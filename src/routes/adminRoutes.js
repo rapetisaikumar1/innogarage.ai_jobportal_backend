@@ -4,6 +4,7 @@ const adminController = require('../controllers/adminController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Super Admin routes
+router.post('/super-admins', authenticate, authorize('SUPER_ADMIN'), adminController.createSuperAdmin);
 router.post('/admins', authenticate, authorize('SUPER_ADMIN'), adminController.createAdmin);
 router.get('/admins', authenticate, authorize('SUPER_ADMIN'), adminController.getAdmins);
 router.patch('/admins/:id/toggle-status', authenticate, authorize('SUPER_ADMIN'), adminController.toggleAdminStatus);

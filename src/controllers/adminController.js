@@ -4,6 +4,48 @@ const crypto = require('crypto');
 
 // ---- Admin (Mentor) Management ----
 
+// Create Super Admin
+exports.createSuperAdmin = async (req, res) => {
+  try {
+    const { fullName, email, password } = req.body;
+    if (!fullName || !email || !password) {
+      return res.status(400).json({ message: 'Full name, email, and password are required' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters' });
+    }
+
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) {
+      return res.status(409).json({ message: 'Email already registered' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    const superAdmin = await prisma.user.create({
+      data: {
+        fullName,
+        email,
+        password: hashedPassword,
+        role: 'SUPER_ADMIN',
+        isActive: true,
+        isEmailVerified: true,
+      },
+      select: {
+        id: true,
+        fullName: true,
+        email: true,
+        role: true,
+        createdAt: true,
+      },
+    });
+
+    res.status(201).json(superAdmin);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to create super admin', error: error.message });
+  }
+};
+
 // Create Admin (Mentor)
 exports.createAdmin = async (req, res) => {
   try {
@@ -172,24 +214,34 @@ exports.getStudentDetail = async (req, res) => {
         education: true,
         experience: true,
         keySkills: true,
+        jobRole: true,
+        location: true,
         resumeUrl: true,
+        avatarUrl: true,
         assignedMentorId: true,
         assignedMentor: {
           select: { id: true, fullName: true, email: true },
         },
         createdAt: true,
+        updatedAt: true,
         jobApplications: {
-          include: { job: true },
+          include: { job: { select: { id: true, title: true, company: true, location: true, source: true } } },
           orderBy: { appliedAt: 'desc' },
         },
         bookings: {
+          include: { slot: { include: { mentor: { select: { id: true, fullName: true, email: true } } } } },
           orderBy: { createdAt: 'desc' },
         },
         sheetApplications: {
           orderBy: { createdAt: 'desc' },
         },
+        trainingNotes: {
+          select: { id: true, title: true, category: true, createdAt: true },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        },
         _count: {
-          select: { jobApplications: true, bookings: true, sheetApplications: true },
+          select: { jobApplications: true, bookings: true, sheetApplications: true, trainingNotes: true, tailoredResumes: true },
         },
       },
     });
