@@ -444,7 +444,7 @@ exports.completeProfile = async (req, res) => {
     };
     if (resumeUrl) updateData.resumeUrl = resumeUrl;
 
-    const user = await prisma.user.update({
+    let user = await prisma.user.update({
       where: { id: userId },
       data: updateData,
       select: {
@@ -461,8 +461,63 @@ exports.completeProfile = async (req, res) => {
         keySkills: true,
         resumeUrl: true,
         avatarUrl: true,
+        assignedMentorId: true,
       },
     });
+
+    // Auto-assign mentor to student after profile completion
+    if (user.role === 'STUDENT' && !user.assignedMentorId) {
+      // Fetch all active mentors with their assigned student count
+      const mentors = await prisma.user.findMany({
+        where: {
+          role: 'ADMIN',
+          isActive: true,
+        },
+        select: {
+          id: true,
+          createdAt: true,
+          _count: {
+            select: { assignedStudents: true },
+          },
+        },
+      });
+
+      if (mentors.length > 0) {
+        // Sort by student count (ascending), then by createdAt (ascending)
+        mentors.sort((a, b) => {
+          const countDiff = a._count.assignedStudents - b._count.assignedStudents;
+          if (countDiff !== 0) return countDiff;
+          return new Date(a.createdAt) - new Date(b.createdAt);
+        });
+
+        // Select the mentor with the least load
+        const selectedMentor = mentors[0];
+
+        // Assign the mentor to the student
+        user = await prisma.user.update({
+          where: { id: userId },
+          data: { assignedMentorId: selectedMentor.id },
+          select: {
+            id: true,
+            registrationNumber: true,
+            fullName: true,
+            email: true,
+            phone: true,
+            role: true,
+            isActive: true,
+            isEmailVerified: true,
+            education: true,
+            experience: true,
+            keySkills: true,
+            resumeUrl: true,
+            avatarUrl: true,
+            assignedMentorId: true,
+          },
+        });
+
+        console.log(`Auto-assigned mentor ${selectedMentor.id} to student ${userId} (mentor load: ${selectedMentor._count.assignedStudents} students)`);
+      }
+    }
 
     res.json({ message: 'Profile completed successfully', user });
   } catch (error) {

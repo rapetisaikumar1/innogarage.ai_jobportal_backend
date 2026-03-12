@@ -496,6 +496,7 @@ exports.getAssignedStudents = async (req, res) => {
         experience: true,
         keySkills: true,
         resumeUrl: true,
+        isActive: true,
         createdAt: true,
         _count: {
           select: { jobApplications: true },
