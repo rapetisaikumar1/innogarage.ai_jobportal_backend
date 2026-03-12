@@ -1,0 +1,326 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  STUDENT
+}
+
+enum ApplicationStatus {
+  APPLIED
+  INTERVIEW_SCHEDULED
+  REJECTED
+  OFFER_RECEIVED
+}
+
+enum ApplicationType {
+  EASY_APPLY
+  MANUAL_APPLY
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+}
+
+model User {
+  id              String    @id @default(uuid())
+  registrationNumber String? @unique
+  fullName        String
+  email           String    @unique
+  phone           String?
+  password        String
+  role            Role      @default(STUDENT)
+  isActive        Boolean   @default(false)
+  isEmailVerified Boolean   @default(false)
+  linkedinProfile String?
+  education       String?
+  experience      String?
+  keySkills       String[]
+  jobRole         String?
+  location        String?
+  resumeUrl       String?
+  avatarUrl       String?
+  googleId        String?   @unique
+
+  // Mentor-specific
+  mentorBio       String?
+  assignedMentorId String?
+  assignedMentor  User?     @relation("MentorStudents", fields: [assignedMentorId], references: [id])
+  assignedStudents User[]   @relation("MentorStudents")
+
+  // Relations
+  jobApplications   JobApplication[]
+  tailoredResumes   TailoredResume[]
+  mentoringSlots    MentoringSlot[]    @relation("MentorSlots")
+  bookings          MentorBooking[]    @relation("StudentBookings")
+  sentMessages      ChatMessage[]      @relation("SentMessages")
+  receivedMessages  ChatMessage[]      @relation("ReceivedMessages")
+  notifications     Notification[]
+  sheetApplications SheetJobApplication[]
+  trainingNotes     TrainingNote[]
+  successStories    SuccessStory[]
+  shoutPosts        ShoutPost[]
+  shoutComments     ShoutComment[]
+  shoutLikes        ShoutLike[]
+
+  // Tokens
+  verificationToken       String?
+  verificationTokenExpiry DateTime?
+  resetPasswordToken      String?
+  resetPasswordExpiry     DateTime?
+  refreshToken            String?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("users")
+}
+
+model Job {
+  id              String          @id @default(uuid())
+  title           String
+  company         String
+  location        String?
+  description     String
+  source          String          // LinkedIn, Indeed, etc.
+  sourceUrl       String?
+  applicationType ApplicationType @default(MANUAL_APPLY)
+  salary          String?
+  datePosted      DateTime?
+  isActive        Boolean         @default(true)
+  externalId      String?         @unique
+
+  applications    JobApplication[]
+  tailoredResumes TailoredResume[]
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@map("jobs")
+}
+
+model JobApplication {
+  id              String            @id @default(uuid())
+  userId          String
+  jobId           String
+  status          ApplicationStatus @default(APPLIED)
+  appliedAt       DateTime          @default(now())
+  resumeUsed      String?
+  notes           String?
+  isAutoApplied   Boolean           @default(false)
+
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job             Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@unique([userId, jobId])
+  @@map("job_applications")
+}
+
+model TailoredResume {
+  id              String    @id @default(uuid())
+  userId          String
+  jobId           String
+  resumeUrl       String
+  matchScore      Float?
+  keywords        String[]
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  job             Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([userId, jobId])
+  @@map("tailored_resumes")
+}
+
+model MentoringSlot {
+  id              String          @id @default(uuid())
+  mentorId        String
+  startTime       DateTime
+  endTime         DateTime
+  isBooked        Boolean         @default(false)
+
+  mentor          User            @relation("MentorSlots", fields: [mentorId], references: [id], onDelete: Cascade)
+  booking         MentorBooking?
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@map("mentoring_slots")
+}
+
+model MentorBooking {
+  id              String        @id @default(uuid())
+  slotId          String        @unique
+  studentId       String
+  status          BookingStatus @default(PENDING)
+  meetLink        String?
+  notes           String?
+
+  slot            MentoringSlot @relation(fields: [slotId], references: [id], onDelete: Cascade)
+  student         User          @relation("StudentBookings", fields: [studentId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@map("mentor_bookings")
+}
+
+model ChatMessage {
+  id              String    @id @default(uuid())
+  senderId        String
+  receiverId      String
+  message         String
+  isRead          Boolean   @default(false)
+
+  sender          User      @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver        User      @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now())
+
+  @@map("chat_messages")
+}
+
+model TrainingMaterial {
+  id              String    @id @default(uuid())
+  title           String
+  description     String?
+  type            String    // video, pdf, document, link
+  url             String?
+  content         String?
+  category        String?
+  isPublished     Boolean   @default(true)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("training_materials")
+}
+
+model TrainingNote {
+  id              String    @id @default(uuid())
+  userId          String
+  title           String
+  content         String
+  category        String?
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("training_notes")
+}
+
+model Notification {
+  id              String    @id @default(uuid())
+  userId          String
+  title           String
+  message         String
+  type            String    // job_match, application, mentoring, message
+  isRead          Boolean   @default(false)
+  link            String?
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now())
+
+  @@map("notifications")
+}
+
+model SheetJobApplication {
+  id              String    @id @default(uuid())
+  userId          String
+  jobLink         String
+  employerName    String?
+  status          String    @default("APPLIED") // APPLIED, MANUAL_REQUIRED, FAILED
+  appliedMethod   String    @default("BOT")     // BOT, MANUAL
+  matchScore      String?
+  pdfLink         String?
+  reportUrl       String?
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now())
+
+  @@unique([userId, jobLink])
+  @@map("sheet_job_applications")
+}
+
+model SuccessStory {
+  id              String    @id @default(uuid())
+  userId          String
+  jobTitle        String
+  company         String
+  story           String
+  imageUrl        String?
+  isApproved      Boolean   @default(true)
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("success_stories")
+}
+
+model ShoutPost {
+  id        String         @id @default(uuid())
+  userId    String
+  content   String
+  tag       String?
+
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comments  ShoutComment[]
+  likes     ShoutLike[]
+
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@map("shout_posts")
+}
+
+model ShoutComment {
+  id        String        @id @default(uuid())
+  postId    String
+  userId    String
+  content   String
+  parentId  String?
+
+  post      ShoutPost     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent    ShoutComment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   ShoutComment[] @relation("CommentReplies")
+
+  createdAt DateTime      @default(now())
+
+  @@map("shout_comments")
+}
+
+model ShoutLike {
+  id        String    @id @default(uuid())
+  postId    String
+  userId    String
+
+  post      ShoutPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+
+  @@unique([postId, userId])
+  @@map("shout_likes")
+}
