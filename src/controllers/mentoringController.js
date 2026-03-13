@@ -70,6 +70,26 @@ exports.bookSlot = async (req, res) => {
       return res.status(409).json({ message: 'Slot is already booked' });
     }
 
+    // Enforce one booking per day per student
+    const slotDate = new Date(slot.startTime);
+    const dayStart = new Date(slotDate.getFullYear(), slotDate.getMonth(), slotDate.getDate());
+    const dayEnd = new Date(dayStart);
+    dayEnd.setDate(dayEnd.getDate() + 1);
+
+    const existingBooking = await prisma.mentorBooking.findFirst({
+      where: {
+        studentId,
+        status: 'CONFIRMED',
+        slot: {
+          startTime: { gte: dayStart, lt: dayEnd },
+        },
+      },
+    });
+
+    if (existingBooking) {
+      return res.status(409).json({ message: 'You can only book one mentoring session per day' });
+    }
+
     // Generate a Google Meet link placeholder
     const meetLink = `https://meet.google.com/maple-${Date.now().toString(36)}`;
 
