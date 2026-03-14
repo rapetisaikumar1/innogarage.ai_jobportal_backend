@@ -19,6 +19,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const achieverRoutes = require('./routes/achieverRoutes');
 const shoutboardRoutes = require('./routes/shoutboardRoutes');
+const queryRoutes = require('./routes/queryRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -55,6 +56,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/achievers', achieverRoutes);
 app.use('/api/shoutboard', shoutboardRoutes);
+app.use('/api/queries', queryRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

@@ -72,6 +72,7 @@ model User {
   shoutPosts        ShoutPost[]
   shoutComments     ShoutComment[]
   shoutLikes        ShoutLike[]
+  supportQueries    SupportQuery[]
 
   // Tokens
   verificationToken       String?
@@ -323,4 +324,21 @@ model ShoutLike {
 
   @@unique([postId, userId])
   @@map("shout_likes")
+}
+
+model SupportQuery {
+  id          String   @id @default(uuid())
+  userId      String
+  subject     String
+  description String
+  category    String   @default("General")
+  status      String   @default("OPEN")
+  adminReply  String?
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("support_queries")
 }
