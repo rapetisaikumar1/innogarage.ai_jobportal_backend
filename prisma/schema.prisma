@@ -32,6 +32,11 @@ enum BookingStatus {
   CANCELLED
 }
 
+enum StudentStatus {
+  ACTIVE
+  INACTIVE
+}
+
 model User {
   id              String    @id @default(uuid())
   registrationNumber String? @unique
@@ -42,6 +47,7 @@ model User {
   role            Role      @default(STUDENT)
   isActive        Boolean   @default(false)
   isEmailVerified Boolean   @default(false)
+  status          StudentStatus @default(INACTIVE)
   linkedinProfile String?
   education       String?
   experience      String?

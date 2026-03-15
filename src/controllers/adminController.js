@@ -163,6 +163,7 @@ exports.getStudents = async (req, res) => {
           phone: true,
           isActive: true,
           isEmailVerified: true,
+          status: true,
           education: true,
           experience: true,
           keySkills: true,
@@ -283,10 +284,11 @@ exports.toggleStudentStatus = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
+    const newStatus = student.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
     const updated = await prisma.user.update({
       where: { id },
-      data: { isActive: !student.isActive },
-      select: { id: true, fullName: true, isActive: true },
+      data: { status: newStatus },
+      select: { id: true, fullName: true, status: true },
     });
 
     res.json(updated);
@@ -329,6 +331,7 @@ exports.registerStudent = async (req, res) => {
         registrationNumber: true,
         education: true,
         isActive: true,
+        status: true,
         createdAt: true,
       },
     });
@@ -353,6 +356,7 @@ exports.getStudentByRegNumber = async (req, res) => {
         phone: true,
         isActive: true,
         isEmailVerified: true,
+        status: true,
         linkedinProfile: true,
         education: true,
         experience: true,
@@ -497,6 +501,7 @@ exports.getAssignedStudents = async (req, res) => {
         keySkills: true,
         resumeUrl: true,
         isActive: true,
+        status: true,
         createdAt: true,
         _count: {
           select: { jobApplications: true },
