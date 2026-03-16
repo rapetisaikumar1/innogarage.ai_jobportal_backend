@@ -343,22 +343,19 @@ exports.triggerN8nWorkflow = async (req, res) => {
     console.log('Final text fields:', JSON.stringify(textFields));
     console.log('Body size:', body.length, 'bytes');
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-    const n8nResponse = await fetch(formPageUrl, {
-      method: 'POST',
+    const n8nResponse = await axios.post(formPageUrl, body, {
       headers: { 'Content-Type': contentType },
-      body: body,
-      signal: controller.signal,
+      timeout: 60000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: () => true,
     });
-    clearTimeout(timeout);
 
-    const responseText = await n8nResponse.text();
     console.log('N8N response status:', n8nResponse.status);
-    console.log('N8N response:', responseText.substring(0, 300));
+    console.log('N8N response:', JSON.stringify(n8nResponse.data).substring(0, 300));
 
-    if (!n8nResponse.ok) {
-      return res.status(502).json({ message: 'N8N workflow error', details: responseText.substring(0, 200) });
+    if (n8nResponse.status >= 400) {
+      return res.status(502).json({ message: 'N8N workflow error', details: JSON.stringify(n8nResponse.data).substring(0, 200) });
     }
 
     res.json({ message: 'Job search triggered successfully. Jobs will appear shortly.' });
@@ -369,8 +366,9 @@ exports.triggerN8nWorkflow = async (req, res) => {
       data: { jobSearchCount: { increment: 1 } },
     }).catch(() => {});
   } catch (error) {
-    console.error('N8N trigger error:', error.message);
-    res.status(500).json({ message: 'Failed to trigger job search', error: error.message });
+    console.error('N8N trigger error:', error.message || error);
+    console.error('N8N trigger stack:', error.stack);
+    res.status(500).json({ message: 'Failed to trigger job search', error: error.message || String(error) });
   }
 };
 
