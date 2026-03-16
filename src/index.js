@@ -25,10 +25,30 @@ const stripeRoutes = require('./routes/stripeRoutes');
 const app = express();
 const server = http.createServer(app);
 
+// Allowed origins for CORS
+const allowedOrigins = [
+  config.frontendUrl,
+  'https://www.innogarage.ai',
+  'https://innogarage.ai',
+  'https://maverickproject-finalise-1.vercel.app',
+  'http://localhost:5173',
+].filter(Boolean);
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+};
+
 // Socket.IO setup
 const io = new Server(server, {
   cors: {
-    origin: config.frontendUrl,
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -39,10 +59,7 @@ app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 
 // Middleware
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({
-  origin: config.frontendUrl,
-  credentials: true,
-}));
+app.use(cors(corsOptions));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
