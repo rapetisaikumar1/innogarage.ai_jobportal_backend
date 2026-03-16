@@ -4,7 +4,15 @@ const resumeService = require('../services/resumeService');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
+const dns = require('dns');
+const https = require('https');
 const config = require('../config');
+
+// Force IPv4 to avoid AggregateError on Render/cloud platforms
+const n8nAxios = axios.create({
+  timeout: 60000,
+  httpsAgent: new https.Agent({ family: 4 }),
+});
 
 // Google Sheet config
 const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
@@ -242,7 +250,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
     // Step 1: GET the n8n form page HTML to discover the REAL field names
     const formPageUrl = config.n8n.webhookUrl.replace('/webhook/', '/form/');
     console.log('Step 1: Fetching n8n form HTML from:', formPageUrl);
-    const formPageResp = await axios.get(formPageUrl, { timeout: 15000 });
+    const formPageResp = await n8nAxios.get(formPageUrl);
     const $ = cheerio.load(formPageResp.data);
 
     // Extract all input/textarea/select field names and their labels
@@ -326,7 +334,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
     if (user.resumeUrl) {
       try {
         console.log('Downloading resume from:', user.resumeUrl);
-        const resumeResp = await axios.get(user.resumeUrl, { responseType: 'arraybuffer', timeout: 15000 });
+        const resumeResp = await n8nAxios.get(user.resumeUrl, { responseType: 'arraybuffer' });
         const resumeBuffer = Buffer.from(resumeResp.data);
         const filename = user.resumeUrl.split('/').pop().split('?')[0] || 'resume.pdf';
         console.log('Resume downloaded, size:', resumeBuffer.length, 'bytes');
@@ -343,9 +351,8 @@ exports.triggerN8nWorkflow = async (req, res) => {
     console.log('Final text fields:', JSON.stringify(textFields));
     console.log('Body size:', body.length, 'bytes');
 
-    const n8nResponse = await axios.post(formPageUrl, body, {
+    const n8nResponse = await n8nAxios.post(formPageUrl, body, {
       headers: { 'Content-Type': contentType },
-      timeout: 60000,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
       validateStatus: () => true,
