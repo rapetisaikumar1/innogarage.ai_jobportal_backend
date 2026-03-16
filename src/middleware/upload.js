@@ -9,6 +9,7 @@ const fileFilter = (req, file, cb) => {
     resume: ['.pdf', '.doc', '.docx'],
     material: ['.pdf', '.doc', '.docx', '.mp4', '.avi', '.mov', '.pptx', '.ppt'],
     avatar: ['.jpg', '.jpeg', '.png', '.gif', '.webp'],
+    document: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf'],
   };
 
   const ext = path.extname(file.originalname).toLowerCase();

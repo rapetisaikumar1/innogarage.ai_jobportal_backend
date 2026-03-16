@@ -88,6 +88,7 @@ exports.getGoogleSheetJobs = async (req, res) => {
         missing_skills: obj['missing_skills'] || obj['missing skills'] || '',
         pdf_link: obj['pdf_link'] || obj['pdf link'] || '',
         jd: obj['jd'] || obj['job_description'] || obj['job description'] || '',
+        resume_text: obj['resume_text'] || obj['resume text'] || obj['resume'] || obj['tailored_resume'] || obj['tailored resume'] || '',
       };
     }).filter(j => j.employer_name);
 
@@ -128,6 +129,82 @@ function buildMultipartBody(textFields, fileFields) {
   return { body: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
 }
 
+// Plan limits for job searches
+const PLAN_LIMITS = {
+  free: { maxSearches: 5, label: 'Free' },
+  basic: { maxSearches: 35, label: 'Basic' },
+  pro: { maxSearches: 200, label: 'Pro' },
+  ultra: { maxSearches: 999999, label: 'Ultra' },
+};
+
+const getPlanLimit = (plan) => PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+
+// Reset search count if a new day has started
+const resetSearchCountIfNeeded = async (user) => {
+  const now = new Date();
+  const last = user.lastSearchReset ? new Date(user.lastSearchReset) : null;
+  if (!last || last.toDateString() !== now.toDateString()) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { jobSearchCount: 0, lastSearchReset: now },
+    });
+    return 0;
+  }
+  return user.jobSearchCount || 0;
+};
+
+// Auto-verify Stripe session and update plan if payment completed but plan never saved
+const autoVerifyStripeSession = async (user) => {
+  try {
+    if (user.subscriptionPlan && user.subscriptionPlan !== 'free') return user.subscriptionPlan;
+    if (!user.stripeSessionId) return user.subscriptionPlan || 'free';
+
+    const config = require('../config');
+    const secretKey = config.stripe.secretKey;
+    if (!secretKey) return user.subscriptionPlan || 'free';
+
+    const { data: session } = await axios.get(
+      `https://api.stripe.com/v1/checkout/sessions/${user.stripeSessionId}`,
+      { headers: { 'Authorization': `Bearer ${secretKey}` } }
+    );
+
+    if (session.payment_status === 'paid' && session.metadata?.plan) {
+      const plan = session.metadata.plan;
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          subscriptionPlan: plan,
+          subscriptionStatus: 'active',
+          subscriptionStart: new Date(),
+        },
+      });
+      console.log(`Auto-verify: Updated user ${user.email} to plan: ${plan}`);
+      return plan;
+    }
+    return user.subscriptionPlan || 'free';
+  } catch (err) {
+    console.error('Auto-verify Stripe session error:', err.message);
+    return user.subscriptionPlan || 'free';
+  }
+};
+
+// Get usage stats for the current user
+exports.getUsage = async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { id: true, email: true, subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true },
+    });
+    // Self-healing: if plan is free but a Stripe session exists, auto-verify payment
+    const plan = await autoVerifyStripeSession(user);
+    const limit = getPlanLimit(plan);
+    const used = await resetSearchCountIfNeeded(user);
+    res.json({ plan, used, max: limit.maxSearches, label: limit.label });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to get usage', error: err.message });
+  }
+};
+
 // Trigger n8n workflow with user data
 exports.triggerN8nWorkflow = async (req, res) => {
   try {
@@ -138,10 +215,26 @@ exports.triggerN8nWorkflow = async (req, res) => {
       select: {
         id: true, fullName: true, email: true, keySkills: true,
         resumeUrl: true, jobRole: true, location: true,
+        subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
       },
     });
 
     if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Self-healing plan check
+    const plan = await autoVerifyStripeSession(user);
+    const limit = getPlanLimit(plan);
+    const used = await resetSearchCountIfNeeded(user);
+
+    if (used >= limit.maxSearches) {
+      return res.status(403).json({
+        message: `You've reached your ${limit.label} plan limit of ${limit.maxSearches} searches today. Upgrade for more!`,
+        limitReached: true,
+        used,
+        max: limit.maxSearches,
+      });
+    }
+
     if (!config.n8n.webhookUrl) return res.status(500).json({ message: 'N8N webhook not configured' });
 
     const days = req.body.days || '1';
@@ -269,6 +362,12 @@ exports.triggerN8nWorkflow = async (req, res) => {
     }
 
     res.json({ message: 'Job search triggered successfully. Jobs will appear shortly.' });
+
+    // Increment search count after successful trigger (fire-and-forget)
+    prisma.user.update({
+      where: { id: userId },
+      data: { jobSearchCount: { increment: 1 } },
+    }).catch(() => {});
   } catch (error) {
     console.error('N8N trigger error:', error.message);
     res.status(500).json({ message: 'Failed to trigger job search', error: error.message });
@@ -761,13 +860,32 @@ exports.getSheetAppliedStatus = async (req, res) => {
     const userId = req.user.id;
     const applications = await prisma.sheetJobApplication.findMany({
       where: { userId },
-      select: { jobLink: true, status: true, appliedMethod: true, employerName: true, createdAt: true },
+      select: { jobLink: true, status: true, appliedMethod: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
       orderBy: { createdAt: 'desc' },
     });
     res.json({ applications });
   } catch (error) {
     // Table might not exist yet — return empty
     res.json({ applications: [] });
+  }
+};
+
+// Mark a single sheet job as applied
+exports.markSheetJobApplied = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { jobLink, employerName, matchScore, jobTitle } = req.body;
+    if (!jobLink) return res.status(400).json({ message: 'jobLink is required' });
+
+    const application = await prisma.sheetJobApplication.upsert({
+      where: { userId_jobLink: { userId, jobLink } },
+      update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
+      create: { userId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
+    });
+
+    res.json({ message: 'Marked as applied', application });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to mark applied', error: error.message });
   }
 };
 

@@ -6,6 +6,8 @@ const upload = require('../middleware/upload');
 
 router.post('/signup', upload.single('resume'), authController.signup);
 router.post('/login', authController.login);
+router.post('/verify-login-otp', authController.verifyLoginOtp);
+router.post('/resend-login-otp', authController.resendLoginOtp);
 router.post('/google-login', authController.googleLogin);
 router.post('/complete-profile', authenticate, upload.single('resume'), authController.completeProfile);
 router.get('/verify-email/:token', authController.verifyEmail);

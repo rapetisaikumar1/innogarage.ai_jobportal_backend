@@ -20,6 +20,7 @@ const chatRoutes = require('./routes/chatRoutes');
 const achieverRoutes = require('./routes/achieverRoutes');
 const shoutboardRoutes = require('./routes/shoutboardRoutes');
 const queryRoutes = require('./routes/queryRoutes');
+const stripeRoutes = require('./routes/stripeRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -32,6 +33,9 @@ const io = new Server(server, {
     credentials: true,
   },
 });
+
+// Stripe webhook — must be before express.json() to receive raw body
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 
 // Middleware
 app.use(helmet({ crossOriginResourcePolicy: false }));
@@ -57,6 +61,8 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/achievers', achieverRoutes);
 app.use('/api/shoutboard', shoutboardRoutes);
 app.use('/api/queries', queryRoutes);
+// Stripe routes (checkout + webhook)
+app.use('/api/stripe', stripeRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

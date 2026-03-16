@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const config = require('../config');
 const prisma = require('../config/database');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/emailService');
+const { sendVerificationEmail, sendPasswordResetEmail, sendLoginOtpEmail } = require('../services/emailService');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
 
 // Generate unique registration number: MIG-26XXX
@@ -108,7 +108,7 @@ exports.signup = async (req, res) => {
   }
 };
 
-// Login
+// Login - Step 1: Validate credentials and send OTP
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -127,11 +127,68 @@ exports.login = async (req, res) => {
       return res.status(403).json({ message: 'Account is deactivated. Contact support.' });
     }
 
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpiry = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { loginOtp: otp, loginOtpExpiry: otpExpiry },
+    });
+
+    // Send OTP via email
+    const emailResult = await sendLoginOtpEmail(user, otp);
+    if (!emailResult) {
+      console.log(`\n📧 OTP for ${user.email}: ${otp}\n`);
+    }
+
+    res.json({
+      message: 'Verification code sent to your email',
+      requiresOtp: true,
+      email: user.email,
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Login failed', error: error.message });
+  }
+};
+
+// Login - Step 2: Verify OTP and return tokens
+exports.verifyLoginOtp = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ message: 'Email and OTP are required' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    if (!user.loginOtp || !user.loginOtpExpiry) {
+      return res.status(400).json({ message: 'No OTP requested. Please login again.' });
+    }
+
+    if (new Date() > user.loginOtpExpiry) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { loginOtp: null, loginOtpExpiry: null },
+      });
+      return res.status(400).json({ message: 'OTP has expired. Please login again.' });
+    }
+
+    if (user.loginOtp !== otp) {
+      return res.status(401).json({ message: 'Invalid verification code' });
+    }
+
+    // Clear OTP after successful verification
     const { accessToken, refreshToken } = generateTokens(user.id, user.role);
 
     await prisma.user.update({
       where: { id: user.id },
-      data: { refreshToken },
+      data: { refreshToken, loginOtp: null, loginOtpExpiry: null },
     });
 
     res.json({
@@ -148,8 +205,39 @@ exports.login = async (req, res) => {
       refreshToken,
     });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ message: 'Login failed', error: error.message });
+    console.error('OTP verification error:', error);
+    res.status(500).json({ message: 'Verification failed', error: error.message });
+  }
+};
+
+// Resend Login OTP
+exports.resendLoginOtp = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      return res.json({ message: 'If the account exists, a new code has been sent.' });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpiry = new Date(Date.now() + 5 * 60 * 1000);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { loginOtp: otp, loginOtpExpiry: otpExpiry },
+    });
+
+    await sendLoginOtpEmail(user, otp);
+
+    res.json({ message: 'A new verification code has been sent to your email.' });
+  } catch (error) {
+    console.error('Resend OTP error:', error);
+    res.status(500).json({ message: 'Failed to resend code', error: error.message });
   }
 };
 
@@ -296,9 +384,11 @@ exports.me = async (req, res) => {
         education: true,
         experience: true,
         keySkills: true,
+        jobRole: true,
         resumeUrl: true,
         avatarUrl: true,
         assignedMentorId: true,
+        subscriptionPlan: true,
         createdAt: true,
       },
     });
@@ -422,7 +512,7 @@ exports.googleLogin = async (req, res) => {
 // Complete Profile
 exports.completeProfile = async (req, res) => {
   try {
-    const { fullName, phone, education, experience, keySkills } = req.body;
+    const { fullName, phone, education, experience, keySkills, linkedinProfile, jobRole } = req.body;
     const userId = req.user.id;
 
     let resumeUrl = null;
@@ -440,6 +530,8 @@ exports.completeProfile = async (req, res) => {
       phone: phone || undefined,
       education: education || undefined,
       experience: experience || undefined,
+      linkedinProfile: linkedinProfile || undefined,
+      jobRole: jobRole || undefined,
       keySkills: Array.isArray(keySkills) ? keySkills : keySkills ? keySkills.split(',').map(s => s.trim()) : [],
     };
     if (resumeUrl) updateData.resumeUrl = resumeUrl;
@@ -456,9 +548,11 @@ exports.completeProfile = async (req, res) => {
         role: true,
         isActive: true,
         isEmailVerified: true,
+        linkedinProfile: true,
         education: true,
         experience: true,
         keySkills: true,
+        jobRole: true,
         resumeUrl: true,
         avatarUrl: true,
         assignedMentorId: true,

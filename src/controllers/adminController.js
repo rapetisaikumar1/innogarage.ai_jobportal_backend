@@ -168,6 +168,7 @@ exports.getStudents = async (req, res) => {
           experience: true,
           keySkills: true,
           resumeUrl: true,
+          subscriptionPlan: true,
           assignedMentorId: true,
           assignedMentor: {
             select: { id: true, fullName: true },
@@ -271,6 +272,34 @@ exports.deleteStudent = async (req, res) => {
     res.json({ message: 'Student deleted' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to delete student', error: error.message });
+  }
+};
+
+// Update student subscription plan
+exports.updateStudentPlan = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { plan } = req.body;
+
+    const validPlans = ['FREE', 'BASIC', 'PRO', 'ULTRA'];
+    if (!validPlans.includes(plan)) {
+      return res.status(400).json({ message: 'Invalid plan. Must be FREE, BASIC, PRO, or ULTRA' });
+    }
+
+    const student = await prisma.user.findUnique({ where: { id } });
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id },
+      data: { subscriptionPlan: plan },
+      select: { id: true, fullName: true, subscriptionPlan: true },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to update plan', error: error.message });
   }
 };
 

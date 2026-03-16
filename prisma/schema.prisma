@@ -56,7 +56,21 @@ model User {
   location        String?
   resumeUrl       String?
   avatarUrl       String?
+  passportUrl     String?
+  drivingLicenceUrl String?
+  visaUrl         String?
   googleId        String?   @unique
+
+  // Subscription
+  subscriptionPlan   String?
+  subscriptionStatus String?
+  subscriptionStart  DateTime?
+  subscriptionEnd    DateTime?
+  stripeSessionId    String?
+
+  // Usage tracking
+  jobSearchCount     Int       @default(0)
+  lastSearchReset    DateTime?
 
   // Mentor-specific
   mentorBio       String?
@@ -86,6 +100,8 @@ model User {
   resetPasswordToken      String?
   resetPasswordExpiry     DateTime?
   refreshToken            String?
+  loginOtp                String?
+  loginOtpExpiry          DateTime?
 
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -254,6 +270,7 @@ model SheetJobApplication {
   userId          String
   jobLink         String
   employerName    String?
+  jobTitle        String?
   status          String    @default("APPLIED") // APPLIED, MANUAL_REQUIRED, FAILED
   appliedMethod   String    @default("BOT")     // BOT, MANUAL
   matchScore      String?

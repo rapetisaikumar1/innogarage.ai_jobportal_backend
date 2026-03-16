@@ -17,6 +17,7 @@ module.exports = {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
     from: process.env.EMAIL_FROM,
+    googleRefreshToken: process.env.GOOGLE_REFRESH_TOKEN,
   },
 
   google: {
@@ -29,6 +30,12 @@ module.exports = {
     webhookUrl: process.env.N8N_WEBHOOK_URL,
   },
 
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY,
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+  },
+
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
 
   upload: {
@@ -37,8 +44,8 @@ module.exports = {
   },
 
   superAdmin: {
-    email: process.env.SUPER_ADMIN_EMAIL || 'rapetisaikumar7@gmail.com',
-    password: process.env.SUPER_ADMIN_PASSWORD || 'Saikumar273@',
+    email: process.env.SUPER_ADMIN_EMAIL || 'vinayvds20@gmail.com',
+    password: process.env.SUPER_ADMIN_PASSWORD || 'Vinay@8112',
     name: process.env.SUPER_ADMIN_NAME || 'Super Admin',
   },
 };

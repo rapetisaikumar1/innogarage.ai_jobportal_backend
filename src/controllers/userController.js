@@ -64,6 +64,9 @@ exports.updateProfile = async (req, res) => {
         location: true,
         resumeUrl: true,
         avatarUrl: true,
+        passportUrl: true,
+        drivingLicenceUrl: true,
+        visaUrl: true,
       },
     });
 
@@ -94,6 +97,9 @@ exports.getProfile = async (req, res) => {
         location: true,
         resumeUrl: true,
         avatarUrl: true,
+        passportUrl: true,
+        drivingLicenceUrl: true,
+        visaUrl: true,
         assignedMentorId: true,
         assignedMentor: {
           select: {
@@ -110,6 +116,43 @@ exports.getProfile = async (req, res) => {
     res.json(user);
   } catch (error) {
     res.status(500).json({ message: 'Failed to get profile', error: error.message });
+  }
+};
+
+// Upload document (passport, driving licence, visa)
+exports.uploadDocument = async (req, res) => {
+  try {
+    const { docType } = req.body;
+    const validTypes = ['passport', 'drivingLicence', 'visa'];
+    if (!validTypes.includes(docType)) {
+      return res.status(400).json({ message: 'Invalid document type. Must be passport, drivingLicence, or visa' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    const result = await uploadToCloudinary(req.file.buffer, { folder: `documents/${docType}`, resourceType: 'image' });
+
+    const fieldMap = {
+      passport: 'passportUrl',
+      drivingLicence: 'drivingLicenceUrl',
+      visa: 'visaUrl',
+    };
+
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { [fieldMap[docType]]: result.url },
+      select: {
+        id: true,
+        passportUrl: true,
+        drivingLicenceUrl: true,
+        visaUrl: true,
+      },
+    });
+
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: 'Document upload failed', error: error.message });
   }
 };
 

@@ -14,6 +14,7 @@ router.get('/students/reg/:regNumber', authenticate, authorize('SUPER_ADMIN', 'A
 router.get('/students/:id', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adminController.getStudentDetail);
 router.delete('/students/:id', authenticate, authorize('SUPER_ADMIN'), adminController.deleteStudent);
 router.patch('/students/:id/toggle-status', authenticate, authorize('SUPER_ADMIN'), adminController.toggleStudentStatus);
+router.patch('/students/:id/plan', authenticate, authorize('SUPER_ADMIN'), adminController.updateStudentPlan);
 router.post('/register-student', authenticate, authorize('SUPER_ADMIN'), adminController.registerStudent);
 router.post('/assign-mentor', authenticate, authorize('SUPER_ADMIN'), adminController.assignMentor);
 

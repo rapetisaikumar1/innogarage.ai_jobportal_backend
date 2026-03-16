@@ -1,23 +1,56 @@
 const nodemailer = require('nodemailer');
+const { google } = require('googleapis');
 const config = require('../config');
 
 let transporter = null;
 
-// Only create transporter if real credentials are configured
-if (config.email.user && config.email.pass && config.email.user !== 'your-email@gmail.com' && config.email.pass !== 'your-app-password') {
-  transporter = nodemailer.createTransport({
-    host: config.email.host,
-    port: config.email.port,
-    secure: false,
-    auth: {
-      user: config.email.user,
-      pass: config.email.pass,
-    },
-  });
-} else {
+const createTransporter = async () => {
+  // Priority 1: Google OAuth2 (recommended)
+  if (config.google.clientId && config.google.clientSecret && config.email.googleRefreshToken && config.email.user) {
+    try {
+      transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          type: 'OAuth2',
+          user: config.email.user,
+          clientId: config.google.clientId,
+          clientSecret: config.google.clientSecret,
+          refreshToken: config.email.googleRefreshToken,
+        },
+      });
+
+      // Verify the transporter works
+      await transporter.verify();
+      console.log('✅ Email transporter configured with Google OAuth2');
+      return;
+    } catch (err) {
+      console.warn('⚠️  Google OAuth2 email setup failed:', err.message);
+      transporter = null;
+    }
+  }
+
+  // Priority 2: App Password / SMTP
+  if (config.email.user && config.email.pass && config.email.user !== 'your-email@gmail.com' && config.email.pass !== 'your-app-password') {
+    transporter = nodemailer.createTransport({
+      host: config.email.host,
+      port: config.email.port,
+      secure: false,
+      auth: {
+        user: config.email.user,
+        pass: config.email.pass,
+      },
+    });
+    console.log('✅ Email transporter configured with SMTP credentials');
+    return;
+  }
+
   console.warn('⚠️  Email credentials not configured. Emails will be logged to console instead.');
-  console.warn('   Update EMAIL_USER and EMAIL_PASS in .env with a Gmail App Password.');
-}
+  console.warn('   Option 1: Set GOOGLE_REFRESH_TOKEN + GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + EMAIL_USER for OAuth2');
+  console.warn('   Option 2: Set EMAIL_USER + EMAIL_PASS for App Password');
+};
+
+// Initialize transporter on startup
+createTransporter();
 
 const sendEmail = async ({ to, subject, html }) => {
   if (!transporter) {
@@ -114,9 +147,31 @@ const sendMentoringConfirmationEmail = async (student, mentor, slot, meetLink) =
   });
 };
 
+const sendLoginOtpEmail = async (user, otp) => {
+  return sendEmail({
+    to: user.email,
+    subject: 'Your Login Verification Code - Maple Record',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h1 style="color: #2563eb;">Login Verification</h1>
+        <p>Hi ${user.fullName},</p>
+        <p>Your one-time verification code is:</p>
+        <div style="background: #f3f4f6; padding: 20px; border-radius: 12px; text-align: center; margin: 20px 0;">
+          <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1e40af;">${otp}</span>
+        </div>
+        <p>This code will expire in <strong>5 minutes</strong>.</p>
+        <p>If you didn't attempt to log in, please ignore this email or change your password immediately.</p>
+        <hr style="border: 1px solid #e5e7eb; margin: 20px 0;" />
+        <p style="color: #6b7280; font-size: 12px;">This is an automated email from Maple Record. Do not reply.</p>
+      </div>
+    `,
+  });
+};
+
 module.exports = {
   sendEmail,
   sendVerificationEmail,
   sendPasswordResetEmail,
   sendMentoringConfirmationEmail,
+  sendLoginOtpEmail,
 };
