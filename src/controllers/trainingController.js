@@ -1,7 +1,7 @@
 const prisma = require('../config/database');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
 
-// Get all training materials
+// Get all training materials (admin/superadmin see all, students see only assigned)
 exports.getMaterials = async (req, res) => {
   try {
     const { category, type, search } = req.query;
@@ -16,8 +16,19 @@ exports.getMaterials = async (req, res) => {
       ];
     }
 
+    // Students only see materials assigned to them
+    if (req.user.role === 'STUDENT') {
+      where.assignments = { some: { studentId: req.user.id } };
+    }
+
     const materials = await prisma.trainingMaterial.findMany({
       where,
+      include: {
+        uploadedBy: { select: { id: true, fullName: true, role: true } },
+        assignments: {
+          include: { student: { select: { id: true, fullName: true, email: true } } }
+        }
+      },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -32,10 +43,24 @@ exports.getMaterial = async (req, res) => {
   try {
     const material = await prisma.trainingMaterial.findUnique({
       where: { id: req.params.id },
+      include: {
+        uploadedBy: { select: { id: true, fullName: true, role: true } },
+        assignments: {
+          include: { student: { select: { id: true, fullName: true, email: true } } }
+        }
+      },
     });
 
     if (!material) {
       return res.status(404).json({ message: 'Material not found' });
+    }
+
+    // Students can only access materials assigned to them
+    if (req.user.role === 'STUDENT') {
+      const isAssigned = material.assignments.some(a => a.studentId === req.user.id);
+      if (!isAssigned) {
+        return res.status(403).json({ message: 'Not assigned to you' });
+      }
     }
 
     res.json(material);
@@ -44,14 +69,14 @@ exports.getMaterial = async (req, res) => {
   }
 };
 
-// Create training material (Super Admin)
+// Create training material (Super Admin / Admin)
 exports.createMaterial = async (req, res) => {
   try {
     const { title, description, type, content, category, url } = req.body;
     let materialUrl = url;
 
     if (req.file) {
-      const result = await uploadToCloudinary(req.file.buffer, { folder: 'materials', resourceType: 'auto' });
+      const result = await uploadToCloudinary(req.file.buffer, { folder: 'materials', resourceType: 'raw' });
       materialUrl = result.url;
     }
 
@@ -63,6 +88,7 @@ exports.createMaterial = async (req, res) => {
         content,
         category,
         url: materialUrl,
+        uploadedById: req.user.id,
       },
     });
 
@@ -87,7 +113,7 @@ exports.updateMaterial = async (req, res) => {
     if (isPublished !== undefined) updateData.isPublished = isPublished;
 
     if (req.file) {
-      const result = await uploadToCloudinary(req.file.buffer, { folder: 'materials', resourceType: 'auto' });
+      const result = await uploadToCloudinary(req.file.buffer, { folder: 'materials', resourceType: 'raw' });
       updateData.url = result.url;
     }
 
@@ -99,6 +125,43 @@ exports.updateMaterial = async (req, res) => {
     res.json(material);
   } catch (error) {
     res.status(500).json({ message: 'Failed to update material', error: error.message });
+  }
+};
+
+// Download / proxy a training material file
+exports.downloadMaterial = async (req, res) => {
+  try {
+    const material = await prisma.trainingMaterial.findUnique({ where: { id: req.params.id } });
+    if (!material || !material.url) {
+      return res.status(404).json({ message: 'Material not found' });
+    }
+
+    // Students can only download materials assigned to them
+    if (req.user.role === 'STUDENT') {
+      const assignment = await prisma.trainingAssignment.findFirst({
+        where: { materialId: material.id, studentId: req.user.id },
+      });
+      if (!assignment) return res.status(403).json({ message: 'Not assigned to you' });
+    }
+
+    const https = require('https');
+    https.get(material.url, (upstream) => {
+      if (upstream.statusCode !== 200) {
+        return res.status(502).json({ message: 'Failed to fetch file from storage' });
+      }
+      const ext = material.url.split('.').pop()?.split('?')[0] || 'pdf';
+      const filename = `${material.title.replace(/[^a-zA-Z0-9_-]/g, '_')}.${ext}`;
+      res.setHeader('Content-Type', upstream.headers['content-type'] || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      if (upstream.headers['content-length']) {
+        res.setHeader('Content-Length', upstream.headers['content-length']);
+      }
+      upstream.pipe(res);
+    }).on('error', () => {
+      res.status(502).json({ message: 'Failed to fetch file from storage' });
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to download material', error: error.message });
   }
 };
 
@@ -170,5 +233,102 @@ exports.deleteNote = async (req, res) => {
     res.json({ message: 'Note deleted' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to delete note', error: error.message });
+  }
+};
+
+// --- Assignment endpoints ---
+
+// Get students list for assignment (Admin sees their assigned students, Super Admin sees all)
+exports.getStudentsForAssignment = async (req, res) => {
+  try {
+    const where = { role: 'STUDENT' };
+
+    if (req.user.role === 'ADMIN') {
+      where.assignedMentorId = req.user.id;
+    }
+
+    const students = await prisma.user.findMany({
+      where,
+      select: { id: true, fullName: true, email: true, registrationNumber: true, avatarUrl: true },
+      orderBy: { fullName: 'asc' },
+    });
+
+    res.json(students);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch students', error: error.message });
+  }
+};
+
+// Assign material to specific students
+exports.assignMaterial = async (req, res) => {
+  try {
+    const { materialId } = req.params;
+    const { studentIds } = req.body;
+
+    if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
+      return res.status(400).json({ message: 'studentIds array is required' });
+    }
+
+    const material = await prisma.trainingMaterial.findUnique({ where: { id: materialId } });
+    if (!material) {
+      return res.status(404).json({ message: 'Material not found' });
+    }
+
+    // Create assignments (skip duplicates)
+    const data = studentIds.map(studentId => ({
+      materialId,
+      studentId,
+    }));
+
+    await prisma.trainingAssignment.createMany({
+      data,
+      skipDuplicates: true,
+    });
+
+    // Return updated material with assignments
+    const updated = await prisma.trainingMaterial.findUnique({
+      where: { id: materialId },
+      include: {
+        assignments: {
+          include: { student: { select: { id: true, fullName: true, email: true } } }
+        }
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to assign material', error: error.message });
+  }
+};
+
+// Unassign material from specific students
+exports.unassignMaterial = async (req, res) => {
+  try {
+    const { materialId } = req.params;
+    const { studentIds } = req.body;
+
+    if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
+      return res.status(400).json({ message: 'studentIds array is required' });
+    }
+
+    await prisma.trainingAssignment.deleteMany({
+      where: {
+        materialId,
+        studentId: { in: studentIds },
+      },
+    });
+
+    const updated = await prisma.trainingMaterial.findUnique({
+      where: { id: materialId },
+      include: {
+        assignments: {
+          include: { student: { select: { id: true, fullName: true, email: true } } }
+        }
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to unassign material', error: error.message });
   }
 };

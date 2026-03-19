@@ -620,7 +620,10 @@ exports.getMyApplications = async (req, res) => {
     const [applications, total] = await Promise.all([
       prisma.jobApplication.findMany({
         where,
-        include: { job: true },
+        include: {
+          job: true,
+          user: { select: { id: true, fullName: true, email: true, phone: true, avatarUrl: true, education: true, jobRole: true } },
+        },
         orderBy: { appliedAt: 'desc' },
         skip,
         take: parseInt(limit),
@@ -646,17 +649,76 @@ exports.getMyApplications = async (req, res) => {
 exports.updateApplicationStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, notes } = req.body;
+    const { status, notes, interviewDate, interviewLocation, interviewNotes } = req.body;
+
+    // Only ADMIN and SUPER_ADMIN can update application status
+    if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({ message: 'Not authorized to update application status' });
+    }
+
+    const data = {};
+    if (status) data.status = status;
+    if (notes !== undefined) data.notes = notes;
+    if (interviewDate !== undefined) data.interviewDate = interviewDate ? new Date(interviewDate) : null;
+    if (interviewLocation !== undefined) data.interviewLocation = interviewLocation;
+    if (interviewNotes !== undefined) data.interviewNotes = interviewNotes;
 
     const application = await prisma.jobApplication.update({
       where: { id },
-      data: { status, notes },
-      include: { job: true },
+      data,
+      include: {
+        job: true,
+        user: { select: { id: true, fullName: true, email: true } },
+      },
     });
 
     res.json(application);
   } catch (error) {
     res.status(500).json({ message: 'Failed to update application', error: error.message });
+  }
+};
+
+// Get all applications (Admin/Super Admin) — includes applicant info
+exports.getAllApplications = async (req, res) => {
+  try {
+    const { status, page = 1, limit = 20, search } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const where = {};
+    if (status) where.status = status;
+    if (search) {
+      where.OR = [
+        { user: { fullName: { contains: search, mode: 'insensitive' } } },
+        { user: { email: { contains: search, mode: 'insensitive' } } },
+        { job: { title: { contains: search, mode: 'insensitive' } } },
+        { job: { company: { contains: search, mode: 'insensitive' } } },
+      ];
+    }
+
+    const [applications, total] = await Promise.all([
+      prisma.jobApplication.findMany({
+        where,
+        include: {
+          job: true,
+          user: { select: { id: true, fullName: true, email: true, phone: true, avatarUrl: true, education: true, jobRole: true } },
+        },
+        orderBy: { appliedAt: 'desc' },
+        skip,
+        take: parseInt(limit),
+      }),
+      prisma.jobApplication.count({ where }),
+    ]);
+
+    res.json({
+      applications,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        totalPages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch applications', error: error.message });
   }
 };
 

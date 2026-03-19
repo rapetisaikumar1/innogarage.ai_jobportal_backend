@@ -86,13 +86,21 @@ exports.verifySession = async (req, res) => {
     if (session.payment_status === 'paid') {
       const plan = session.metadata?.plan;
       if (plan) {
+        const updateData = {
+          subscriptionPlan: plan,
+          subscriptionStatus: 'active',
+          subscriptionStart: new Date(),
+        };
+
+        // Auto-activate student when they pay for pro or ultra
+        if (plan === 'pro' || plan === 'ultra') {
+          updateData.status = 'ACTIVE';
+          updateData.isActive = true;
+        }
+
         await prisma.user.update({
           where: { id: req.user.id },
-          data: {
-            subscriptionPlan: plan,
-            subscriptionStatus: 'active',
-            subscriptionStart: new Date(),
-          },
+          data: updateData,
         });
         console.log(`Stripe verify: Updated user ${user.email} to plan: ${plan}`);
         return res.json({ success: true, plan });
@@ -137,14 +145,22 @@ exports.handleWebhook = async (req, res) => {
     try {
       const user = await prisma.user.findUnique({ where: { email: customerEmail } });
       if (user) {
+        const updateData = {
+          subscriptionPlan: plan,
+          subscriptionStatus: 'active',
+          subscriptionStart: new Date(),
+          stripeSessionId: session.id,
+        };
+
+        // Auto-activate student when they pay for pro or ultra
+        if ((plan === 'pro' || plan === 'ultra') && user.role === 'STUDENT') {
+          updateData.status = 'ACTIVE';
+          updateData.isActive = true;
+        }
+
         await prisma.user.update({
           where: { email: customerEmail },
-          data: {
-            subscriptionPlan: plan,
-            subscriptionStatus: 'active',
-            subscriptionStart: new Date(),
-            stripeSessionId: session.id,
-          },
+          data: updateData,
         });
         console.log(`Stripe: Updated user ${customerEmail} to plan: ${plan}`);
       } else {

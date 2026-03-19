@@ -14,6 +14,7 @@ router.post('/auto-apply-all', authenticate, authorize('STUDENT'), jobController
 router.post('/auto-apply', authenticate, authorize('STUDENT'), jobController.autoApplyToJob);
 router.get('/stats', authenticate, jobController.getDashboardStats);
 router.get('/applications/mine', authenticate, jobController.getMyApplications);
+router.get('/applications/all', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getAllApplications);
 router.patch('/applications/:id/status', authenticate, jobController.updateApplicationStatus);
 router.post('/scrape', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.scrapeJobs);
 router.post('/sample', authenticate, authorize('SUPER_ADMIN'), jobController.addSampleJobs);

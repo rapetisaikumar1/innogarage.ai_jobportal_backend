@@ -17,6 +17,7 @@ const mentoringRoutes = require('./routes/mentoringRoutes');
 const trainingRoutes = require('./routes/trainingRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const groupChatRoutes = require('./routes/groupChatRoutes');
 const achieverRoutes = require('./routes/achieverRoutes');
 const shoutboardRoutes = require('./routes/shoutboardRoutes');
 const queryRoutes = require('./routes/queryRoutes');
@@ -75,6 +76,7 @@ app.use('/api/mentoring', mentoringRoutes);
 app.use('/api/training', trainingRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/group-chat', groupChatRoutes);
 app.use('/api/achievers', achieverRoutes);
 app.use('/api/shoutboard', shoutboardRoutes);
 app.use('/api/queries', queryRoutes);
@@ -140,6 +142,16 @@ io.on('connection', (socket) => {
         createdAt: new Date().toISOString(),
       });
     }
+  });
+
+  socket.on('joinGroup', (groupId) => {
+    socket.join(`group_${groupId}`);
+  });
+
+  socket.on('sendGroupMessage', (data) => {
+    const { groupId } = data;
+    // Broadcast to all group members in the room except sender
+    socket.to(`group_${groupId}`).emit('newGroupMessage', data);
   });
 
   socket.on('typing', (data) => {

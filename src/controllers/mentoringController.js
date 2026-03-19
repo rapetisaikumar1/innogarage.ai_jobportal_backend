@@ -1,5 +1,5 @@
 const prisma = require('../config/database');
-const { sendMentoringConfirmationEmail } = require('../services/emailService');
+const { sendMentoringConfirmationEmail, sendBookingRequestEmail, sendBookingCancelledEmail } = require('../services/emailService');
 
 // Get available mentoring slots
 exports.getAvailableSlots = async (req, res) => {
@@ -51,7 +51,7 @@ exports.createSlots = async (req, res) => {
   }
 };
 
-// Book a mentoring slot (Student)
+// Book a mentoring slot (Student) — creates PENDING booking, admin must confirm
 exports.bookSlot = async (req, res) => {
   try {
     const { slotId } = req.params;
@@ -79,7 +79,7 @@ exports.bookSlot = async (req, res) => {
     const existingBooking = await prisma.mentorBooking.findFirst({
       where: {
         studentId,
-        status: 'CONFIRMED',
+        status: { in: ['CONFIRMED', 'PENDING'] },
         slot: {
           startTime: { gte: dayStart, lt: dayEnd },
         },
@@ -90,16 +90,12 @@ exports.bookSlot = async (req, res) => {
       return res.status(409).json({ message: 'You can only book one mentoring session per day' });
     }
 
-    // Generate a Google Meet link placeholder
-    const meetLink = `https://meet.google.com/maple-${Date.now().toString(36)}`;
-
     const [booking] = await prisma.$transaction([
       prisma.mentorBooking.create({
         data: {
           slotId,
           studentId,
-          status: 'CONFIRMED',
-          meetLink,
+          status: 'PENDING',
         },
         include: {
           slot: {
@@ -115,25 +111,26 @@ exports.bookSlot = async (req, res) => {
       }),
     ]);
 
-    // Send confirmation email
     const student = await prisma.user.findUnique({ where: { id: studentId } });
-    await sendMentoringConfirmationEmail(student, slot.mentor, slot, meetLink);
+
+    // Notify mentor about new booking request
+    await sendBookingRequestEmail(student, slot.mentor, slot);
 
     // Create notifications
     await Promise.all([
       prisma.notification.create({
         data: {
           userId: studentId,
-          title: 'Mentoring Session Booked',
-          message: `Session with ${slot.mentor.fullName} on ${new Date(slot.startTime).toLocaleDateString()}`,
+          title: 'Booking Request Sent',
+          message: `Your request for a session with ${slot.mentor.fullName} on ${new Date(slot.startTime).toLocaleDateString()} is pending confirmation.`,
           type: 'mentoring',
         },
       }),
       prisma.notification.create({
         data: {
           userId: slot.mentorId,
-          title: 'New Booking',
-          message: `${student.fullName} booked a session on ${new Date(slot.startTime).toLocaleDateString()}`,
+          title: 'New Booking Request',
+          message: `${student.fullName} requested a session on ${new Date(slot.startTime).toLocaleDateString()}. Please confirm or cancel.`,
           type: 'mentoring',
         },
       }),
@@ -142,6 +139,130 @@ exports.bookSlot = async (req, res) => {
     res.status(201).json(booking);
   } catch (error) {
     res.status(500).json({ message: 'Booking failed', error: error.message });
+  }
+};
+
+// Confirm a booking (Admin) — admin provides Google Meet link
+exports.confirmBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { meetLink } = req.body;
+
+    if (!meetLink) {
+      return res.status(400).json({ message: 'Google Meet link is required' });
+    }
+
+    const booking = await prisma.mentorBooking.findUnique({
+      where: { id },
+      include: {
+        slot: {
+          include: {
+            mentor: { select: { id: true, fullName: true, email: true } },
+          },
+        },
+        student: { select: { id: true, fullName: true, email: true } },
+      },
+    });
+
+    if (!booking) return res.status(404).json({ message: 'Booking not found' });
+    if (booking.status !== 'PENDING') {
+      return res.status(400).json({ message: `Cannot confirm a ${booking.status.toLowerCase()} booking` });
+    }
+
+    const updated = await prisma.mentorBooking.update({
+      where: { id },
+      data: { status: 'CONFIRMED', meetLink },
+      include: {
+        slot: {
+          include: {
+            mentor: { select: { id: true, fullName: true, email: true } },
+          },
+        },
+        student: { select: { id: true, fullName: true, email: true } },
+      },
+    });
+
+    // Send confirmation emails to both student and mentor
+    await sendMentoringConfirmationEmail(booking.student, booking.slot.mentor, booking.slot, meetLink);
+
+    // Notify student
+    await prisma.notification.create({
+      data: {
+        userId: booking.student.id,
+        title: 'Session Confirmed!',
+        message: `Your mentoring session on ${new Date(booking.slot.startTime).toLocaleDateString()} has been confirmed. Google Meet link is ready.`,
+        type: 'mentoring',
+      },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to confirm booking', error: error.message });
+  }
+};
+
+// Cancel booking (Admin or Student) — with optional reason
+exports.cancelBooking = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const booking = await prisma.mentorBooking.findUnique({
+      where: { id },
+      include: {
+        slot: {
+          include: {
+            mentor: { select: { id: true, fullName: true, email: true } },
+          },
+        },
+        student: { select: { id: true, fullName: true, email: true } },
+      },
+    });
+
+    if (!booking) return res.status(404).json({ message: 'Booking not found' });
+    if (booking.status === 'CANCELLED') {
+      return res.status(400).json({ message: 'Booking is already cancelled' });
+    }
+
+    const cancelledBy = req.user.role === 'ADMIN' || req.user.role === 'SUPER_ADMIN' ? 'admin' : 'student';
+    const cancelNote = reason ? `Cancelled by ${cancelledBy}: ${reason}` : `Cancelled by ${cancelledBy}`;
+
+    await prisma.$transaction([
+      prisma.mentorBooking.update({
+        where: { id },
+        data: { status: 'CANCELLED', notes: cancelNote },
+      }),
+      prisma.mentoringSlot.update({
+        where: { id: booking.slotId },
+        data: { isBooked: false },
+      }),
+    ]);
+
+    // Send cancellation email to the other party
+    if (cancelledBy === 'admin') {
+      await sendBookingCancelledEmail(booking.student, booking.slot.mentor, booking.slot, reason);
+      await prisma.notification.create({
+        data: {
+          userId: booking.student.id,
+          title: 'Session Cancelled',
+          message: `Your mentoring session on ${new Date(booking.slot.startTime).toLocaleDateString()} was cancelled by the mentor.${reason ? ` Reason: ${reason}` : ''}`,
+          type: 'mentoring',
+        },
+      });
+    } else {
+      await prisma.notification.create({
+        data: {
+          userId: booking.slot.mentorId,
+          title: 'Booking Cancelled',
+          message: `${booking.student.fullName} cancelled their session on ${new Date(booking.slot.startTime).toLocaleDateString()}.${reason ? ` Reason: ${reason}` : ''}`,
+          type: 'mentoring',
+        },
+      });
+    }
+
+    res.json({ message: 'Booking cancelled' });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to cancel booking', error: error.message });
   }
 };
 
@@ -226,35 +347,6 @@ exports.deleteSlot = async (req, res) => {
     res.json({ message: 'Slot deleted' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to delete slot', error: error.message });
-  }
-};
-
-// Cancel booking
-exports.cancelBooking = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const booking = await prisma.mentorBooking.findUnique({
-      where: { id },
-      include: { slot: true },
-    });
-
-    if (!booking) return res.status(404).json({ message: 'Booking not found' });
-
-    await prisma.$transaction([
-      prisma.mentorBooking.update({
-        where: { id },
-        data: { status: 'CANCELLED' },
-      }),
-      prisma.mentoringSlot.update({
-        where: { id: booking.slotId },
-        data: { isBooked: false },
-      }),
-    ]);
-
-    res.json({ message: 'Booking cancelled' });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to cancel booking', error: error.message });
   }
 };
 

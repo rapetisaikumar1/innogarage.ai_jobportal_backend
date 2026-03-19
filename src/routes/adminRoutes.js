@@ -8,6 +8,7 @@ router.post('/super-admins', authenticate, authorize('SUPER_ADMIN'), adminContro
 router.post('/admins', authenticate, authorize('SUPER_ADMIN'), adminController.createAdmin);
 router.get('/admins', authenticate, authorize('SUPER_ADMIN'), adminController.getAdmins);
 router.patch('/admins/:id/toggle-status', authenticate, authorize('SUPER_ADMIN'), adminController.toggleAdminStatus);
+router.patch('/admins/:id/department', authenticate, authorize('SUPER_ADMIN'), adminController.updateAdminDepartment);
 
 router.get('/students', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adminController.getStudents);
 router.get('/students/reg/:regNumber', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adminController.getStudentByRegNumber);
@@ -17,11 +18,24 @@ router.patch('/students/:id/toggle-status', authenticate, authorize('SUPER_ADMIN
 router.patch('/students/:id/plan', authenticate, authorize('SUPER_ADMIN'), adminController.updateStudentPlan);
 router.post('/register-student', authenticate, authorize('SUPER_ADMIN'), adminController.registerStudent);
 router.post('/assign-mentor', authenticate, authorize('SUPER_ADMIN'), adminController.assignMentor);
+router.post('/unassign-admin', authenticate, authorize('SUPER_ADMIN'), adminController.unassignAdmin);
+router.get('/students/:studentId/admins', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adminController.getStudentAdmins);
 
 router.get('/analytics', authenticate, authorize('SUPER_ADMIN'), adminController.getAnalytics);
 
 // Admin (Mentor) routes
 router.get('/my-students', authenticate, authorize('ADMIN'), adminController.getAssignedStudents);
 router.get('/student-progress/:studentId', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentProgress);
+
+// Admin view-as-student routes
+router.get('/students/:studentId/dashboard-data', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentDashboardData);
+router.get('/students/:studentId/applications', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentApplications);
+router.get('/students/:studentId/sheet-jobs', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentSheetJobs);
+router.get('/students/:studentId/sheet-applied-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentSheetAppliedStatus);
+
+// Admin act-on-behalf-of-student routes
+router.post('/students/:studentId/trigger-job-search', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.triggerStudentJobSearch);
+router.post('/students/:studentId/apply-job', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.applyJobForStudent);
+router.post('/students/:studentId/mark-sheet-applied', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.markSheetJobAppliedForStudent);
 
 module.exports = router;

@@ -138,9 +138,7 @@ exports.login = async (req, res) => {
 
     // Send OTP via email
     const emailResult = await sendLoginOtpEmail(user, otp);
-    if (!emailResult) {
-      console.log(`\n📧 OTP for ${user.email}: ${otp}\n`);
-    }
+    console.log(`\n🔑 OTP for ${user.email}: ${otp}\n`);
 
     res.json({
       message: 'Verification code sent to your email',
@@ -191,8 +189,11 @@ exports.verifyLoginOtp = async (req, res) => {
       data: { refreshToken, loginOtp: null, loginOtpExpiry: null },
     });
 
+    const profileComplete = !!user.education;
+
     res.json({
       message: 'Login successful',
+      profileComplete,
       user: {
         id: user.id,
         fullName: user.fullName,
@@ -200,6 +201,8 @@ exports.verifyLoginOtp = async (req, res) => {
         role: user.role,
         registrationNumber: user.registrationNumber,
         isEmailVerified: user.isEmailVerified,
+        education: user.education,
+        profileCompleted: user.profileCompleted,
       },
       accessToken,
       refreshToken,
@@ -389,6 +392,7 @@ exports.me = async (req, res) => {
         avatarUrl: true,
         assignedMentorId: true,
         subscriptionPlan: true,
+        profileCompleted: true,
         createdAt: true,
       },
     });
@@ -499,6 +503,7 @@ exports.googleLogin = async (req, res) => {
         role: user.role,
         registrationNumber: user.registrationNumber,
         avatarUrl: user.avatarUrl,
+        profileCompleted: user.profileCompleted,
       },
       accessToken,
       refreshToken,
@@ -533,6 +538,7 @@ exports.completeProfile = async (req, res) => {
       linkedinProfile: linkedinProfile || undefined,
       jobRole: jobRole || undefined,
       keySkills: Array.isArray(keySkills) ? keySkills : keySkills ? keySkills.split(',').map(s => s.trim()) : [],
+      profileCompleted: true,
     };
     if (resumeUrl) updateData.resumeUrl = resumeUrl;
 
@@ -556,6 +562,7 @@ exports.completeProfile = async (req, res) => {
         resumeUrl: true,
         avatarUrl: true,
         assignedMentorId: true,
+        profileCompleted: true,
       },
     });
 
@@ -606,10 +613,35 @@ exports.completeProfile = async (req, res) => {
             resumeUrl: true,
             avatarUrl: true,
             assignedMentorId: true,
+            profileCompleted: true,
           },
         });
 
         console.log(`Auto-assigned mentor ${selectedMentor.id} to student ${userId} (mentor load: ${selectedMentor._count.assignedStudents} students)`);
+      }
+    }
+
+    // Auto-create group chat for the student with all admins & super admins
+    if (user.role === 'STUDENT') {
+      const existingGroup = await prisma.chatGroup.findUnique({ where: { studentId: userId } });
+      if (!existingGroup) {
+        const staff = await prisma.user.findMany({
+          where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
+          select: { id: true },
+        });
+        await prisma.chatGroup.create({
+          data: {
+            name: `${user.fullName}'s Group`,
+            studentId: userId,
+            members: {
+              create: [
+                { userId },
+                ...staff.map(s => ({ userId: s.id })),
+              ],
+            },
+          },
+        });
+        console.log(`Auto-created group chat for student ${userId} with ${staff.length} staff members`);
       }
     }
 

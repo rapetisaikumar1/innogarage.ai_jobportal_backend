@@ -32,6 +32,12 @@ enum BookingStatus {
   CANCELLED
 }
 
+enum AdminDepartment {
+  MARKETING
+  PROXY
+  HR
+}
+
 enum StudentStatus {
   ACTIVE
   INACTIVE
@@ -60,6 +66,7 @@ model User {
   drivingLicenceUrl String?
   visaUrl         String?
   googleId        String?   @unique
+  profileCompleted Boolean   @default(false)
 
   // Subscription
   subscriptionPlan   String?
@@ -72,7 +79,8 @@ model User {
   jobSearchCount     Int       @default(0)
   lastSearchReset    DateTime?
 
-  // Mentor-specific
+  // Admin/Mentor-specific
+  department      AdminDepartment?
   mentorBio       String?
   assignedMentorId String?
   assignedMentor  User?     @relation("MentorStudents", fields: [assignedMentorId], references: [id])
@@ -86,13 +94,23 @@ model User {
   sentMessages      ChatMessage[]      @relation("SentMessages")
   receivedMessages  ChatMessage[]      @relation("ReceivedMessages")
   notifications     Notification[]
+  chatGroups        ChatGroup[]        @relation("GroupStudent")
+  groupMemberships  ChatGroupMember[]  @relation("GroupMemberships")
+  groupMessagesSent GroupMessage[]     @relation("GroupMessagesSent")
   sheetApplications SheetJobApplication[]
   trainingNotes     TrainingNote[]
   successStories    SuccessStory[]
   shoutPosts        ShoutPost[]
   shoutComments     ShoutComment[]
   shoutLikes        ShoutLike[]
-  supportQueries    SupportQuery[]
+  supportQueries    SupportQuery[]   @relation("QueryCreator")
+  assignedQueries   SupportQuery[]   @relation("QueryAssignee")
+  trainingAssignments TrainingAssignment[]
+  uploadedMaterials   TrainingMaterial[] @relation("MaterialUploader")
+
+  // Multi-admin assignments (student can have up to 5 admins)
+  adminAssignments    StudentAdminAssignment[] @relation("StudentAdminAssignments")
+  studentAssignments  StudentAdminAssignment[] @relation("AdminStudentAssignments")
 
   // Tokens
   verificationToken       String?
@@ -141,6 +159,9 @@ model JobApplication {
   resumeUsed      String?
   notes           String?
   isAutoApplied   Boolean           @default(false)
+  interviewDate   DateTime?
+  interviewLocation String?
+  interviewNotes  String?
 
   user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   job             Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
@@ -218,6 +239,50 @@ model ChatMessage {
   @@map("chat_messages")
 }
 
+model ChatGroup {
+  id          String             @id @default(uuid())
+  name        String
+  studentId   String
+  student     User               @relation("GroupStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  members     ChatGroupMember[]
+  messages    GroupMessage[]
+
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@unique([studentId])
+  @@map("chat_groups")
+}
+
+model ChatGroupMember {
+  id        String    @id @default(uuid())
+  groupId   String
+  userId    String
+
+  group     ChatGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user      User      @relation("GroupMemberships", fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+
+  @@unique([groupId, userId])
+  @@map("chat_group_members")
+}
+
+model GroupMessage {
+  id        String    @id @default(uuid())
+  groupId   String
+  senderId  String
+  message   String
+  isRead    Boolean   @default(false)
+
+  group     ChatGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  sender    User      @relation("GroupMessagesSent", fields: [senderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+
+  @@map("group_messages")
+}
+
 model TrainingMaterial {
   id              String    @id @default(uuid())
   title           String
@@ -227,11 +292,29 @@ model TrainingMaterial {
   content         String?
   category        String?
   isPublished     Boolean   @default(true)
+  uploadedById    String?
+
+  uploadedBy      User?     @relation("MaterialUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  assignments     TrainingAssignment[]
 
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   @@map("training_materials")
+}
+
+model TrainingAssignment {
+  id              String    @id @default(uuid())
+  materialId      String
+  studentId       String
+
+  material        TrainingMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  student         User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  assignedAt      DateTime  @default(now())
+
+  @@unique([materialId, studentId])
+  @@map("training_assignments")
 }
 
 model TrainingNote {
@@ -350,18 +433,35 @@ model ShoutLike {
 }
 
 model SupportQuery {
-  id          String   @id @default(uuid())
-  userId      String
-  subject     String
-  description String
-  category    String   @default("General")
-  status      String   @default("OPEN")
-  adminReply  String?
+  id            String   @id @default(uuid())
+  userId        String
+  assignedToId  String?
+  subject       String
+  description   String
+  category      String   @default("General")
+  status        String   @default("OPEN")
+  adminReply    String?
 
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user          User     @relation("QueryCreator", fields: [userId], references: [id], onDelete: Cascade)
+  assignedTo    User?    @relation("QueryAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   @@map("support_queries")
+}
+
+model StudentAdminAssignment {
+  id         String   @id @default(uuid())
+  studentId  String
+  adminId    String
+  department String?
+
+  student    User     @relation("StudentAdminAssignments", fields: [studentId], references: [id], onDelete: Cascade)
+  admin      User     @relation("AdminStudentAssignments", fields: [adminId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime @default(now())
+
+  @@unique([studentId, adminId])
+  @@map("student_admin_assignments")
 }

@@ -64,6 +64,26 @@ exports.sendMessage = async (req, res) => {
       },
     });
 
+    // Create notifications for @mentioned users (except receiver who already got one)
+    const mentionMatches = (message || '').match(/@\[([^\]]+)\]/g);
+    if (mentionMatches) {
+      const mentionedNames = mentionMatches.map(m => m.slice(2, -1)); // extract names from @[Name]
+      const mentionedUsers = await prisma.user.findMany({
+        where: { fullName: { in: mentionedNames }, id: { notIn: [senderId, receiverId] }, isActive: true },
+        select: { id: true, fullName: true },
+      });
+      if (mentionedUsers.length > 0) {
+        await prisma.notification.createMany({
+          data: mentionedUsers.map(u => ({
+            userId: u.id,
+            title: 'You were mentioned',
+            message: `${req.user.fullName} mentioned you in a chat`,
+            type: 'mention',
+          })),
+        });
+      }
+    }
+
     res.status(201).json(chatMessage);
   } catch (error) {
     res.status(500).json({ message: 'Failed to send message', error: error.message });
@@ -93,25 +113,56 @@ exports.getContacts = async (req, res) => {
       ...receivedFrom.map(m => m.senderId),
     ])];
 
-    // If student, also include assigned mentor
+    // If student, include only their assigned admins + all super admins
     if (req.user.role === 'STUDENT') {
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { assignedMentorId: true },
+      // Get admins assigned to this student via StudentAdminAssignment
+      const assignments = await prisma.studentAdminAssignment.findMany({
+        where: { studentId: userId },
+        select: { adminId: true },
       });
-      if (user?.assignedMentorId && !contactIds.includes(user.assignedMentorId)) {
-        contactIds.push(user.assignedMentorId);
-      }
-    }
+      assignments.forEach(a => {
+        if (!contactIds.includes(a.adminId)) contactIds.push(a.adminId);
+      });
 
-    // If mentor, include assigned students
-    if (req.user.role === 'ADMIN') {
-      const students = await prisma.user.findMany({
-        where: { assignedMentorId: userId },
+      // Include all active super admins
+      const superAdmins = await prisma.user.findMany({
+        where: { role: 'SUPER_ADMIN', isActive: true },
         select: { id: true },
       });
-      students.forEach(s => {
+      superAdmins.forEach(s => {
         if (!contactIds.includes(s.id)) contactIds.push(s.id);
+      });
+    }
+
+    // If admin, include students assigned to them + other admins/super admins
+    if (req.user.role === 'ADMIN') {
+      // Students assigned to this admin via StudentAdminAssignment
+      const assignments = await prisma.studentAdminAssignment.findMany({
+        where: { adminId: userId },
+        select: { studentId: true },
+      });
+      assignments.forEach(a => {
+        if (!contactIds.includes(a.studentId)) contactIds.push(a.studentId);
+      });
+
+      // Include other admins and super admins
+      const staff = await prisma.user.findMany({
+        where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true, id: { not: userId } },
+        select: { id: true },
+      });
+      staff.forEach(s => {
+        if (!contactIds.includes(s.id)) contactIds.push(s.id);
+      });
+    }
+
+    // If super admin, include all admins, other super admins, and all students
+    if (req.user.role === 'SUPER_ADMIN') {
+      const allUsers = await prisma.user.findMany({
+        where: { role: { in: ['ADMIN', 'SUPER_ADMIN', 'STUDENT'] }, isActive: true, id: { not: userId } },
+        select: { id: true },
+      });
+      allUsers.forEach(u => {
+        if (!contactIds.includes(u.id)) contactIds.push(u.id);
       });
     }
 
@@ -124,6 +175,7 @@ exports.getContacts = async (req, res) => {
         avatarUrl: true,
         role: true,
         isActive: true,
+        department: true,
       },
     });
 
