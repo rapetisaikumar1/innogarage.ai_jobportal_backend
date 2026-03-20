@@ -968,7 +968,7 @@ exports.triggerStudentJobSearch = async (req, res) => {
       where: { id: studentId },
       select: {
         id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, jobRole: true, location: true, role: true,
+        resumeUrl: true, jobRole: true, location: true, role: true, experience: true, education: true,
         subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
       },
     });

@@ -226,7 +226,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
       where: { id: userId },
       select: {
         id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, jobRole: true, location: true,
+        resumeUrl: true, jobRole: true, location: true, experience: true, education: true,
         subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
       },
     });
