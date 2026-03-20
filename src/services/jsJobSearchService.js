@@ -80,72 +80,30 @@ async function appendToSheet(rows) {
 
 // ───── Free Job Search APIs ─────
 
-/** Search Remotive (remote jobs, no key needed) */
-async function searchRemotive(query, limit = 15) {
-  try {
-    const { data } = await httpClient.get('https://remotive.com/api/remote-jobs', {
-      params: { search: query, limit },
-    });
-    return (data.jobs || []).map(j => ({
-      employer_name: j.company_name || '',
-      job_title: j.title || '',
-      job_city: 'Remote',
-      job_state: '',
-      job_country: '',
-      job_employment_type: j.job_type || '',
-      job_apply_link: j.url || '',
-      jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 2000),
-      source: 'Remotive',
-      posted: j.publication_date || '',
-    }));
-  } catch (err) {
-    console.warn('Remotive search error:', err.message);
-    return [];
-  }
-}
-
-/** Search Arbeitnow (EU + remote jobs, no key needed) */
-async function searchArbeitnow(query, limit = 15) {
-  try {
-    const { data } = await httpClient.get('https://www.arbeitnow.com/api/job-board-api', {
-      params: { search: query, per_page: limit },
-    });
-    return (data.data || []).map(j => ({
-      employer_name: j.company_name || '',
-      job_title: j.title || '',
-      job_city: j.location || '',
-      job_state: '',
-      job_country: '',
-      job_employment_type: j.remote ? 'Remote' : 'On-site',
-      job_apply_link: j.url || '',
-      jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 2000),
-      source: 'Arbeitnow',
-      posted: j.created_at || '',
-    }));
-  } catch (err) {
-    console.warn('Arbeitnow search error:', err.message);
-    return [];
-  }
-}
-
-/** Search JSearch (RapidAPI — only if RAPIDAPI_KEY is set) */
-async function searchJSearch(query, location, days, limit = 15) {
+/** Search JSearch (RapidAPI — PRIMARY source, best quality & working links) */
+async function searchJSearch(query, location, days, limit = 30) {
   const apiKey = process.env.RAPIDAPI_KEY;
   if (!apiKey) return [];
   try {
-    const { data } = await httpClient.get('https://jsearch.p.rapidapi.com/search', {
-      params: {
-        query: `${query} in ${location || 'United States'}`,
-        page: '1',
-        num_pages: '1',
-        date_posted: days <= 1 ? 'today' : days <= 3 ? '3days' : days <= 7 ? 'week' : 'month',
-      },
-      headers: {
-        'X-RapidAPI-Key': apiKey,
-        'X-RapidAPI-Host': 'jsearch.p.rapidapi.com',
-      },
-    });
-    return (data.data || []).slice(0, limit).map(j => ({
+    const datePosted = days <= 1 ? 'today' : days <= 3 ? '3days' : days <= 7 ? 'week' : 'month';
+    const searchQuery = location
+      ? `${query} in ${location}`
+      : `${query}`;
+
+    // Fetch 2 pages for more results
+    const [page1, page2] = await Promise.all([
+      httpClient.get('https://jsearch.p.rapidapi.com/search', {
+        params: { query: searchQuery, page: '1', num_pages: '1', date_posted: datePosted, remote_jobs_only: false },
+        headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
+      }).catch(() => ({ data: { data: [] } })),
+      httpClient.get('https://jsearch.p.rapidapi.com/search', {
+        params: { query: searchQuery, page: '2', num_pages: '1', date_posted: datePosted, remote_jobs_only: false },
+        headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
+      }).catch(() => ({ data: { data: [] } })),
+    ]);
+
+    const allResults = [...(page1.data?.data || []), ...(page2.data?.data || [])];
+    return allResults.slice(0, limit).map(j => ({
       employer_name: j.employer_name || '',
       job_title: j.job_title || '',
       job_city: j.job_city || '',
@@ -153,12 +111,40 @@ async function searchJSearch(query, location, days, limit = 15) {
       job_country: j.job_country || '',
       job_employment_type: j.job_employment_type || '',
       job_apply_link: j.job_apply_link || '',
+      employer_logo: j.employer_logo || '',
       jd: (j.job_description || '').substring(0, 2000),
       source: 'JSearch',
       posted: j.job_posted_at_datetime_utc || '',
     }));
   } catch (err) {
     console.warn('JSearch error:', err.message);
+    return [];
+  }
+}
+
+/** Search Remotive (remote jobs, no key needed — SECONDARY source) */
+async function searchRemotive(query, limit = 20) {
+  try {
+    const { data } = await httpClient.get('https://remotive.com/api/remote-jobs', {
+      params: { search: query, limit },
+    });
+    return (data.jobs || [])
+      .filter(j => j.url && j.url.startsWith('http'))
+      .map(j => ({
+        employer_name: j.company_name || '',
+        job_title: j.title || '',
+        job_city: 'Remote',
+        job_state: '',
+        job_country: '',
+        job_employment_type: j.job_type || '',
+        job_apply_link: j.url || '',
+        employer_logo: j.company_logo_url || '',
+        jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 2000),
+        source: 'Remotive',
+        posted: j.publication_date || '',
+      }));
+  } catch (err) {
+    console.warn('Remotive search error:', err.message);
     return [];
   }
 }
@@ -212,15 +198,26 @@ async function searchJobs(student, days = 1) {
 
   console.log(`[JS Job Search] Query: "${query}", Location: "${location}", Skills: ${skills.length}, Days: ${days}`);
 
-  // Search all APIs in parallel
-  const [remotiveJobs, arbeitnowJobs, jsearchJobs] = await Promise.all([
-    searchRemotive(query),
-    searchArbeitnow(query),
+  // Search APIs in parallel — JSearch is primary, Remotive is secondary
+  const [jsearchJobs, remotiveJobs] = await Promise.all([
     searchJSearch(query, location, days),
+    searchRemotive(query),
   ]);
 
-  const allJobs = [...jsearchJobs, ...remotiveJobs, ...arbeitnowJobs];
-  console.log(`[JS Job Search] Found: JSearch=${jsearchJobs.length}, Remotive=${remotiveJobs.length}, Arbeitnow=${arbeitnowJobs.length}, Total=${allJobs.length}`);
+  // JSearch first (best quality), then Remotive
+  const allJobs = [...jsearchJobs, ...remotiveJobs];
+  console.log(`[JS Job Search] Found: JSearch=${jsearchJobs.length}, Remotive=${remotiveJobs.length}, Total=${allJobs.length}`);
+
+  if (allJobs.length === 0) {
+    return [];
+  }
+
+  // Filter out jobs with bad/missing apply links
+  const validJobs = allJobs.filter(j => {
+    if (!j.job_apply_link || !j.job_apply_link.startsWith('http')) return false;
+    if (!j.job_title || !j.employer_name) return false;
+    return true;
+  });
 
   if (allJobs.length === 0) {
     return [];
@@ -228,7 +225,7 @@ async function searchJobs(student, days = 1) {
 
   // Deduplicate by employer + title
   const seen = new Set();
-  const unique = allJobs.filter(j => {
+  const unique = validJobs.filter(j => {
     const key = `${j.employer_name}|${j.job_title}`.toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
