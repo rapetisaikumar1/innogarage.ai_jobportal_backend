@@ -1,12 +1,16 @@
 const prisma = require('../config/database');
 const jobScraperService = require('../services/jobScraperService');
 const resumeService = require('../services/resumeService');
+const jsJobSearchService = require('../services/jsJobSearchService');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const crypto = require('crypto');
 const dns = require('dns');
 const https = require('https');
 const config = require('../config');
+
+// JOB_SEARCH_MODE: 'js' = JavaScript direct search, 'n8n' = n8n webhook (default: 'js')
+const JOB_SEARCH_MODE = process.env.JOB_SEARCH_MODE || 'js';
 
 // Force IPv4 to avoid AggregateError on Render/cloud platforms
 const n8nAxios = axios.create({
@@ -213,7 +217,7 @@ exports.getUsage = async (req, res) => {
   }
 };
 
-// Trigger n8n workflow with user data
+// Trigger job search — auto-switches between JS mode and n8n mode
 exports.triggerN8nWorkflow = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -243,9 +247,29 @@ exports.triggerN8nWorkflow = async (req, res) => {
       });
     }
 
-    if (!config.n8n.webhookUrl) return res.status(500).json({ message: 'N8N webhook not configured' });
+    // ─── JS Mode: Direct job search via free APIs ───
+    if (JOB_SEARCH_MODE === 'js') {
+      const days = parseInt(req.body.days) || 1;
+      console.log(`[Job Search] Using JS mode for user ${user.email}`);
+      const results = await jsJobSearchService.searchJobs(user, days);
 
-    const days = req.body.days || '1';
+      // Increment search count
+      prisma.user.update({
+        where: { id: userId },
+        data: { jobSearchCount: { increment: 1 } },
+      }).catch(() => {});
+
+      return res.json({
+        message: results.length > 0
+          ? `Found ${results.length} matching jobs!`
+          : 'No jobs found. Try different keywords or expand your search.',
+        jobs: results,
+        mode: 'js',
+      });
+    }
+
+    // ─── N8N Mode: Trigger n8n webhook ───
+    if (!config.n8n.webhookUrl) return res.status(500).json({ message: 'N8N webhook not configured' });
 
     // Step 1: GET the n8n form page HTML to discover the REAL field names
     const formPageUrl = config.n8n.webhookUrl.replace('/webhook/', '/form/');

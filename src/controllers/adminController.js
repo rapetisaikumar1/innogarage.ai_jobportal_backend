@@ -2,6 +2,7 @@ const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const https = require('https');
+const jsJobSearchService = require('../services/jsJobSearchService');
 
 // Google Sheet config (shared with jobController)
 const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
@@ -975,10 +976,25 @@ exports.triggerStudentJobSearch = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
+    const days = parseInt(req.body.days) || 1;
+    const JOB_SEARCH_MODE = process.env.JOB_SEARCH_MODE || 'js';
+
+    // ─── JS Mode: Direct job search via free APIs ───
+    if (JOB_SEARCH_MODE === 'js') {
+      console.log(`[Admin Job Search] JS mode for student ${student.email}`);
+      const results = await jsJobSearchService.searchJobs(student, days);
+      return res.json({
+        message: results.length > 0
+          ? `Found ${results.length} matching jobs for ${student.fullName}!`
+          : 'No jobs found. Try different keywords.',
+        jobs: results,
+        mode: 'js',
+      });
+    }
+
+    // ─── N8N Mode ───
     const config = require('../config');
     if (!config.n8n.webhookUrl) return res.status(500).json({ message: 'N8N webhook not configured' });
-
-    const days = req.body.days || '1';
     const axios = require('axios');
     const cheerio = require('cheerio');
     const crypto = require('crypto');
