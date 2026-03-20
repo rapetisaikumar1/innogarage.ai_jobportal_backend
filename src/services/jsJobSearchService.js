@@ -80,30 +80,60 @@ async function appendToSheet(rows) {
 
 // ───── Free Job Search APIs ─────
 
-/** Search JSearch (RapidAPI — PRIMARY source, best quality & working links) */
-async function searchJSearch(query, location, days, limit = 30) {
+/** Search JSearch (RapidAPI — PRIMARY source: LinkedIn, Indeed, Dice, Glassdoor, ZipRecruiter etc.) */
+async function searchJSearch(query, location, days, limit = 50) {
   const apiKey = process.env.RAPIDAPI_KEY;
   if (!apiKey) return [];
   try {
     const datePosted = days <= 1 ? 'today' : days <= 3 ? '3days' : days <= 7 ? 'week' : 'month';
-    const searchQuery = location
-      ? `${query} in ${location}`
-      : `${query}`;
 
-    // Fetch 2 pages for more results
-    const [page1, page2] = await Promise.all([
-      httpClient.get('https://jsearch.p.rapidapi.com/search', {
-        params: { query: searchQuery, page: '1', num_pages: '1', date_posted: datePosted, remote_jobs_only: false },
-        headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
-      }).catch(() => ({ data: { data: [] } })),
-      httpClient.get('https://jsearch.p.rapidapi.com/search', {
-        params: { query: searchQuery, page: '2', num_pages: '1', date_posted: datePosted, remote_jobs_only: false },
-        headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
-      }).catch(() => ({ data: { data: [] } })),
-    ]);
+    // Build location-specific queries — always target US/Canada
+    const searchLocation = location || 'United States';
+    const queries = [
+      `${query} in ${searchLocation}`,
+    ];
 
-    const allResults = [...(page1.data?.data || []), ...(page2.data?.data || [])];
-    return allResults.slice(0, limit).map(j => ({
+    // If user didn't specify location, also search Canada for broader coverage
+    if (!location) {
+      queries.push(`${query} in Canada`);
+    }
+
+    // Fetch multiple pages per query for maximum results
+    const fetchPage = (q, page) =>
+      httpClient.get('https://jsearch.p.rapidapi.com/search', {
+        params: {
+          query: q,
+          page: String(page),
+          num_pages: '1',
+          date_posted: datePosted,
+          remote_jobs_only: false,
+        },
+        headers: {
+          'X-RapidAPI-Key': apiKey,
+          'X-RapidAPI-Host': 'jsearch.p.rapidapi.com',
+        },
+      }).then(res => res.data?.data || []).catch(() => []);
+
+    // Fetch pages in parallel — 3 pages per query
+    const pagePromises = [];
+    for (const q of queries) {
+      for (let page = 1; page <= 3; page++) {
+        pagePromises.push(fetchPage(q, page));
+      }
+    }
+    const pageResults = await Promise.all(pagePromises);
+    const allResults = pageResults.flat();
+
+    // Filter to US and Canada ONLY — no Germany, no other countries
+    const allowedCountries = ['US', 'CA', 'United States', 'Canada', ''];
+    const filtered = allResults.filter(j => {
+      const country = (j.job_country || '').toUpperCase();
+      return allowedCountries.some(c => c.toUpperCase() === country) || !j.job_country;
+    });
+
+    console.log(`[JSearch] Raw: ${allResults.length}, After US/CA filter: ${filtered.length}`);
+
+    return filtered.slice(0, limit).map(j => ({
       employer_name: j.employer_name || '',
       job_title: j.job_title || '',
       job_city: j.job_city || '',
@@ -112,8 +142,9 @@ async function searchJSearch(query, location, days, limit = 30) {
       job_employment_type: j.job_employment_type || '',
       job_apply_link: j.job_apply_link || '',
       employer_logo: j.employer_logo || '',
+      job_publisher: j.job_publisher || '',
       jd: (j.job_description || '').substring(0, 2000),
-      source: 'JSearch',
+      source: j.job_publisher || 'JSearch',
       posted: j.job_posted_at_datetime_utc || '',
     }));
   } catch (err) {
@@ -250,8 +281,8 @@ async function searchJobs(student, days = 1) {
     };
   }).sort((a, b) => b.match_score - a.match_score);
 
-  // Take top results
-  const results = scored.slice(0, 30);
+  // Take top results (increased to 50 for broader coverage)
+  const results = scored.slice(0, 50);
 
   // Write to Google Sheet (same format as n8n) — fire and forget
   const sheetRows = results.map(r => [
