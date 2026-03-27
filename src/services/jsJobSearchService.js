@@ -1,14 +1,6 @@
 /**
- * JS-based Job Search Service — full replacement for n8n workflow
- *
- * Flow: Student profile (name, role, skills, experience, education, location)
- *       → search JSearch + Remotive APIs
- *       → deep match scoring (skills, role fit, experience, education)
- *       → generate tailored resume per JD
- *       → write to Google Sheet
- *
- * Toggle: JOB_SEARCH_MODE=js in .env
- * Resume: Uses Gemini AI if GEMINI_API_KEY is set, otherwise template-based
+ * JS-based Job Search Service
+ * Flow: Student profile → JSearch + Remotive + RemoteOK APIs → deep match scoring → tailored resume → Google Sheet
  */
 
 const axios = require('axios');
@@ -19,6 +11,27 @@ const httpClient = axios.create({
   timeout: 20000,
   httpsAgent: new https.Agent({ family: 4 }),
 });
+
+// ───── In-Memory Cache (TTL-based) ─────
+
+class MemCache {
+  constructor(ttlMs = 5 * 60 * 1000) {
+    this._store = new Map();
+    this._ttl = ttlMs;
+  }
+  get(key) {
+    const entry = this._store.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.exp) { this._store.delete(key); return undefined; }
+    return entry.val;
+  }
+  set(key, val) {
+    this._store.set(key, { val, exp: Date.now() + this._ttl });
+  }
+  clear() { this._store.clear(); }
+}
+
+const apiCache = new MemCache(5 * 60 * 1000); // 5-minute TTL for API results
 
 // ───── Google Sheets Write ─────
 
@@ -34,9 +47,7 @@ async function getSheetsClient() {
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
       return google.sheets({ version: 'v4', auth });
-    } catch (err) {
-      console.error('Sheets service account auth error:', err.message);
-    }
+    } catch { /* auth unavailable */ }
   }
 
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -47,9 +58,7 @@ async function getSheetsClient() {
       const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
       oauth2.setCredentials({ refresh_token: refreshToken });
       return google.sheets({ version: 'v4', auth: oauth2 });
-    } catch (err) {
-      console.error('Sheets OAuth2 auth error:', err.message);
-    }
+    } catch { /* auth unavailable */ }
   }
 
   return null;
@@ -57,10 +66,7 @@ async function getSheetsClient() {
 
 async function appendToSheet(rows) {
   const sheets = await getSheetsClient();
-  if (!sheets) {
-    console.log('No Google Sheets credentials configured — skipping sheet write');
-    return false;
-  }
+  if (!sheets) return false;
   try {
     await sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
@@ -70,8 +76,7 @@ async function appendToSheet(rows) {
       requestBody: { values: rows },
     });
     return true;
-  } catch (err) {
-    console.error('Sheet append error:', err.message);
+  } catch {
     return false;
   }
 }
@@ -203,63 +208,86 @@ function getAllowedCountryCodes(regions) {
     if (rl.includes('australia')) { codes.add('AU'); codes.add('AUSTRALIA'); }
     if (rl.includes('germany')) { codes.add('DE'); codes.add('GERMANY'); }
   }
-  // If no standard codes matched, allow all (for custom locations)
-  if (codes.size === 0) codes.add('');
+  // Default to US if no known region matched (prevents random countries)
+  if (codes.size === 0) { codes.add('US'); codes.add('UNITED STATES'); }
   return codes;
 }
 
 /** Search JSearch (RapidAPI — PRIMARY source) */
-async function searchJSearch(query, regions, days, experienceLevel, limit = 50) {
+async function searchJSearch(query, regions, days, experienceLevel, limit = 80) {
   const apiKey = process.env.RAPIDAPI_KEY;
   if (!apiKey) return [];
   try {
     const datePosted = days <= 1 ? 'today' : days <= 3 ? '3days' : days <= 7 ? 'week' : 'month';
 
-    // Build queries for each region
-    const queries = regions.map(r => `${query} in ${r}`);
+    // Map experience level to JSearch requirement
+    const expRequirement = experienceLevel === 'senior' ? 'more_than_3_years'
+      : experienceLevel === 'mid' ? 'under_3_years'
+      : experienceLevel === 'junior' ? 'no_experience' : '';
 
-    // Add experience-level specific queries for better results
-    if (experienceLevel === 'senior') {
-      queries.push(...regions.map(r => `senior ${query} in ${r}`));
-    } else if (experienceLevel === 'junior') {
-      queries.push(...regions.map(r => `junior ${query} in ${r}`));
+    // Build targeted queries for major job boards
+    const queries = [];
+    // Region-specific queries (Indeed, LinkedIn, ZipRecruiter, Dice pull through)
+    for (const r of regions) {
+      queries.push(`${query} in ${r}`);
     }
+    // Source-targeted queries for better coverage from specific boards
+    const topRegion = regions[0] || 'United States';
+    queries.push(`${query} in ${topRegion} jobs`);
 
-    const fetchPage = (q, page) =>
-      httpClient.get('https://jsearch.p.rapidapi.com/search', {
-        params: {
-          query: q,
-          page: String(page),
-          num_pages: '1',
-          date_posted: datePosted,
-          remote_jobs_only: false,
-        },
+    const fetchPage = (q, remoteOnly = false, page = 1) => {
+      const params = {
+        query: q,
+        page: String(page),
+        num_pages: '10',
+        date_posted: datePosted,
+        remote_jobs_only: remoteOnly,
+      };
+      if (expRequirement) params.job_requirements = expRequirement;
+      return httpClient.get('https://jsearch.p.rapidapi.com/search', {
+        params,
         headers: {
           'X-RapidAPI-Key': apiKey,
           'X-RapidAPI-Host': 'jsearch.p.rapidapi.com',
         },
       }).then(res => res.data?.data || []).catch(() => []);
+    };
 
-    // Fetch 3 pages per query
-    const pagePromises = [];
-    for (const q of queries) {
-      for (let page = 1; page <= 3; page++) {
-        pagePromises.push(fetchPage(q, page));
-      }
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // Execute API calls with delays to avoid 429 rate limits
+    const allResults = [];
+    for (let i = 0; i < queries.length; i++) {
+      const results = await fetchPage(queries[i]);
+      allResults.push(...results);
+      if (i < queries.length - 1) await delay(500);
     }
-    const pageResults = await Promise.all(pagePromises);
-    const allResults = pageResults.flat();
+    // Remote-only call with region (to avoid random country results)
+    await delay(500);
+    const remoteResults = await fetchPage(`${query} in ${topRegion}`, true);
+    allResults.push(...remoteResults);
 
-    // Filter by allowed countries
+    // Strict country filtering — only allow user's chosen regions
     const allowedCodes = getAllowedCountryCodes(regions);
     const filtered = allResults.filter(j => {
       const country = (j.job_country || '').toUpperCase();
-      return allowedCodes.has(country) || allowedCodes.has('') || !j.job_country;
+      // Allow jobs where country matches user's region OR job is remote with no country
+      if (allowedCodes.has(country)) return true;
+      // Allow remote jobs that don't specify a country
+      if (!j.job_country && j.job_is_remote) return true;
+      return false;
     });
 
-    console.log(`[JSearch] Raw: ${allResults.length}, After region filter: ${filtered.length}`);
+    // Deduplicate by employer+title before slicing
+    const seenKeys = new Set();
+    const deduped = filtered.filter(j => {
+      const k = `${j.employer_name}|${j.job_title}`.toLowerCase();
+      if (seenKeys.has(k)) return false;
+      seenKeys.add(k);
+      return true;
+    });
 
-    return filtered.slice(0, limit).map(j => ({
+    return deduped.slice(0, limit).map(j => ({
       employer_name: j.employer_name || '',
       job_title: j.job_title || '',
       job_city: j.job_city || '',
@@ -276,37 +304,309 @@ async function searchJSearch(query, regions, days, experienceLevel, limit = 50) 
       job_max_salary: j.job_max_salary || '',
       job_salary_currency: j.job_salary_currency || '',
     }));
-  } catch (err) {
-    console.warn('JSearch error:', err.message);
+  } catch {
     return [];
   }
 }
 
-/** Search Remotive (remote jobs — SECONDARY source) */
+/** Search Remotive (remote jobs — SECONDARY source, reduced limit for quality) */
 async function searchRemotive(query, limit = 20) {
   try {
-    const { data } = await httpClient.get('https://remotive.com/api/remote-jobs', {
-      params: { search: query, limit },
+    // Try multiple search variations for more results
+    const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const searches = [query];
+    if (words.length > 1) searches.push(words[0]); // single keyword search
+    
+    const allJobs = [];
+    for (const q of searches) {
+      const { data } = await httpClient.get('https://remotive.com/api/remote-jobs', {
+        params: { search: q, limit },
+      });
+      allJobs.push(...(data.jobs || []));
+    }
+    // Deduplicate by id
+    const seen = new Set();
+    const unique = allJobs.filter(j => {
+      if (!j.url || !j.url.startsWith('http') || seen.has(j.id)) return false;
+      seen.add(j.id);
+      return true;
     });
-    return (data.jobs || [])
-      .filter(j => j.url && j.url.startsWith('http'))
-      .map(j => ({
-        employer_name: j.company_name || '',
-        job_title: j.title || '',
-        job_city: 'Remote',
-        job_state: '',
-        job_country: '',
-        job_employment_type: j.job_type || '',
-        job_apply_link: j.url || '',
-        employer_logo: j.company_logo_url || '',
-        jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 3000),
-        source: 'Remotive',
-        posted: j.publication_date || '',
-      }));
-  } catch (err) {
-    console.warn('Remotive search error:', err.message);
+    return unique.map(j => ({
+      employer_name: j.company_name || '',
+      job_title: j.title || '',
+      job_city: 'Remote',
+      job_state: '',
+      job_country: '',
+      job_employment_type: j.job_type || '',
+      job_apply_link: j.url || '',
+      employer_logo: j.company_logo_url || '',
+      jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 3000),
+      source: 'Remotive',
+      posted: j.publication_date || '',
+    }));
+  } catch {
     return [];
   }
+}
+
+/** Search RemoteOK (additional remote tech jobs — FREE, no auth, reduced limit for quality) */
+async function searchRemoteOK(query, limit = 20) {
+  try {
+    const { data } = await httpClient.get('https://remoteok.com/api', {
+      headers: { 'User-Agent': 'INNOGARAGE-JobSearch/1.0' },
+      timeout: 10000,
+    });
+    // First item is metadata, actual jobs start from index 1
+    const jobs = (Array.isArray(data) ? data.slice(1) : []);
+    const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    // Score each job by how many query words match
+    const scored = jobs.map(j => {
+      const text = `${j.position || ''} ${(j.tags || []).join(' ')} ${j.company || ''} ${j.description || ''}`.toLowerCase();
+      const hits = queryWords.filter(w => text.includes(w)).length;
+      return { j, hits };
+    }).filter(({ hits }) => hits >= 2)  // Require at least 2 keyword matches for quality
+      .sort((a, b) => b.hits - a.hits)
+      .slice(0, limit);
+    return scored.map(({ j }) => ({
+      employer_name: j.company || '',
+      job_title: j.position || '',
+      job_city: 'Remote',
+      job_state: '',
+      job_country: '',
+      job_employment_type: 'FULLTIME',
+      job_apply_link: j.url ? (j.url.startsWith('http') ? j.url : `https://remoteok.com${j.url}`) : '',
+      employer_logo: j.company_logo || '',
+      jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 3000),
+      source: 'RemoteOK',
+      posted: j.date || '',
+      job_min_salary: j.salary_min || '',
+      job_max_salary: j.salary_max || '',
+      job_salary_currency: 'USD',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Search Arbeitnow (free job API — no auth needed) */
+async function searchArbeitnow(query, limit = 50) {
+  try {
+    const { data } = await httpClient.get('https://www.arbeitnow.com/api/job-board-api', {
+      timeout: 10000,
+    });
+    const jobs = data?.data || [];
+    const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    const scored = jobs.map(j => {
+      const text = `${j.title || ''} ${j.company_name || ''} ${(j.tags || []).join(' ')} ${j.description || ''}`.toLowerCase();
+      const hits = queryWords.filter(w => text.includes(w)).length;
+      return { j, hits };
+    }).filter(({ hits }) => hits >= 2)  // Require at least 2 keyword matches for quality
+      .sort((a, b) => b.hits - a.hits)
+      .slice(0, limit);
+    return scored.map(({ j }) => ({
+      employer_name: j.company_name || '',
+      job_title: j.title || '',
+      job_city: j.location || '',
+      job_state: '',
+      job_country: '',
+      job_employment_type: j.remote ? 'Remote' : 'FULLTIME',
+      job_apply_link: j.url || '',
+      employer_logo: '',
+      jd: (j.description || '').replace(/<[^>]*>/g, ' ').substring(0, 3000),
+      source: 'Arbeitnow',
+      posted: j.created_at ? new Date(j.created_at * 1000).toISOString() : '',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Search Jobicy (free remote job API — no auth needed) */
+async function searchJobicy(query, limit = 50) {
+  try {
+    const tag = query.split(/\s+/)[0].toLowerCase();
+    const { data } = await httpClient.get(`https://jobicy.com/api/v2/remote-jobs`, {
+      params: { count: limit, tag },
+      timeout: 10000,
+    });
+    const jobs = data?.jobs || [];
+    return jobs.map(j => ({
+      employer_name: j.companyName || '',
+      job_title: j.jobTitle || '',
+      job_city: j.jobGeo || 'Remote',
+      job_state: '',
+      job_country: j.jobGeo || '',
+      job_employment_type: j.jobType || '',
+      job_apply_link: j.url || '',
+      employer_logo: j.companyLogo || '',
+      jd: (j.jobDescription || '').replace(/<[^>]*>/g, ' ').substring(0, 3000),
+      source: 'Jobicy',
+      posted: j.pubDate || '',
+      job_min_salary: j.annualSalaryMin || '',
+      job_max_salary: j.annualSalaryMax || '',
+      job_salary_currency: j.salaryCurrency || 'USD',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ───── Module-Level Constants (allocated once, not per-call) ─────
+
+const TECH_EXTRACT_RE = /\b(Java|Python|JavaScript|TypeScript|React|Angular|Vue|Next\.?js|Node\.?js|Express|NestJS|Spring|Django|Flask|FastAPI|AWS|Azure|GCP|Docker|Kubernetes|SQL|NoSQL|MongoDB|PostgreSQL|MySQL|Redis|GraphQL|REST|Git|CI\/CD|Agile|Scrum|HTML|CSS|Tailwind|Bootstrap|C\+\+|C#|\.NET|Go|Rust|Swift|Kotlin|PHP|Ruby|Rails|Laravel|TensorFlow|PyTorch|Machine Learning|AI|Data Science|DevOps|Linux|Terraform|Kafka|Microservices|Selenium|Jest|Figma|Jira|Salesforce|SAP|Oracle|Flutter|React Native|Pandas|NumPy|Power\s?BI|Tableau|Spark|Hadoop|Snowflake|Databricks|Cypress|Playwright|Webpack|Vite|Nginx|Prometheus|Grafana|Jenkins|CRM|PowerPlatform|Power\s?Apps|Dynamics|AEP|Adobe|Marketo|HubSpot|MERN|MEAN|Full\s*Stack|Frontend|Backend|Web\s*Development|Mobile\s*Development|Cloud|API|Blockchain|Web3|Unity|Unreal)\b/gi;
+
+const SKILL_ALIASES = {
+  'node.js': ['node', 'nodejs', 'node.js', 'node js'],
+  'node': ['node', 'nodejs', 'node.js', 'node js'],
+  'nodejs': ['node', 'nodejs', 'node.js'],
+  'react': ['react', 'reactjs', 'react.js'],
+  'react.js': ['react', 'reactjs', 'react.js'],
+  'reactjs': ['react', 'reactjs', 'react.js'],
+  'vue': ['vue', 'vuejs', 'vue.js'],
+  'vue.js': ['vue', 'vuejs', 'vue.js'],
+  'angular': ['angular', 'angularjs', 'angular.js'],
+  'angularjs': ['angular', 'angularjs'],
+  'next.js': ['next', 'nextjs', 'next.js'],
+  'nextjs': ['next', 'nextjs', 'next.js'],
+  'typescript': ['typescript', 'ts '],
+  'ts': ['typescript', ' ts '],
+  'javascript': ['javascript', 'js ', 'ecmascript'],
+  'js': ['javascript', ' js '],
+  'java': ['java', ' java '],
+  'python': ['python'],
+  'c++': ['c++', 'cpp', 'c plus plus'],
+  'cpp': ['c++', 'cpp'],
+  'c#': ['c#', 'csharp', 'c sharp', 'c-sharp'],
+  'csharp': ['c#', 'csharp'],
+  '.net': ['.net', 'dotnet', 'dot net', 'asp.net'],
+  'dotnet': ['.net', 'dotnet'],
+  'aws': ['aws', 'amazon web services', 'amazon cloud'],
+  'gcp': ['gcp', 'google cloud'],
+  'azure': ['azure', 'microsoft cloud'],
+  'ci/cd': ['ci/cd', 'cicd', 'ci cd', 'continuous integration', 'continuous delivery'],
+  'postgresql': ['postgresql', 'postgres', 'psql'],
+  'postgres': ['postgresql', 'postgres'],
+  'mongodb': ['mongodb', 'mongo'],
+  'mongo': ['mongodb', 'mongo'],
+  'machine learning': ['machine learning', ' ml ', 'deep learning'],
+  'ml': ['machine learning', ' ml '],
+  'artificial intelligence': ['artificial intelligence', ' ai ', 'machine learning'],
+  'ai': ['artificial intelligence', ' ai ', 'machine learning'],
+  'ui/ux': ['ui/ux', 'uiux', 'ui ux', 'user experience', 'user interface', 'ux design'],
+  'devops': ['devops', 'dev ops', 'site reliability'],
+  'docker': ['docker', 'container'],
+  'kubernetes': ['kubernetes', 'k8s'],
+  'k8s': ['kubernetes', 'k8s'],
+  'sql': ['sql', 'database', 'relational database'],
+  'nosql': ['nosql', 'no-sql', 'non-relational'],
+  'graphql': ['graphql', 'graph ql'],
+  'rest': ['rest', 'restful', 'rest api'],
+  'api': ['api', 'apis', 'rest api', 'web service'],
+  'html': ['html', 'html5'],
+  'css': ['css', 'css3', 'stylesheet'],
+  'tailwind': ['tailwind', 'tailwindcss'],
+  'bootstrap': ['bootstrap'],
+  'express': ['express', 'express.js', 'expressjs'],
+  'express.js': ['express', 'express.js', 'expressjs'],
+  'spring': ['spring', 'spring boot', 'springboot'],
+  'spring boot': ['spring boot', 'springboot', 'spring'],
+  'django': ['django'],
+  'flask': ['flask'],
+  'laravel': ['laravel'],
+  'ruby': ['ruby', 'ruby on rails'],
+  'rails': ['rails', 'ruby on rails'],
+  'go': ['golang', ' go '],
+  'golang': ['golang', ' go '],
+  'rust': ['rust', ' rust '],
+  'swift': ['swift', 'swiftui'],
+  'kotlin': ['kotlin'],
+  'flutter': ['flutter'],
+  'react native': ['react native', 'react-native'],
+  'terraform': ['terraform', 'iac', 'infrastructure as code'],
+  'jenkins': ['jenkins', 'ci/cd'],
+  'git': [' git ', 'github', 'gitlab', 'version control'],
+  'agile': ['agile', 'scrum', 'kanban'],
+  'scrum': ['scrum', 'agile'],
+  'jira': ['jira'],
+  'linux': ['linux', 'unix', 'ubuntu'],
+  'crm': ['crm', 'customer relationship', 'dynamics crm', 'salesforce'],
+  'powerplatform': ['power platform', 'powerplatform', 'power apps', 'powerapps'],
+  'power platform': ['power platform', 'powerplatform', 'power apps'],
+  'salesforce': ['salesforce', 'sfdc', 'crm'],
+  'sap': ['sap', 'sap hana'],
+  'oracle': ['oracle', 'oracle db'],
+  'aep': ['aep', 'adobe experience platform', 'adobe'],
+  'aep devloper': ['aep', 'adobe experience platform', 'adobe', 'experience platform'],
+  'aep developer': ['aep', 'adobe experience platform', 'adobe', 'experience platform'],
+  'full stack': ['full stack', 'fullstack', 'full-stack'],
+  'fullstack': ['full stack', 'fullstack', 'full-stack'],
+  'full-stack': ['full stack', 'fullstack', 'full-stack'],
+  'frontend': ['frontend', 'front end', 'front-end', 'ui'],
+  'front end': ['frontend', 'front end', 'front-end'],
+  'backend': ['backend', 'back end', 'back-end', 'server side'],
+  'back end': ['backend', 'back end', 'back-end'],
+  'mern': ['mern', 'mongodb', 'express', 'react', 'node'],
+  'mean': ['mean', 'mongodb', 'express', 'angular', 'node'],
+  'data science': ['data science', 'data scientist', 'data analysis'],
+  'web development': ['web development', 'web developer', 'web app'],
+  'mobile development': ['mobile development', 'mobile developer', 'mobile app'],
+  'cloud': ['cloud', 'aws', 'azure', 'gcp'],
+  'blockchain': ['blockchain', 'web3', 'smart contract'],
+  'figma': ['figma', 'design tool'],
+  'selenium': ['selenium', 'test automation'],
+  'cypress': ['cypress', 'test automation'],
+  'jest': ['jest', 'unit test'],
+  'pandas': ['pandas', 'data analysis'],
+  'numpy': ['numpy', 'numerical'],
+  'tableau': ['tableau', 'data visualization'],
+  'power bi': ['power bi', 'powerbi', 'data visualization'],
+  'spark': ['spark', 'apache spark', 'pyspark'],
+  'kafka': ['kafka', 'event streaming', 'message queue'],
+  'redis': ['redis', 'caching', 'in-memory'],
+  'elasticsearch': ['elasticsearch', 'elastic', 'search engine'],
+  'firebase': ['firebase', 'firestore'],
+  'supabase': ['supabase'],
+  'prisma': ['prisma', 'orm'],
+  'nginx': ['nginx', 'reverse proxy'],
+  'webpack': ['webpack', 'bundler'],
+  'vite': ['vite', 'bundler'],
+};
+
+const IMPLIED_BY = {
+  'javascript': ['react', 'angular', 'vue', 'next.js', 'nextjs', 'nuxt', 'typescript', 'node.js', 'nodejs', 'express', 'jquery', 'svelte', 'gatsby'],
+  'html': ['react', 'angular', 'vue', 'next.js', 'frontend', 'front end', 'web developer', 'ui developer'],
+  'css': ['react', 'angular', 'vue', 'next.js', 'frontend', 'front end', 'tailwind', 'bootstrap', 'sass', 'scss'],
+  'java': ['spring', 'spring boot', 'springboot', 'hibernate', 'jpa'],
+  'python': ['django', 'flask', 'fastapi', 'pandas', 'numpy', 'tensorflow', 'pytorch', 'scikit'],
+  'ruby': ['rails', 'ruby on rails'],
+  'php': ['laravel', 'symfony', 'wordpress'],
+  'typescript': ['angular', 'next.js', 'nextjs', 'nestjs'],
+};
+
+const DOMAIN_KEYWORDS = {
+  frontend: ['frontend', 'front end', 'front-end', 'react', 'angular', 'vue', 'ui ', 'web developer'],
+  backend: ['backend', 'back end', 'back-end', 'server', 'api developer', 'node.js developer', 'java developer', 'python developer'],
+  fullstack: ['full stack', 'fullstack', 'full-stack', 'mern', 'mean'],
+  devops: ['devops', 'dev ops', 'sre', 'infrastructure', 'cloud engineer', 'platform engineer'],
+  data: ['data engineer', 'data scientist', 'data analyst', 'machine learning', 'ml engineer', 'ai engineer'],
+  mobile: ['mobile', 'ios', 'android', 'flutter', 'react native'],
+  security: ['security', 'cybersecurity', 'infosec', 'penetration'],
+};
+
+// ───── Resume Section Extractor ─────
+
+/** Extract a section (experience, education, skills) from parsed resume text */
+function extractResumeSection(resumeText, sectionName) {
+  if (!resumeText) return '';
+  const patterns = {
+    experience: /(?:PROFESSIONAL\s*EXPERIENCE|WORK\s*EXPERIENCE|EXPERIENCE)\s*\n([\s\S]*?)(?=\n\s*(?:EDUCATION|SKILLS|KEY\s*SKILLS|TECHNICAL\s*SKILLS|CERTIFICATIONS|PROJECTS|$))/i,
+    education: /(?:EDUCATION)\s*\n([\s\S]*?)(?=\n\s*(?:EXPERIENCE|SKILLS|KEY\s*SKILLS|TECHNICAL\s*SKILLS|CERTIFICATIONS|PROJECTS|$))/i,
+    skills: /(?:SKILLS|KEY\s*SKILLS|TECHNICAL\s*SKILLS|CORE\s*COMPETENCIES)\s*\n([\s\S]*?)(?=\n\s*(?:EXPERIENCE|EDUCATION|CERTIFICATIONS|PROJECTS|$))/i,
+  };
+  const re = patterns[sectionName];
+  if (!re) return '';
+  const match = resumeText.match(re);
+  return match ? match[1].trim().substring(0, 2000) : '';
 }
 
 // ───── Deep Match Scoring ─────
@@ -319,13 +619,31 @@ async function searchRemotive(query, limit = 20) {
  *   - Education (10%): education level alignment
  */
 function computeMatchScore(job, student) {
-  const skills = (student.keySkills || []).map(s => s.toLowerCase().trim()).filter(Boolean);
+  const rawSkills = (student.keySkills || []).map(s => s.toLowerCase().trim()).filter(Boolean);
   const role = (student.jobRole || '').toLowerCase();
   const jdAnalysis = analyzeJD(job.jd);
   const jobText = `${job.job_title} ${job.jd}`.toLowerCase();
 
+  const roleSkills = (student.jobRole || '').match(TECH_EXTRACT_RE) || [];
+  const expSkills = (student.experience || '').match(TECH_EXTRACT_RE) || [];
+  // Also extract skills from parsed resume text
+  const resumeSkills = (student.parsedResumeText || '').match(TECH_EXTRACT_RE) || [];
+  const extractedSkills = [...new Set([...roleSkills, ...expSkills, ...resumeSkills].map(s => s.toLowerCase().trim()))];
+
+  // Merge: keySkills + extracted skills from role/experience (deduplicated)
+  const allStudentSkills = [...new Set([...rawSkills, ...extractedSkills])];
+  const skills = allStudentSkills.length > 0 ? allStudentSkills : rawSkills;
+
   if (skills.length === 0 && !role) {
-    return { score: 50, strongMatches: [], missingSkills: [], summary: 'No skills provided for matching.', jdAnalysis };
+    // Even with no skills, show what the JD requires
+    const jdSkillsList = (jdAnalysis.jdSkills || []).slice(0, 8);
+    return {
+      score: 30,
+      strongMatches: [],
+      missingSkills: jdSkillsList.length > 0 ? jdSkillsList : ['Update your profile skills for better matching'],
+      summary: 'No skills in profile — add your key skills for better job matching.',
+      jdAnalysis
+    };
   }
 
   // ── 1. Skills Match (50%) ──
@@ -333,34 +651,13 @@ function computeMatchScore(job, student) {
   const missingSkills = [];
   const partialMatches = [];
 
-  // Common tech name aliases for fuzzy matching
-  const skillAliases = {
-    'node.js': ['node', 'nodejs', 'node.js'],
-    'react': ['react', 'reactjs', 'react.js'],
-    'vue': ['vue', 'vuejs', 'vue.js'],
-    'angular': ['angular', 'angularjs'],
-    'next.js': ['next', 'nextjs', 'next.js'],
-    'typescript': ['typescript', 'ts'],
-    'javascript': ['javascript', 'js', 'ecmascript'],
-    'c++': ['c++', 'cpp'],
-    'c#': ['c#', 'csharp', 'c sharp'],
-    '.net': ['.net', 'dotnet', 'dot net'],
-    'aws': ['aws', 'amazon web services'],
-    'gcp': ['gcp', 'google cloud'],
-    'ci/cd': ['ci/cd', 'cicd', 'ci cd', 'continuous integration'],
-    'postgresql': ['postgresql', 'postgres'],
-    'mongodb': ['mongodb', 'mongo'],
-    'machine learning': ['machine learning', 'ml'],
-    'artificial intelligence': ['artificial intelligence', 'ai'],
-    'ui/ux': ['ui/ux', 'uiux', 'ui ux', 'user experience', 'user interface'],
-  };
-
   for (const skill of skills) {
     const skillLower = skill.toLowerCase();
-    // Get aliases for this skill
-    const aliases = skillAliases[skillLower] || [skillLower];
-    // Check any alias matches in JD text
-    const matched = aliases.some(alias => jobText.includes(alias));
+    const aliases = SKILL_ALIASES[skillLower] || [skillLower];
+    let matched = aliases.some(alias => jobText.includes(alias));
+    if (!matched && IMPLIED_BY[skillLower]) {
+      matched = IMPLIED_BY[skillLower].some(framework => jobText.includes(framework));
+    }
     if (matched) {
       strongMatches.push(skill);
     } else {
@@ -392,10 +689,13 @@ function computeMatchScore(job, student) {
 
   const allMissing = [...missingSkills, ...extraMissing.slice(0, 5)];
 
-  const totalSkillsToMatch = Math.max(skills.length, jdRequiredLower.length, 1);
-  const matchedCount = strongMatches.length + partialMatches.length * 0.5;
+  // Skill scoring: use student's own skills as denominator (not JD's long list)
+  const studentSkillCount = Math.max(skills.length, 1);
+  const matchedCount = strongMatches.length + partialMatches.length * 0.85;
+  const studentCoverage = Math.min(matchedCount / studentSkillCount, 1.0); // How many of YOUR skills matched
   const jdCoverage = jdRequiredLower.length > 0 ? jdMatchedRequired.length / jdRequiredLower.length : 0.5;
-  const skillScore = ((matchedCount / totalSkillsToMatch) * 0.6 + jdCoverage * 0.4) * 50;
+  // Weight student coverage heavily — if most of your skills match, that's great
+  const skillScore = (studentCoverage * 0.82 + jdCoverage * 0.18) * 50;
 
   // ── 2. Role Fit (25%) ──
   let roleFitScore = 0;
@@ -417,14 +717,14 @@ function computeMatchScore(job, student) {
   }
 
   // ── 3. Experience Match (15%) ──
-  let expScore = 7.5; // Default mid-score
+  let expScore = 9; // Default mid-score (more generous)
   const studentYears = parseExperienceYears(student.experience);
   if (studentYears > 0 && jdAnalysis.requiredYears > 0) {
     const diff = studentYears - jdAnalysis.requiredYears;
     if (diff >= 0) expScore = 15; // Meets or exceeds
-    else if (diff >= -1) expScore = 11; // Close enough
-    else if (diff >= -2) expScore = 7; // Slightly under
-    else expScore = 3; // Significantly under
+    else if (diff >= -1) expScore = 12; // Close enough
+    else if (diff >= -2) expScore = 10; // Slightly under
+    else expScore = 5; // Significantly under
   } else if (studentYears > 0) {
     // No years in JD — check seniority alignment
     const studentLevel = studentYears >= 7 ? 'senior' : studentYears >= 3 ? 'mid' : 'junior';
@@ -433,7 +733,7 @@ function computeMatchScore(job, student) {
   }
 
   // ── 4. Education Match (10%) ──
-  let eduScore = 5; // Default
+  let eduScore = 7; // Default (generous baseline)
   const studentEdu = parseEducationLevel(student.education);
   if (studentEdu && jdAnalysis.requiredEducation) {
     const eduLevels = { 'diploma': 1, 'other': 1, 'bachelors': 2, 'masters': 3, 'phd': 4 };
@@ -446,8 +746,18 @@ function computeMatchScore(job, student) {
     eduScore = 7; // Has education, JD doesn't specify
   }
 
+  // ── 5. Category & Relevance Bonus (up to +5) ──
+  let bonusScore = 0;
+  const titleAndJD = `${job.job_title} ${job.jd}`.toLowerCase();
+  const roleLower = role.toLowerCase();
+  for (const [domain, keywords] of Object.entries(DOMAIN_KEYWORDS)) {
+    const studentInDomain = keywords.some(kw => roleLower.includes(kw) || skills.some(s => s.toLowerCase().includes(kw)));
+    const jobInDomain = keywords.some(kw => titleAndJD.includes(kw));
+    if (studentInDomain && jobInDomain) { bonusScore = 5; break; }
+  }
+
   // ── Total Score ──
-  const totalScore = Math.min(100, Math.round(skillScore + roleFitScore + expScore + eduScore));
+  const totalScore = Math.min(100, Math.round(skillScore + roleFitScore + expScore + eduScore + bonusScore));
 
   // ── Summary ──
   const parts = [];
@@ -467,7 +777,8 @@ function computeMatchScore(job, student) {
 
   return {
     score: totalScore,
-    strongMatches: [...strongMatches, ...partialMatches.map(p => `${p} (partial)`)],
+    strongMatches,
+    partialMatches,
     missingSkills: allMissing,
     summary,
     jdAnalysis,
@@ -476,53 +787,51 @@ function computeMatchScore(job, student) {
 
 // ───── Tailored Resume Generation ─────
 
-/** Generate a tailored resume using Gemini AI */
-async function generateResumeWithGemini(student, job, matchResult) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+// Cache OpenAI client to avoid re-creating per call
+let _openaiClient = null;
+function getOpenAIClient() {
+  if (!_openaiClient) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return null;
+    const OpenAI = require('openai');
+    _openaiClient = new OpenAI({ apiKey });
+  }
+  return _openaiClient;
+}
+
+/** Generate a tailored resume using OpenAI GPT (with 8s timeout) */
+async function generateResumeWithAI(student, job, matchResult) {
+  const openai = getOpenAIClient();
+  if (!openai) return null;
 
   try {
-    const { GoogleGenerativeAI } = require('@google/generative-ai');
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const prompt = `Generate a tailored resume for this candidate for the job below. Be concise (under 500 words).
 
-    const prompt = `Generate a tailored professional resume for the following candidate, optimized for the specific job description below.
+CANDIDATE: ${student.fullName || 'Candidate'} | Role: ${student.jobRole || 'Software Professional'}
+Skills: ${(student.keySkills || []).join(', ')}
+Experience: ${student.experience || 'Not specified'}
+Education: ${student.education || 'Not specified'}
+${student.parsedResumeText ? `Original Resume Content:\n${student.parsedResumeText.substring(0, 1500)}` : ''}
 
-CANDIDATE PROFILE:
-- Name: ${student.fullName || 'Candidate'}
-- Target Role: ${student.jobRole || 'Software Professional'}
-- Key Skills: ${(student.keySkills || []).join(', ') || 'Not specified'}
-- Experience: ${student.experience || 'Not specified'}
-- Education: ${student.education || 'Not specified'}
-- Location: ${student.location || 'Not specified'}
+JOB: ${job.job_title} at ${job.employer_name}
+JD: ${job.jd.substring(0, 1200)}
 
-JOB DETAILS:
-- Title: ${job.job_title}
-- Company: ${job.employer_name}
-- Description: ${job.jd.substring(0, 2000)}
+Matched Skills: ${matchResult.strongMatches.slice(0, 6).join(', ')}
+Missing: ${matchResult.missingSkills.slice(0, 5).join(', ')}
 
-MATCHING ANALYSIS:
-- Strong Matches: ${matchResult.strongMatches.join(', ')}
-- Missing Skills: ${matchResult.missingSkills.join(', ')}
+FORMAT: Plain text only. Start with candidate name, then role title. Use UPPERCASE headers: PROFESSIONAL SUMMARY, PROFESSIONAL EXPERIENCE, EDUCATION, KEY SKILLS. If missing key skills, add NOTES ON ADDRESSED GAPS. No markdown (**,##).`;
 
-FORMAT RULES (CRITICAL — follow exactly):
-1. Start with the candidate's name on the first line
-2. Second line: target role title
-3. Use UPPERCASE section headers on their own line: PROFESSIONAL SUMMARY, PROFESSIONAL EXPERIENCE, EDUCATION, KEY SKILLS, CERTIFICATIONS
-4. Professional Summary: 3-4 sentences highlighting relevant experience and skills matching this JD
-5. Professional Experience: 2-3 role entries with bullet points emphasizing skills relevant to this JD
-6. Education: Degree details
-7. Key Skills: Bullet-pointed list organized by relevance to this JD (matched skills first)
-8. If candidate is missing key JD skills, add a "NOTES ON ADDRESSED GAPS" section briefly noting transferable skills
-9. Do NOT invent fake companies or degrees — use the candidate's actual background, tailoring the emphasis
-10. Keep it concise — under 600 words
-11. Use plain text only, no markdown formatting like ** or ##`;
-
-    const result = await model.generateContent(prompt);
-    const text = result.response.text();
-    return text || null;
-  } catch (err) {
-    console.warn('[Gemini Resume] Error:', err.message);
+    // Race against 8s timeout
+    const aiCall = openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 800,
+      temperature: 0.7,
+    });
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000));
+    const response = await Promise.race([aiCall, timeout]);
+    return response.choices?.[0]?.message?.content || null;
+  } catch {
     return null;
   }
 }
@@ -534,62 +843,250 @@ function generateTemplateResume(student, job, matchResult) {
   const skills = student.keySkills || [];
   const experience = student.experience || '';
   const education = student.education || '';
-  const jdAnalysis = matchResult.jdAnalysis || {};
+  const resumeText = student.parsedResumeText || '';
+  const partials = matchResult.partialMatches || [];
 
-  // Organize skills: matched first, then others
-  const matchedSkills = matchResult.strongMatches.map(s => s.replace(' (partial)', ''));
-  const otherSkills = skills.filter(s => !matchedSkills.map(m => m.toLowerCase()).includes(s.toLowerCase()));
-  const orderedSkills = [...matchedSkills, ...otherSkills];
+  // Organize skills by relevance
+  const matchedSkills = matchResult.strongMatches || [];
+  const partialSkills = partials.filter(s => !matchedSkills.map(m => m.toLowerCase()).includes(s.toLowerCase()));
+  // Also pull extra skills from parsed resume
+  const resumeSkillsRaw = resumeText ? (resumeText.match(TECH_EXTRACT_RE) || []).map(s => s.trim()) : [];
+  const allKnown = new Set([...matchedSkills, ...partialSkills, ...skills].map(s => s.toLowerCase()));
+  const extraResumeSkills = [...new Set(resumeSkillsRaw.filter(s => !allKnown.has(s.toLowerCase())))].slice(0, 8);
+  const otherSkills = [...skills.filter(s =>
+    !matchedSkills.map(m => m.toLowerCase()).includes(s.toLowerCase()) &&
+    !partialSkills.map(p => p.toLowerCase()).includes(s.toLowerCase())
+  ), ...extraResumeSkills];
 
-  // Build professional summary
   const topMatches = matchedSkills.slice(0, 5).join(', ');
+  const yearsText = experience.match(/(\d+)\s*\+?\s*year/i)?.[0] || '';
+
+  // Professional Summary
   const summaryLine = topMatches
-    ? `Results-driven ${role} with expertise in ${topMatches}. Proven track record of delivering high-quality solutions in fast-paced environments. Seeking to leverage technical skills and experience to contribute to ${job.employer_name}'s team as ${job.job_title}.`
-    : `Motivated ${role} with a strong foundation in software development and a passion for building impactful solutions. Eager to apply skills and knowledge to the ${job.job_title} role at ${job.employer_name}.`;
+    ? `${role}${yearsText ? ` with ${yearsText} of experience` : ''} specializing in ${topMatches}. Proven ability to deliver scalable, production-ready solutions. Seeking to contribute expertise to ${job.employer_name || 'a forward-thinking team'} as ${job.job_title}.`
+    : `${role} with a strong technical foundation${yearsText ? ` and ${yearsText} of experience` : ''}. Passionate about building impactful solutions and eager to apply skills to the ${job.job_title} role at ${job.employer_name || 'your organization'}.`;
 
-  // Build experience section
+  // Experience Section — prefer form field, fall back to parsed resume
   let expSection = '';
-  if (experience) {
-    // Parse experience text — try to structure it
-    const expLines = experience.split(/\n|;|\|/).map(l => l.trim()).filter(Boolean);
-    expSection = expLines.map(line => {
-      // If it's already a structured entry, use it
-      if (line.length > 20) return line;
-      return `- ${line}`;
-    }).join('\n');
+  const expSource = experience || extractResumeSection(resumeText, 'experience') || '';
+  if (expSource) {
+    const expLines = expSource.split(/\n|;|\|/).map(l => l.trim()).filter(Boolean);
+    expSection = expLines.map(line => line.length > 20 ? line : `  • ${line}`).join('\n');
   } else {
-    expSection = `- Developed and maintained applications using ${orderedSkills.slice(0, 4).join(', ')}\n- Collaborated with cross-functional teams to deliver projects on time\n- Implemented best practices for code quality and testing`;
+    const techList = [...matchedSkills, ...partialSkills].slice(0, 4).join(', ') || 'modern technologies';
+    expSection = `  • Developed and maintained applications using ${techList}\n  • Collaborated with cross-functional teams to deliver projects on schedule\n  • Implemented best practices for code quality, testing, and documentation`;
   }
 
-  // Build education section
-  let eduSection = education || 'Bachelor\'s Degree in Computer Science';
+  // Education Section — prefer form field, fall back to parsed resume
+  const eduSection = education || extractResumeSection(resumeText, 'education') || "Bachelor's Degree in Computer Science";
 
-  // Build skills section — organized by relevance to JD
-  const skillsSection = orderedSkills.length > 0
-    ? orderedSkills.map(s => `- ${s}${matchedSkills.includes(s) ? ' (matches JD requirement)' : ''}`).join('\n')
-    : '- Software Development\n- Problem Solving\n- Team Collaboration';
-
-  // Build gaps section (if any missing critical skills)
-  let gapsSection = '';
-  if (matchResult.missingSkills.length > 0) {
-    const gaps = matchResult.missingSkills.slice(0, 4);
-    gapsSection = `\nNOTES ON ADDRESSED GAPS\n${gaps.map(g => `- ${g}: Demonstrates strong foundational knowledge and ability to quickly upskill in related technologies`).join('\n')}`;
+  // Technical Skills — grouped by match status
+  const skillLines = [];
+  if (matchedSkills.length > 0) {
+    skillLines.push(`  Core Skills (JD Match): ${matchedSkills.join(' | ')}`);
+  }
+  if (partialSkills.length > 0) {
+    skillLines.push(`  Related Skills: ${partialSkills.join(' | ')}`);
+  }
+  if (otherSkills.length > 0) {
+    skillLines.push(`  Additional Skills: ${otherSkills.join(' | ')}`);
+  }
+  if (skillLines.length === 0) {
+    skillLines.push('  Software Development | Problem Solving | Team Collaboration');
   }
 
-  return `${name}
-${role}
+  const sections = [
+    `${name}`,
+    `${role}`,
+    '',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    '',
+    'PROFESSIONAL SUMMARY',
+    '─────────────────────',
+    summaryLine,
+    '',
+    'TECHNICAL SKILLS',
+    '─────────────────────',
+    ...skillLines,
+    '',
+    'PROFESSIONAL EXPERIENCE',
+    '─────────────────────',
+    expSection,
+    '',
+    'EDUCATION',
+    '─────────────────────',
+    eduSection,
+  ];
 
-PROFESSIONAL SUMMARY
-${summaryLine}
+  return sections.join('\n');
+}
 
-PROFESSIONAL EXPERIENCE
-${expSection}
+// ───── Smart Query Builder ─────
 
-EDUCATION
-${eduSection}
+/** Map of common misspelled/non-standard role names to proper job titles */
+const ROLE_NORMALIZATION = {
+  'aep devloper': 'Adobe Experience Platform Developer',
+  'aep developer': 'Adobe Experience Platform Developer',
+  'aepdevloper': 'Adobe Experience Platform Developer',
+  'aep': 'Adobe Experience Platform Developer',
+  'mern stack': 'MERN Stack Developer',
+  'mean stack': 'MEAN Stack Developer',
+  'full stack': 'Full Stack Developer',
+  'fullstack': 'Full Stack Developer',
+  'full-stack': 'Full Stack Developer',
+  'frontend': 'Frontend Developer',
+  'front end': 'Frontend Developer',
+  'front-end': 'Frontend Developer',
+  'backend': 'Backend Developer',
+  'back end': 'Backend Developer',
+  'back-end': 'Backend Developer',
+  'devops': 'DevOps Engineer',
+  'sre': 'Site Reliability Engineer',
+  'qa': 'QA Engineer',
+  'ml engineer': 'Machine Learning Engineer',
+  'ai engineer': 'AI Engineer',
+  'data engineer': 'Data Engineer',
+  'data scientist': 'Data Scientist',
+  'data analyst': 'Data Analyst',
+  'cloud engineer': 'Cloud Engineer',
+  'ui/ux': 'UI/UX Designer',
+  'ux designer': 'UX Designer',
+  'ui designer': 'UI Designer',
+  'ios developer': 'iOS Developer',
+  'android developer': 'Android Developer',
+  'mobile developer': 'Mobile Developer',
+  'web developer': 'Web Developer',
+  'react developer': 'React Developer',
+  'node developer': 'Node.js Developer',
+  'python developer': 'Python Developer',
+  'java developer': 'Java Developer',
+  'dotnet developer': '.NET Developer',
+  '.net developer': '.NET Developer',
+  'salesforce developer': 'Salesforce Developer',
+  'crm developer': 'CRM Developer',
+  'dynamics crm developer': 'Microsoft Dynamics CRM Developer',
+  'sap consultant': 'SAP Consultant',
+  'blockchain developer': 'Blockchain Developer',
+  'security engineer': 'Security Engineer',
+  'cybersecurity': 'Cybersecurity Engineer',
+  'database admin': 'Database Administrator',
+  'dba': 'Database Administrator',
+  'sys admin': 'System Administrator',
+  'network engineer': 'Network Engineer',
+  'embedded': 'Embedded Software Engineer',
+  'firmware': 'Firmware Engineer',
+};
 
-KEY SKILLS
-${skillsSection}${gapsSection}`;
+/** Normalize a raw job role string into a proper searchable job title */
+function normalizeJobTitle(rawRole) {
+  if (!rawRole) return 'Software Developer';
+  const lower = rawRole.toLowerCase().trim();
+
+  // Check exact match in normalization map
+  if (ROLE_NORMALIZATION[lower]) return ROLE_NORMALIZATION[lower];
+
+  // Check partial match
+  for (const [key, normalized] of Object.entries(ROLE_NORMALIZATION)) {
+    if (lower.includes(key) || key.includes(lower)) return normalized;
+  }
+
+  // If the role already looks like a proper title (has "developer", "engineer", "designer", etc.), use it
+  if (/\b(developer|engineer|designer|analyst|architect|consultant|manager|administrator|scientist|specialist)\b/i.test(rawRole)) {
+    // Clean up: capitalize words properly
+    return rawRole.replace(/\b\w/g, c => c.toUpperCase()).trim();
+  }
+
+  // Try to make a proper title: "react" → "React Developer", "java" → "Java Developer"
+  const techToRole = {
+    'react': 'React Developer', 'angular': 'Angular Developer', 'vue': 'Vue.js Developer',
+    'node': 'Node.js Developer', 'python': 'Python Developer', 'java': 'Java Developer',
+    'javascript': 'JavaScript Developer', 'typescript': 'TypeScript Developer',
+    'c++': 'C++ Developer', 'c#': 'C# Developer', '.net': '.NET Developer',
+    'go': 'Go Developer', 'golang': 'Go Developer', 'rust': 'Rust Developer',
+    'swift': 'iOS Developer', 'kotlin': 'Android Developer',
+    'ruby': 'Ruby Developer', 'php': 'PHP Developer', 'laravel': 'Laravel Developer',
+    'django': 'Django Developer', 'flask': 'Python Developer',
+    'spring': 'Java Spring Developer', 'aws': 'AWS Cloud Engineer',
+    'azure': 'Azure Cloud Engineer', 'docker': 'DevOps Engineer',
+    'kubernetes': 'DevOps Engineer', 'terraform': 'Infrastructure Engineer',
+    'salesforce': 'Salesforce Developer', 'sap': 'SAP Consultant',
+    'flutter': 'Flutter Developer', 'react native': 'React Native Developer',
+    'sql': 'Database Developer', 'mongodb': 'Backend Developer',
+    'machine learning': 'Machine Learning Engineer', 'ai': 'AI Engineer',
+    'data': 'Data Engineer', 'tableau': 'Data Analyst', 'power bi': 'Data Analyst',
+    'crm': 'CRM Developer', 'powerplatform': 'Power Platform Developer',
+    'adobe': 'Adobe Experience Platform Developer',
+  };
+  for (const [tech, title] of Object.entries(techToRole)) {
+    if (lower.includes(tech)) return title;
+  }
+
+  // Fallback: append "Developer" if it's just a tech name
+  if (rawRole.length < 30 && !/\s/.test(rawRole.trim())) {
+    return `${rawRole.trim()} Developer`;
+  }
+
+  return rawRole.trim() || 'Software Developer';
+}
+
+/** Build an array of optimized search queries from role + skills */
+function buildSearchQueries(normalizedRole, skills, expLevel) {
+  const queries = [];
+
+  // Map of niche roles to broader, more searchable queries
+  const BROADER_QUERIES = {
+    'adobe experience platform developer': ['Adobe developer', 'marketing technology developer', 'Adobe Experience Platform', 'MarTech developer'],
+    'salesforce developer': ['Salesforce developer', 'Salesforce engineer', 'CRM developer'],
+    'microsoft dynamics crm developer': ['Dynamics 365 developer', 'CRM developer', 'Microsoft Dynamics'],
+    'sap consultant': ['SAP consultant', 'SAP developer', 'ERP consultant'],
+    'blockchain developer': ['blockchain developer', 'Web3 developer', 'smart contract developer'],
+    'site reliability engineer': ['SRE', 'DevOps engineer', 'infrastructure engineer'],
+    'firmware engineer': ['firmware engineer', 'embedded software engineer', 'embedded developer'],
+  };
+
+  const lowerRole = normalizedRole.toLowerCase();
+  const broaderAlts = BROADER_QUERIES[lowerRole];
+
+  if (broaderAlts) {
+    // For niche roles, use the broader alternatives as search queries
+    queries.push(...broaderAlts.slice(0, 2));
+  } else {
+    // Primary query: role + top keywords for better relevance
+    const topKeywords = (skills || []).slice(0, 3).map(s => s.trim()).filter(Boolean).join(' ');
+    queries.push(topKeywords ? `${normalizedRole} ${topKeywords}` : normalizedRole);
+  }
+
+  // Secondary query: use top skills to find more relevant jobs
+  // Known real tech terms for validation
+  const KNOWN_TECH = new Set(['java','python','javascript','typescript','react','react.js','angular','vue','vue.js','next.js','nuxt','node.js','node','express','nestjs','spring','django','flask','fastapi','aws','azure','gcp','docker','kubernetes','sql','nosql','mongodb','postgresql','mysql','redis','graphql','rest','git','html','css','tailwind','bootstrap','c++','c#','.net','go','golang','rust','swift','kotlin','php','ruby','rails','laravel','tensorflow','pytorch','machine learning','ml','ai','data science','devops','linux','terraform','kafka','microservices','selenium','jest','figma','jira','salesforce','sap','oracle','flutter','react native','pandas','numpy','tableau','power bi','spark','hadoop','cypress','firebase','prisma','nginx','webpack','vite','crm','powerplatform','aep','adobe','mern','mean','blockchain','web3','unity','jenkins','agile','scrum']);
+
+  const cleanSkills = (skills || [])
+    .map(s => s.trim().toLowerCase())
+    .filter(s => {
+      if (s.length < 2 || s.length > 30) return false;
+      // Must be a known tech term or contain at least one recognizable tech word
+      if (KNOWN_TECH.has(s)) return true;
+      // Check if any known tech is a substring
+      for (const tech of KNOWN_TECH) {
+        if (s.includes(tech) || tech.includes(s)) return true;
+      }
+      return false;
+    });
+
+  if (cleanSkills.length >= 2) {
+    const topSkills = cleanSkills.slice(0, 3).join(' ');
+    const skillQuery = `${topSkills} developer`;
+    if (skillQuery.toLowerCase() !== normalizedRole.toLowerCase()) {
+      queries.push(skillQuery);
+    }
+  } else if (cleanSkills.length === 1) {
+    const singleSkillQuery = `${cleanSkills[0]} developer`;
+    if (singleSkillQuery.toLowerCase() !== normalizedRole.toLowerCase()) {
+      queries.push(singleSkillQuery);
+    }
+  }
+
+  return queries.slice(0, 2); // Max 2 queries to avoid API rate limits
 }
 
 // ───── Main Search Function ─────
@@ -602,99 +1099,199 @@ ${skillsSection}${gapsSection}`;
  * @returns {Array} job results with match scores and tailored resumes
  */
 async function searchJobs(student, days = 1) {
-  const query = student.jobRole || (student.keySkills || []).slice(0, 3).join(' ') || 'Software Developer';
   const location = student.location || '';
   const skills = student.keySkills || [];
   const experience = student.experience || '';
-  const education = student.education || '';
 
-  // Resolve regions from student's location
   const regions = resolveSearchRegions(location);
   const experienceYears = parseExperienceYears(experience);
   const expLevel = experienceYears >= 7 ? 'senior' : experienceYears >= 3 ? 'mid' : experienceYears > 0 ? 'junior' : '';
 
-  console.log(`[JS Job Search] Query: "${query}", Regions: ${regions.join(', ')}, Skills: ${skills.length}, Experience: ${experience || 'N/A'}, Level: ${expLevel || 'N/A'}, Days: ${days}`);
+  const rawRole = (student.jobRole || '').trim();
+  const normalizedRole = normalizeJobTitle(rawRole);
+  const searchQueries = buildSearchQueries(normalizedRole, skills, expLevel);
 
-  // Search APIs in parallel
-  const [jsearchJobs, remotiveJobs] = await Promise.all([
-    searchJSearch(query, regions, days, expLevel),
-    searchRemotive(query),
+  const DATE_TIERS = [1, 3, 7];
+  const primaryQuery = searchQueries[0];
+  const secondaryQuery = searchQueries.length > 1 ? searchQueries[1] : null;
+
+  // Check cache for repeat searches
+  const cacheKey = `${primaryQuery}|${regions.join(',')}|${days}`;
+  const cached = apiCache.get(cacheKey);
+  if (cached) return cached;
+
+  // Progressive date search: try 24h first, broaden if too few
+  let jsearchJobs = [];
+  for (const searchDays of DATE_TIERS) {
+    jsearchJobs = [];
+    const primaryResults = await searchJSearch(primaryQuery, regions, searchDays, expLevel, 80);
+    jsearchJobs.push(...primaryResults);
+
+    if (secondaryQuery) {
+      const secondaryResults = await searchJSearch(secondaryQuery, regions, searchDays, expLevel, 60);
+      jsearchJobs.push(...secondaryResults);
+    }
+
+    if (jsearchJobs.length >= 10) break;
+  }
+
+  // Filter JSearch results by experience level (title-based)
+  if (expLevel) {
+    jsearchJobs = jsearchJobs.filter(j => {
+      const title = (j.job_title || '').toLowerCase();
+      if (expLevel === 'junior') {
+        // Juniors should not see senior/lead/principal/director roles
+        if (/\b(senior|sr\.|lead|principal|staff|director|head of|vp\b|architect)\b/.test(title)) return false;
+      } else if (expLevel === 'mid') {
+        // Mid-level: skip principal/director/vp
+        if (/\b(principal|staff|director|head of|vp\b)\b/.test(title)) return false;
+      }
+      return true;
+    });
+  }
+
+  // Fetch secondary sources in parallel (only high-quality free APIs)
+  const [remotiveJobs, remoteOKJobs] = await Promise.all([
+    searchRemotive(primaryQuery),
+    searchRemoteOK(primaryQuery),
   ]);
 
-  const allJobs = [...jsearchJobs, ...remotiveJobs];
-  console.log(`[JS Job Search] Found: JSearch=${jsearchJobs.length}, Remotive=${remotiveJobs.length}, Total=${allJobs.length}`);
+  // Filter free API results to user's regions (they return global results)
+  const allowedCodes = getAllowedCountryCodes(regions);
+  const filterByRegion = (jobs) => jobs.filter(j => {
+    const country = (j.job_country || '').toUpperCase();
+    const city = (j.job_city || '').toLowerCase();
+    // Allow if country matches user's region
+    if (country && allowedCodes.has(country)) return true;
+    // Allow remote jobs (no specific country or marked remote)
+    if (!country || country === '' || city === 'remote' || city.includes('remote') || city === 'anywhere') return true;
+    return false;
+  });
+
+  // Filter free API results by experience level (title-based)
+  const filterByExperience = (jobs) => {
+    if (!expLevel) return jobs; // No experience info, skip filtering
+    return jobs.filter(j => {
+      const title = (j.job_title || '').toLowerCase();
+      const jd = (j.jd || '').toLowerCase();
+      if (expLevel === 'junior') {
+        // Juniors should not see senior/lead/principal roles
+        if (/\b(senior|sr\.|lead|principal|staff|director|head of|vp\b|architect)\b/.test(title)) return false;
+      } else if (expLevel === 'mid') {
+        // Mid-level: skip principal/director/vp, allow senior
+        if (/\b(principal|staff|director|head of|vp\b)\b/.test(title)) return false;
+      }
+      // Senior can see everything
+      return true;
+    });
+  };
+
+  const filteredRemotive = filterByExperience(filterByRegion(remotiveJobs));
+  const filteredRemoteOK = filterByExperience(filterByRegion(remoteOKJobs));
+
+  const allJobs = [
+    ...jsearchJobs,
+    ...filteredRemotive,
+    ...filteredRemoteOK,
+  ];
+
+  // Fallback if 0 results — try broader queries on free APIs
+  if (allJobs.length === 0) {
+    const fallbackQueries = [
+      normalizedRole.split(' ').slice(0, 2).join(' '),
+      `${(skills[0] || 'software')} developer`,
+      'software developer',
+    ];
+    for (const fq of fallbackQueries) {
+      const [fb1, fb2, fb3] = await Promise.all([
+        searchJSearch(fq, regions, 7, expLevel, 60),
+        searchRemoteOK(fq, 20),
+        searchRemotive(fq, 20),
+      ]);
+      const fbAll = [...fb1, ...fb2, ...fb3];
+      if (fbAll.length > 0) { allJobs.push(...fbAll); break; }
+    }
+  }
 
   if (allJobs.length === 0) return [];
 
-  // Filter out invalid jobs
-  const validJobs = allJobs.filter(j => {
-    if (!j.job_apply_link || !j.job_apply_link.startsWith('http')) return false;
-    if (!j.job_title || !j.employer_name) return false;
-    return true;
-  });
-
-  if (validJobs.length === 0) return [];
-
-  // Deduplicate
+  // Filter invalid + deduplicate in one pass
   const seen = new Set();
-  const unique = validJobs.filter(j => {
+  const unique = allJobs.filter(j => {
+    if (!j.job_apply_link?.startsWith('http') || !j.job_title || !j.employer_name) return false;
     const key = `${j.employer_name}|${j.job_title}`.toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 
-  // Deep score
+  if (unique.length === 0) return [];
+
+  // Deep score & sort — boost JSearch results (Indeed/LinkedIn/Dice/ZipRecruiter) for source quality
   const scored = unique.map(job => {
     const match = computeMatchScore(job, student);
-    return { job, match };
+    // Source quality bonus: JSearch aggregates top job boards (Indeed, LinkedIn, Dice, ZipRecruiter, Glassdoor)
+    const src = (job.source || '').toLowerCase();
+    let sourceBonus = 0;
+    if (src.includes('indeed') || src.includes('linkedin') || src.includes('dice') || src.includes('ziprecruiter') || src.includes('glassdoor') || src === 'jsearch') {
+      sourceBonus = 8; // Premium source bonus
+    } else if (src === 'remotive') {
+      sourceBonus = 3; // Decent remote source
+    } else if (src === 'remoteok') {
+      sourceBonus = 2; // Basic remote source
+    }
+    // Location match bonus: jobs explicitly in user's region get a boost
+    const jobCountry = (job.job_country || '').toUpperCase();
+    const locationBonus = (jobCountry && allowedCodes.has(jobCountry)) ? 5 : 0;
+    // Experience alignment bonus from JD analysis
+    const adjustedScore = Math.min(100, match.score + sourceBonus + locationBonus);
+    return { job, match: { ...match, score: adjustedScore } };
   }).sort((a, b) => b.match.score - a.match.score);
 
-  // Take top 50
-  const topResults = scored.slice(0, 50);
+  const MIN_SCORE = 70;
+  const qualityJobs = scored.filter(({ match }) => match.score >= MIN_SCORE);
+  const topResults = qualityJobs.length >= 5
+    ? qualityJobs.slice(0, 80)
+    : scored.slice(0, Math.max(20, qualityJobs.length));
 
-  // Generate tailored resumes — Gemini for top 10, template for rest
-  const hasGemini = !!process.env.GEMINI_API_KEY;
-  console.log(`[JS Job Search] Generating resumes: ${hasGemini ? 'Gemini AI (top 10) + Template' : 'Template-based'} for ${topResults.length} jobs`);
+  // Generate template resumes for all jobs
+  const results = topResults.map(({ job, match }) => ({
+    ...job,
+    match_score: match.score,
+    strong_matches: JSON.stringify(match.strongMatches),
+    partial_matches: JSON.stringify(match.partialMatches || []),
+    missing_skills: JSON.stringify(match.missingSkills),
+    match_summary: match.summary,
+    candidate_id: student.id,
+    candidate_name: student.fullName || '',
+    email: student.email || '',
+    timestamp: new Date().toISOString(),
+    pdf_link: student.resumeUrl || '',
+    resume_text: generateTemplateResume(student, job, match),
+  }));
 
-  const results = [];
-  for (let i = 0; i < topResults.length; i++) {
-    const { job, match } = topResults[i];
-
-    let resumeText = '';
-    // Use Gemini for top 10 results (within free tier RPM), template for rest
-    if (hasGemini && i < 10) {
-      resumeText = await generateResumeWithGemini(student, job, match) || generateTemplateResume(student, job, match);
-    } else {
-      resumeText = generateTemplateResume(student, job, match);
-    }
-
-    results.push({
-      ...job,
-      match_score: match.score,
-      strong_matches: JSON.stringify(match.strongMatches),
-      missing_skills: JSON.stringify(match.missingSkills),
-      match_summary: match.summary,
-      candidate_id: student.id,
-      candidate_name: student.fullName || '',
-      email: student.email || '',
-      timestamp: new Date().toISOString(),
-      pdf_link: student.resumeUrl || '',
-      resume_text: resumeText,
-    });
+  // Upgrade top 5 with AI resumes in parallel
+  if (process.env.OPENAI_API_KEY && topResults.length > 0) {
+    const AI_COUNT = 5;
+    const aiJobs = topResults.slice(0, AI_COUNT);
+    const aiResults = await Promise.all(
+      aiJobs.map(({ job, match }) => generateResumeWithAI(student, job, match).catch(() => null))
+    );
+    aiResults.forEach((text, i) => { if (text) results[i].resume_text = text; });
   }
 
-  // Write to Google Sheet — fire and forget
+  // Write to Google Sheet (fire and forget)
   const sheetRows = results.map(r => [
     '', '', r.candidate_id, r.candidate_name, r.email, r.employer_name,
     String(r.match_score), r.strong_matches, r.missing_skills, r.job_apply_link,
     r.match_summary, r.timestamp, r.pdf_link, r.jd.substring(0, 500), r.resume_text.substring(0, 2000),
   ]);
-  appendToSheet(sheetRows).then(ok => {
-    if (ok) console.log(`[JS Job Search] Wrote ${results.length} rows to Google Sheet`);
-  });
+  appendToSheet(sheetRows);
+
+  // Cache results before returning
+  apiCache.set(cacheKey, results);
 
   return results;
 }
 
-module.exports = { searchJobs, computeMatchScore, generateResumeWithGemini, generateTemplateResume };
+module.exports = { searchJobs, computeMatchScore, generateResumeWithAI, generateTemplateResume };

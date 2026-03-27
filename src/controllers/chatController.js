@@ -55,12 +55,15 @@ exports.sendMessage = async (req, res) => {
     });
 
     // Create notification for receiver
+    const receiver = await prisma.user.findUnique({ where: { id: receiverId }, select: { role: true } });
+    const chatLink = receiver?.role === 'STUDENT' ? '/dashboard/chat' : receiver?.role === 'ADMIN' ? '/admin/chat' : '/superadmin/chat';
     await prisma.notification.create({
       data: {
         userId: receiverId,
         title: 'New Message',
         message: `${req.user.fullName} sent you a message`,
-        type: 'message',
+        type: 'CHAT_MESSAGE',
+        link: chatLink,
       },
     });
 
@@ -113,36 +116,25 @@ exports.getContacts = async (req, res) => {
       ...receivedFrom.map(m => m.senderId),
     ])];
 
-    // If student, include only their assigned admins + all super admins
+    // If student, include ALL active admins (Marketing, HR, Proxy) + all super admins
     if (req.user.role === 'STUDENT') {
-      // Get admins assigned to this student via StudentAdminAssignment
-      const assignments = await prisma.studentAdminAssignment.findMany({
-        where: { studentId: userId },
-        select: { adminId: true },
-      });
-      assignments.forEach(a => {
-        if (!contactIds.includes(a.adminId)) contactIds.push(a.adminId);
-      });
-
-      // Include all active super admins
-      const superAdmins = await prisma.user.findMany({
-        where: { role: 'SUPER_ADMIN', isActive: true },
+      const allStaff = await prisma.user.findMany({
+        where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
         select: { id: true },
       });
-      superAdmins.forEach(s => {
+      allStaff.forEach(s => {
         if (!contactIds.includes(s.id)) contactIds.push(s.id);
       });
     }
 
-    // If admin, include students assigned to them + other admins/super admins
+    // If admin, include ALL active students + other admins/super admins
     if (req.user.role === 'ADMIN') {
-      // Students assigned to this admin via StudentAdminAssignment
-      const assignments = await prisma.studentAdminAssignment.findMany({
-        where: { adminId: userId },
-        select: { studentId: true },
+      const allStudents = await prisma.user.findMany({
+        where: { role: 'STUDENT', isActive: true },
+        select: { id: true },
       });
-      assignments.forEach(a => {
-        if (!contactIds.includes(a.studentId)) contactIds.push(a.studentId);
+      allStudents.forEach(s => {
+        if (!contactIds.includes(s.id)) contactIds.push(s.id);
       });
 
       // Include other admins and super admins

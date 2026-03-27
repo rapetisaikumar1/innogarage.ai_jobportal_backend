@@ -28,7 +28,7 @@ const uploadToCloudinary = (fileBuffer, options = {}) => {
 
   return new Promise((resolve, reject) => {
     const uploadOptions = {
-      folder: `gethired/${folder}`,
+      folder: `innogarage/${folder}`,
       resource_type: resourceType,
     };
     if (publicId) uploadOptions.public_id = publicId;
@@ -58,7 +58,7 @@ const uploadStreamToCloudinary = (pdfStream, fileName) => {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
       {
-        folder: 'gethired/resumes',
+        folder: 'innogarage/resumes',
         resource_type: 'raw',
         public_id: fileName,
       },

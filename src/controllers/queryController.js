@@ -34,6 +34,23 @@ const createQuery = async (req, res) => {
       },
     });
 
+    // Send notification to all admins and super admins about new query
+    const staffUsers = await prisma.user.findMany({
+      where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
+      select: { id: true },
+    });
+    if (staffUsers.length > 0) {
+      await prisma.notification.createMany({
+        data: staffUsers.map(s => ({
+          userId: s.id,
+          title: 'New Support Query',
+          message: `${query.user.fullName} raised a query: "${subject}"`,
+          type: 'query',
+          link: '/superadmin/queries',
+        })),
+      });
+    }
+
     res.status(201).json(query);
   } catch (error) {
     console.error('Error creating query:', error);
@@ -118,6 +135,23 @@ const updateQuery = async (req, res) => {
         assignedTo: { select: { id: true, fullName: true, role: true } },
       },
     });
+
+    // Notify the student who raised the query about the update
+    if (updated.userId) {
+      const parts = [];
+      if (status) parts.push(`status changed to ${(data.status || status).replace(/_/g, ' ')}`);
+      if (adminReply) parts.push('admin replied');
+      const msg = parts.length > 0 ? `Your query "${updated.subject}" — ${parts.join(', ')}.` : `Your query "${updated.subject}" was updated.`;
+      await prisma.notification.create({
+        data: {
+          userId: updated.userId,
+          title: 'Query Updated',
+          message: msg,
+          type: 'query',
+          link: '/dashboard/help',
+        },
+      });
+    }
 
     res.json(updated);
   } catch (error) {

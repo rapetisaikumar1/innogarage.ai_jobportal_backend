@@ -18,10 +18,10 @@ const ensureStudentGroup = async (studentId, studentName) => {
   });
 
   if (!group) {
-    // Get assigned admins + super admins
-    const assignments = await prisma.studentAdminAssignment.findMany({
-      where: { studentId },
-      select: { adminId: true },
+    // Get ALL active admins + super admins
+    const allAdmins = await prisma.user.findMany({
+      where: { role: 'ADMIN', isActive: true },
+      select: { id: true },
     });
     const superAdmins = await prisma.user.findMany({
       where: { role: 'SUPER_ADMIN', isActive: true },
@@ -29,7 +29,7 @@ const ensureStudentGroup = async (studentId, studentName) => {
     });
     const memberIds = [
       studentId,
-      ...assignments.map(a => a.adminId),
+      ...allAdmins.map(a => a.id),
       ...superAdmins.map(s => s.id),
     ];
     const uniqueMemberIds = [...new Set(memberIds)];
@@ -49,10 +49,10 @@ const ensureStudentGroup = async (studentId, studentName) => {
     if (group.name !== groupName) {
       await prisma.chatGroup.update({ where: { id: group.id }, data: { name: groupName } });
     }
-    // Sync: ensure assigned admins + super admins are members
-    const assignments = await prisma.studentAdminAssignment.findMany({
-      where: { studentId },
-      select: { adminId: true },
+    // Sync: ensure ALL active admins + super admins are members
+    const allAdmins = await prisma.user.findMany({
+      where: { role: 'ADMIN', isActive: true },
+      select: { id: true },
     });
     const superAdmins = await prisma.user.findMany({
       where: { role: 'SUPER_ADMIN', isActive: true },
@@ -60,7 +60,7 @@ const ensureStudentGroup = async (studentId, studentName) => {
     });
     const shouldBeMembers = [
       studentId,
-      ...assignments.map(a => a.adminId),
+      ...allAdmins.map(a => a.id),
       ...superAdmins.map(s => s.id),
     ];
     const uniqueShouldBe = [...new Set(shouldBeMembers)];
@@ -119,13 +119,13 @@ exports.getMyGroups = async (req, res) => {
         await ensureStudentGroup(student.id, student.fullName);
       }
     } else if (role === 'ADMIN') {
-      // Admin sees groups for students assigned to them — ensure those groups exist
-      const assignments = await prisma.studentAdminAssignment.findMany({
-        where: { adminId: userId },
-        select: { studentId: true, student: { select: { id: true, fullName: true } } },
+      // All admins (Marketing, HR, Proxy) see groups for ALL active students
+      const allStudents = await prisma.user.findMany({
+        where: { role: 'STUDENT', isActive: true },
+        select: { id: true, fullName: true },
       });
-      for (const a of assignments) {
-        await ensureStudentGroup(a.studentId, a.student.fullName);
+      for (const student of allStudents) {
+        await ensureStudentGroup(student.id, student.fullName);
       }
     }
 
@@ -226,13 +226,24 @@ exports.sendGroupMessage = async (req, res) => {
     });
 
     if (members.length > 0) {
+      // Fetch member roles to build correct chat links
+      const memberUsers = await prisma.user.findMany({
+        where: { id: { in: members.map(m => m.userId) } },
+        select: { id: true, role: true },
+      });
+      const roleMap = Object.fromEntries(memberUsers.map(u => [u.id, u.role]));
       await prisma.notification.createMany({
-        data: members.map(m => ({
-          userId: m.userId,
-          title: 'Group Message',
-          message: `${req.user.fullName} sent a message in group chat`,
-          type: 'group_message',
-        })),
+        data: members.map(m => {
+          const role = roleMap[m.userId];
+          const link = role === 'STUDENT' ? '/dashboard/chat' : role === 'ADMIN' ? '/admin/chat' : '/superadmin/chat';
+          return {
+            userId: m.userId,
+            title: 'Group Message',
+            message: `${req.user.fullName} sent a message in group chat`,
+            type: 'CHAT_MESSAGE',
+            link,
+          };
+        }),
       });
     }
 

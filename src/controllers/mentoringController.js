@@ -123,15 +123,17 @@ exports.bookSlot = async (req, res) => {
           userId: studentId,
           title: 'Booking Request Sent',
           message: `Your request for a session with ${slot.mentor.fullName} on ${new Date(slot.startTime).toLocaleDateString()} is pending confirmation.`,
-          type: 'mentoring',
+          type: 'BOOKING_CREATED',
+          link: '/dashboard/mentoring',
         },
       }),
       prisma.notification.create({
         data: {
           userId: slot.mentorId,
           title: 'New Booking Request',
-          message: `${student.fullName} requested a session on ${new Date(slot.startTime).toLocaleDateString()}. Please confirm or cancel.`,
-          type: 'mentoring',
+          message: `New booking request received from ${student.fullName}`,
+          type: 'BOOKING_CREATED',
+          link: '/admin/bookings',
         },
       }),
     ]);
@@ -185,15 +187,27 @@ exports.confirmBooking = async (req, res) => {
     // Send confirmation emails to both student and mentor
     await sendMentoringConfirmationEmail(booking.student, booking.slot.mentor, booking.slot, meetLink);
 
-    // Notify student
-    await prisma.notification.create({
-      data: {
-        userId: booking.student.id,
-        title: 'Session Confirmed!',
-        message: `Your mentoring session on ${new Date(booking.slot.startTime).toLocaleDateString()} has been confirmed. Google Meet link is ready.`,
-        type: 'mentoring',
-      },
-    });
+    // Notify both student and mentor
+    await Promise.all([
+      prisma.notification.create({
+        data: {
+          userId: booking.student.id,
+          title: 'Session Confirmed!',
+          message: `Your mentoring session on ${new Date(booking.slot.startTime).toLocaleDateString()} has been confirmed. Google Meet link is ready.`,
+          type: 'BOOKING_CONFIRMED',
+          link: '/dashboard/mentoring',
+        },
+      }),
+      prisma.notification.create({
+        data: {
+          userId: booking.slot.mentor.id,
+          title: 'Session Confirmed',
+          message: `Your session with ${booking.student.fullName} on ${new Date(booking.slot.startTime).toLocaleDateString()} is confirmed.`,
+          type: 'BOOKING_CONFIRMED',
+          link: '/admin/bookings',
+        },
+      }),
+    ]);
 
     res.json(updated);
   } catch (error) {
@@ -246,7 +260,8 @@ exports.cancelBooking = async (req, res) => {
           userId: booking.student.id,
           title: 'Session Cancelled',
           message: `Your mentoring session on ${new Date(booking.slot.startTime).toLocaleDateString()} was cancelled by the mentor.${reason ? ` Reason: ${reason}` : ''}`,
-          type: 'mentoring',
+          type: 'BOOKING_CANCELLED',
+          link: '/dashboard/mentoring',
         },
       });
     } else {
@@ -255,7 +270,8 @@ exports.cancelBooking = async (req, res) => {
           userId: booking.slot.mentorId,
           title: 'Booking Cancelled',
           message: `${booking.student.fullName} cancelled their session on ${new Date(booking.slot.startTime).toLocaleDateString()}.${reason ? ` Reason: ${reason}` : ''}`,
-          type: 'mentoring',
+          type: 'BOOKING_CANCELLED',
+          link: '/admin/bookings',
         },
       });
     }

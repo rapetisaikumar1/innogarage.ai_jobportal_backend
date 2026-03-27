@@ -1,5 +1,6 @@
 const prisma = require('../config/database');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
+const pdfParse = require('pdf-parse');
 
 // Update user profile
 exports.updateProfile = async (req, res) => {
@@ -31,8 +32,14 @@ exports.updateProfile = async (req, res) => {
         try {
           const result = await uploadToCloudinary(req.file.buffer, { folder: 'resumes', resourceType: 'raw' });
           updateData.resumeUrl = result.url;
+          // Extract text from PDF resume
+          try {
+            const pdfData = await pdfParse(req.file.buffer);
+            if (pdfData.text && pdfData.text.trim().length > 20) {
+              updateData.parsedResumeText = pdfData.text.trim().substring(0, 10000);
+            }
+          } catch { /* PDF parse failed — continue without text */ }
         } catch (uploadErr) {
-          console.error('Cloudinary resume upload error:', uploadErr);
           return res.status(500).json({ message: 'Resume upload failed', error: uploadErr.message });
         }
       } else if (req.file.fieldname === 'avatar') {
@@ -63,6 +70,7 @@ exports.updateProfile = async (req, res) => {
         jobRole: true,
         location: true,
         resumeUrl: true,
+        parsedResumeText: true,
         avatarUrl: true,
         passportUrl: true,
         drivingLicenceUrl: true,
@@ -96,6 +104,7 @@ exports.getProfile = async (req, res) => {
         jobRole: true,
         location: true,
         resumeUrl: true,
+        parsedResumeText: true,
         avatarUrl: true,
         passportUrl: true,
         drivingLicenceUrl: true,

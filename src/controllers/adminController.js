@@ -622,22 +622,37 @@ exports.getAnalytics = async (req, res) => {
       prisma.mentorBooking.count({ where: { status: 'COMPLETED' } }),
     ]);
 
-    // Applications per day (last 7 days)
+    // Parallel: recent apps, status breakdown, technology breakdown
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const recentApplications = await prisma.jobApplication.groupBy({
-      by: ['appliedAt'],
-      where: { appliedAt: { gte: sevenDaysAgo } },
-      _count: true,
-    });
+    const [recentApplications, applicationsByStatus, studentsWithRole] = await Promise.all([
+      prisma.jobApplication.groupBy({
+        by: ['appliedAt'],
+        where: { appliedAt: { gte: sevenDaysAgo } },
+        _count: true,
+      }),
+      prisma.jobApplication.groupBy({
+        by: ['status'],
+        _count: true,
+      }),
+      prisma.user.findMany({
+        where: { role: 'STUDENT', jobRole: { not: null } },
+        select: { jobRole: true },
+      }),
+    ]);
 
     // Application status breakdown
-    const applicationsByStatus = await prisma.jobApplication.groupBy({
-      by: ['status'],
-      _count: true,
-    });
     const statusBreakdown = {};
     applicationsByStatus.forEach(item => {
       statusBreakdown[item.status] = item._count;
+    });
+
+    // Technology/Role-wise candidate breakdown
+    const technologyBreakdown = {};
+    studentsWithRole.forEach(s => {
+      const role = (s.jobRole || '').trim();
+      if (role) {
+        technologyBreakdown[role] = (technologyBreakdown[role] || 0) + 1;
+      }
     });
 
     res.json({
@@ -654,6 +669,7 @@ exports.getAnalytics = async (req, res) => {
       completedBookings,
       recentApplications,
       applicationsByStatus: statusBreakdown,
+      technologyBreakdown,
     });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch analytics', error: error.message });
@@ -770,7 +786,7 @@ exports.getStudentDashboardData = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs, manualPending] = await Promise.all([
+    const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs, manualPending, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
       prisma.jobApplication.count({ where: { userId: studentId, status: 'APPLIED' } }),
       prisma.jobApplication.count({ where: { userId: studentId, status: 'INTERVIEW_SCHEDULED' } }),
       prisma.jobApplication.count({ where: { userId: studentId, status: 'REJECTED' } }),
@@ -783,7 +799,14 @@ exports.getStudentDashboardData = async (req, res) => {
           NOT: { applications: { some: { userId: studentId } } },
         },
       }),
+      prisma.jobApplication.count({ where: { userId: studentId, appliedById: { not: null } } }),
+      prisma.sheetJobApplication.count({ where: { userId: studentId, appliedById: { not: null } } }),
+      prisma.sheetJobApplication.count({ where: { userId: studentId } }),
     ]);
+
+    const allDbApplied = totalApplied + interviewScheduled + rejected + offerReceived;
+    const adminApplyCount = dbAdminApplied + sheetAdminApplied;
+    const candidateApplyCount = (allDbApplied - dbAdminApplied) + (sheetTotalApplied - sheetAdminApplied);
 
     const recentApplications = await prisma.jobApplication.findMany({
       where: { userId: studentId },
@@ -804,11 +827,14 @@ exports.getStudentDashboardData = async (req, res) => {
     res.json({
       stats: {
         totalJobs,
-        totalApplied: totalApplied + interviewScheduled + rejected + offerReceived,
+        totalApplied: allDbApplied,
         interviewScheduled,
         rejected,
         offerReceived,
         manualPending,
+        sheetAppliedCount: sheetTotalApplied,
+        adminApplyCount,
+        candidateApplyCount,
       },
       recentApplications,
       sheetApplications,
@@ -1135,6 +1161,7 @@ exports.applyJobForStudent = async (req, res) => {
         jobId,
         status: 'APPLIED',
         isAutoApplied: false,
+        appliedById: req.user.id,
         resumeUsed: student.resumeUrl,
         notes: `Applied by admin ${req.user.fullName} on behalf of student`,
       },
@@ -1145,9 +1172,10 @@ exports.applyJobForStudent = async (req, res) => {
     await prisma.notification.create({
       data: {
         userId: studentId,
-        title: 'Job Application Submitted',
-        message: `Your mentor ${req.user.fullName} applied for ${job.title} at ${job.company} on your behalf`,
-        type: 'application',
+        title: 'Job Application Update',
+        message: 'A job has been applied on your behalf',
+        type: 'JOB_APPLIED_BY_ADMIN',
+        link: '/dashboard/applications',
       },
     });
 
@@ -1158,6 +1186,50 @@ exports.applyJobForStudent = async (req, res) => {
 };
 
 // Mark sheet job as applied on behalf of student
+// Update application status (interview/offer/rejection)
+exports.updateApplicationStatus = async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { applicationId, status, source } = req.body;
+
+    const validStatuses = ['APPLIED', 'INTERVIEW_SCHEDULED', 'REJECTED', 'OFFER_RECEIVED'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+
+    const student = await prisma.user.findUnique({ where: { id: studentId }, select: { id: true, role: true } });
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    if (source === 'sheet') {
+      // Update sheet job application status
+      const app = await prisma.sheetJobApplication.findFirst({
+        where: { userId: studentId, jobLink: applicationId },
+      });
+      if (!app) return res.status(404).json({ message: 'Sheet application not found' });
+      const updated = await prisma.sheetJobApplication.update({
+        where: { id: app.id },
+        data: { status },
+      });
+      return res.json({ message: 'Status updated', application: updated });
+    } else {
+      // Update DB job application status
+      const app = await prisma.jobApplication.findFirst({
+        where: { id: applicationId, userId: studentId },
+      });
+      if (!app) return res.status(404).json({ message: 'Application not found' });
+      const updated = await prisma.jobApplication.update({
+        where: { id: applicationId },
+        data: { status },
+      });
+      return res.json({ message: 'Status updated', application: updated });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to update status', error: error.message });
+  }
+};
+
 exports.markSheetJobAppliedForStudent = async (req, res) => {
   try {
     const { studentId } = req.params;
@@ -1172,8 +1244,8 @@ exports.markSheetJobAppliedForStudent = async (req, res) => {
 
     const application = await prisma.sheetJobApplication.upsert({
       where: { userId_jobLink: { userId: studentId, jobLink } },
-      update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
-      create: { userId: studentId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
+      update: { status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore, jobTitle },
+      create: { userId: studentId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore, jobTitle },
     });
 
     res.json({ message: 'Marked as applied for student', application });
@@ -1188,7 +1260,7 @@ exports.getStudentSheetAppliedStatus = async (req, res) => {
     const { studentId } = req.params;
     const applications = await prisma.sheetJobApplication.findMany({
       where: { userId: studentId },
-      select: { jobLink: true, status: true, appliedMethod: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
+      select: { jobLink: true, status: true, appliedMethod: true, appliedById: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
       orderBy: { createdAt: 'desc' },
     });
     res.json({ applications });

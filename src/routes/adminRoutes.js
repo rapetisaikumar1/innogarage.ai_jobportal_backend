@@ -37,5 +37,6 @@ router.get('/students/:studentId/sheet-applied-status', authenticate, authorize(
 router.post('/students/:studentId/trigger-job-search', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.triggerStudentJobSearch);
 router.post('/students/:studentId/apply-job', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.applyJobForStudent);
 router.post('/students/:studentId/mark-sheet-applied', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.markSheetJobAppliedForStudent);
+router.patch('/students/:studentId/application-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.updateApplicationStatus);
 
 module.exports = router;

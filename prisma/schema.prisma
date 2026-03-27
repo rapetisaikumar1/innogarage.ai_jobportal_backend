@@ -32,12 +32,6 @@ enum BookingStatus {
   CANCELLED
 }
 
-enum AdminDepartment {
-  MARKETING
-  PROXY
-  HR
-}
-
 enum StudentStatus {
   ACTIVE
   INACTIVE
@@ -61,6 +55,8 @@ model User {
   jobRole         String?
   location        String?
   resumeUrl       String?
+  parsedResumeText String?
+  department      String?
   avatarUrl       String?
   passportUrl     String?
   drivingLicenceUrl String?
@@ -79,8 +75,7 @@ model User {
   jobSearchCount     Int       @default(0)
   lastSearchReset    DateTime?
 
-  // Admin/Mentor-specific
-  department      AdminDepartment?
+  // Mentor-specific
   mentorBio       String?
   assignedMentorId String?
   assignedMentor  User?     @relation("MentorStudents", fields: [assignedMentorId], references: [id])
@@ -107,10 +102,8 @@ model User {
   assignedQueries   SupportQuery[]   @relation("QueryAssignee")
   trainingAssignments TrainingAssignment[]
   uploadedMaterials   TrainingMaterial[] @relation("MaterialUploader")
-
-  // Multi-admin assignments (student can have up to 5 admins)
-  adminAssignments    StudentAdminAssignment[] @relation("StudentAdminAssignments")
-  studentAssignments  StudentAdminAssignment[] @relation("AdminStudentAssignments")
+  adminAssignments    StudentAdminAssignment[] @relation("StudentAssignments")
+  adminOfStudents     StudentAdminAssignment[] @relation("AdminAssignments")
 
   // Tokens
   verificationToken       String?
@@ -125,6 +118,43 @@ model User {
   updatedAt       DateTime  @updatedAt
 
   @@map("users")
+}
+
+model StudentAdminAssignment {
+  id         String   @id @default(uuid())
+  studentId  String
+  adminId    String
+  department String?
+  student    User     @relation("StudentAssignments", fields: [studentId], references: [id], onDelete: Cascade)
+  admin      User     @relation("AdminAssignments", fields: [adminId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([studentId, adminId])
+  @@map("student_admin_assignments")
+}
+
+model SavedJobResult {
+  id            String   @id @default(uuid())
+  userId        String
+  employerName  String?
+  jobTitle      String?
+  jobCity       String?
+  jobState      String?
+  jobCountry    String?
+  employmentType String?
+  applyLink     String?
+  employerLogo  String?
+  source        String?
+  postedAt      String?
+  jd            String?
+  matchScore    Int?
+  strongMatches Json?
+  missingSkills Json?
+  matchSummary  String?
+  resumeText    String?
+  createdAt     DateTime @default(now())
+
+  @@map("saved_job_results")
 }
 
 model Job {
@@ -159,9 +189,7 @@ model JobApplication {
   resumeUsed      String?
   notes           String?
   isAutoApplied   Boolean           @default(false)
-  interviewDate   DateTime?
-  interviewLocation String?
-  interviewNotes  String?
+  appliedById     String?
 
   user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   job             Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
@@ -356,6 +384,7 @@ model SheetJobApplication {
   jobTitle        String?
   status          String    @default("APPLIED") // APPLIED, MANUAL_REQUIRED, FAILED
   appliedMethod   String    @default("BOT")     // BOT, MANUAL
+  appliedById     String?
   matchScore      String?
   pdfLink         String?
   reportUrl       String?
@@ -449,19 +478,4 @@ model SupportQuery {
   updatedAt     DateTime @updatedAt
 
   @@map("support_queries")
-}
-
-model StudentAdminAssignment {
-  id         String   @id @default(uuid())
-  studentId  String
-  adminId    String
-  department String?
-
-  student    User     @relation("StudentAdminAssignments", fields: [studentId], references: [id], onDelete: Cascade)
-  admin      User     @relation("AdminStudentAssignments", fields: [adminId], references: [id], onDelete: Cascade)
-
-  createdAt  DateTime @default(now())
-
-  @@unique([studentId, adminId])
-  @@map("student_admin_assignments")
 }

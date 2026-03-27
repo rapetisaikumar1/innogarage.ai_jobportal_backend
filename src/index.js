@@ -22,6 +22,7 @@ const achieverRoutes = require('./routes/achieverRoutes');
 const shoutboardRoutes = require('./routes/shoutboardRoutes');
 const queryRoutes = require('./routes/queryRoutes');
 const stripeRoutes = require('./routes/stripeRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -82,6 +83,7 @@ app.use('/api/shoutboard', shoutboardRoutes);
 app.use('/api/queries', queryRoutes);
 // Stripe routes (checkout + webhook)
 app.use('/api/stripe', stripeRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -103,7 +105,7 @@ app.get('/api/test-cloudinary', async (req, res) => {
     // Test with a tiny text file upload instead of admin API
     const result = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
-        { folder: 'gethired/test', resource_type: 'raw' },
+        { folder: 'innogarage/test', resource_type: 'raw' },
         (error, result) => {
           if (error) return reject(error);
           resolve(result);

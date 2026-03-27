@@ -1,5 +1,6 @@
 const axios = require('axios');
-const cheerio = require('cheerio');
+let cheerio;
+try { cheerio = require('cheerio'); } catch { cheerio = null; }
 const prisma = require('../config/database');
 
 class JobScraperService {

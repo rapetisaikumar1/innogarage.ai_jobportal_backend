@@ -517,7 +517,7 @@ exports.googleLogin = async (req, res) => {
 // Complete Profile
 exports.completeProfile = async (req, res) => {
   try {
-    const { fullName, phone, education, experience, keySkills, linkedinProfile, jobRole } = req.body;
+    const { fullName, phone, education, experience, keySkills, linkedinProfile, jobRole, location } = req.body;
     const userId = req.user.id;
 
     let resumeUrl = null;
@@ -537,6 +537,7 @@ exports.completeProfile = async (req, res) => {
       experience: experience || undefined,
       linkedinProfile: linkedinProfile || undefined,
       jobRole: jobRole || undefined,
+      location: location || undefined,
       keySkills: Array.isArray(keySkills) ? keySkills : keySkills ? keySkills.split(',').map(s => s.trim()) : [],
       profileCompleted: true,
     };
@@ -559,6 +560,7 @@ exports.completeProfile = async (req, res) => {
         experience: true,
         keySkills: true,
         jobRole: true,
+        location: true,
         resumeUrl: true,
         avatarUrl: true,
         assignedMentorId: true,

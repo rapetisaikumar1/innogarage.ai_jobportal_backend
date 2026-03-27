@@ -7,6 +7,7 @@ router.get('/', authenticate, jobController.getJobs);
 router.get('/sheet', authenticate, jobController.getGoogleSheetJobs);
 router.get('/sheet/applied-status', authenticate, jobController.getSheetAppliedStatus);
 router.get('/usage', authenticate, jobController.getUsage);
+router.get('/saved-jobs', authenticate, jobController.getSavedJobs);
 router.post('/sheet/mark-applied', authenticate, authorize('STUDENT'), jobController.markSheetJobApplied);
 router.get('/extension-data', authenticate, jobController.getExtensionData);
 router.post('/trigger-n8n', authenticate, authorize('STUDENT'), jobController.triggerN8nWorkflow);

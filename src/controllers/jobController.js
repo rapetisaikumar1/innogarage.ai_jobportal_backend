@@ -3,7 +3,7 @@ const jobScraperService = require('../services/jobScraperService');
 const resumeService = require('../services/resumeService');
 const jsJobSearchService = require('../services/jsJobSearchService');
 const axios = require('axios');
-const cheerio = require('cheerio');
+
 const crypto = require('crypto');
 const dns = require('dns');
 const https = require('https');
@@ -17,6 +17,9 @@ const n8nAxios = axios.create({
   timeout: 60000,
   httpsAgent: new https.Agent({ family: 4 }),
 });
+
+// Cache n8n form field discovery (avoids re-fetching HTML every trigger)
+const n8nFormFieldsCache = { fields: null, expiry: 0 };
 
 // Google Sheet config
 const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
@@ -226,7 +229,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
       where: { id: userId },
       select: {
         id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, jobRole: true, location: true, experience: true, education: true,
+        resumeUrl: true, parsedResumeText: true, jobRole: true, location: true, experience: true, education: true,
         subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
       },
     });
@@ -247,158 +250,128 @@ exports.triggerN8nWorkflow = async (req, res) => {
       });
     }
 
-    // ─── JS Mode: Direct job search via free APIs ───
-    if (JOB_SEARCH_MODE === 'js') {
-      const days = parseInt(req.body.days) || 1;
-      console.log(`[Job Search] Using JS mode for user ${user.email}`);
-      const results = await jsJobSearchService.searchJobs(user, days);
+    // Parse days from request body
+    const days = parseInt(req.body.days) || 1;
 
-      // Increment search count
-      prisma.user.update({
-        where: { id: userId },
-        data: { jobSearchCount: { increment: 1 } },
-      }).catch(() => {});
+    // ─── N8N-ONLY MODE: trigger n8n webhook, results appear in Google Sheet ───
+    let n8nTriggered = false;
 
-      return res.json({
-        message: results.length > 0
-          ? `Found ${results.length} matching jobs!`
-          : 'No jobs found. Try different keywords or expand your search.',
-        jobs: results,
-        mode: 'js',
-      });
-    }
+    if (config.n8n.webhookUrl) {
+      n8nTriggered = true;
+      (async () => {
+        try {
+          const formPageUrl = config.n8n.webhookUrl.replace('/webhook/', '/form/');
 
-    // ─── N8N Mode: Trigger n8n webhook ───
-    if (!config.n8n.webhookUrl) return res.status(500).json({ message: 'N8N webhook not configured' });
+          // Fetch form fields (cached) and resume in parallel
+          const formFieldsPromise = (async () => {
+            if (n8nFormFieldsCache.fields && Date.now() < n8nFormFieldsCache.expiry) {
+              return n8nFormFieldsCache.fields;
+            }
+            const formPageResp = await n8nAxios.get(formPageUrl);
+            const $ = require('cheerio').load(formPageResp.data);
+            const formFields = [];
+            $('input, textarea, select').each((i, el) => {
+              const name = $(el).attr('name');
+              if (!name) return;
+              const type = $(el).attr('type') || 'text';
+              let label = '';
+              const id = $(el).attr('id');
+              if (id) label = $(`label[for="${id}"]`).text().trim();
+              if (!label) label = $(el).closest('label').text().trim();
+              if (!label) label = $(el).closest('.form-group, .field, div').find('label').first().text().trim();
+              formFields.push({ name, type, label: label.toLowerCase() });
+            });
+            n8nFormFieldsCache.fields = formFields;
+            n8nFormFieldsCache.expiry = Date.now() + 10 * 60 * 1000;
+            return formFields;
+          })();
 
-    // Step 1: GET the n8n form page HTML to discover the REAL field names
-    const formPageUrl = config.n8n.webhookUrl.replace('/webhook/', '/form/');
-    console.log('Step 1: Fetching n8n form HTML from:', formPageUrl);
-    const formPageResp = await n8nAxios.get(formPageUrl);
-    const $ = cheerio.load(formPageResp.data);
+          const resumePromise = (async () => {
+            if (!user.resumeUrl) return null;
+            try {
+              const resumeResp = await n8nAxios.get(user.resumeUrl, { responseType: 'arraybuffer' });
+              return { buffer: Buffer.from(resumeResp.data), filename: user.resumeUrl.split('/').pop().split('?')[0] || 'resume.pdf' };
+            } catch { return null; }
+          })();
 
-    // Extract all input/textarea/select field names and their labels
-    const formFields = [];
-    $('input, textarea, select').each((i, el) => {
-      const name = $(el).attr('name');
-      if (!name) return;
-      const type = $(el).attr('type') || 'text';
-      // Find the label - check for associated label element or parent label
-      let label = '';
-      const id = $(el).attr('id');
-      if (id) {
-        label = $(`label[for="${id}"]`).text().trim();
-      }
-      if (!label) {
-        label = $(el).closest('label').text().trim();
-      }
-      if (!label) {
-        label = $(el).closest('.form-group, .field, div').find('label').first().text().trim();
-      }
-      formFields.push({ name, type, label: label.toLowerCase() });
-    });
+          const [formFields, resumeData] = await Promise.all([formFieldsPromise, resumePromise]);
 
-    console.log('Discovered form fields:', JSON.stringify(formFields, null, 2));
+          const dataMap = [
+            { keywords: ['candidate id', 'candidate_id', 'candidateid', 'id'], value: String(user.id) },
+            { keywords: ['candidate_name', 'candidate name', 'name'], value: user.fullName || '' },
+            { keywords: ['email', 'e-mail'], value: user.email || '' },
+            { keywords: ['role', 'job role', 'jobrole'], value: user.jobRole || 'Software Developer' },
+            { keywords: ['keywords', 'skills', 'key skills'], value: (user.keySkills || []).join(', ') },
+            { keywords: ['location', 'city'], value: user.location || '' },
+            { keywords: ['days', 'day', 'date'], value: days },
+          ];
 
-    // Our data values mapped by expected label keywords
-    const dataMap = [
-      { keywords: ['candidate id', 'candidate_id', 'candidateid', 'id'], value: String(user.id) },
-      { keywords: ['candidate_name', 'candidate name', 'name'], value: user.fullName || '' },
-      { keywords: ['email', 'e-mail'], value: user.email || '' },
-      { keywords: ['role', 'job role', 'jobrole'], value: user.jobRole || 'Software Developer' },
-      { keywords: ['keywords', 'skills', 'key skills'], value: (user.keySkills || []).join(', ') },
-      { keywords: ['location', 'city'], value: user.location || '' },
-      { keywords: ['days', 'day', 'date'], value: days },
-    ];
+          const textFields = {};
+          let resumeFieldName = 'resume';
+          const usedDataIndices = new Set();
 
-    // Map discovered field names to our data
-    const textFields = {};
-    let resumeFieldName = 'resume'; // default
-    const usedDataIndices = new Set();
-
-    for (const field of formFields) {
-      // Skip file inputs and hidden fields
-      if (field.type === 'file') {
-        resumeFieldName = field.name;
-        console.log(`  File field: "${field.name}" (label: "${field.label}")`);
-        continue;
-      }
-      if (field.type === 'hidden' || field.type === 'submit') continue;
-
-      // Try to match by label or field name
-      let matched = false;
-      for (let i = 0; i < dataMap.length; i++) {
-        if (usedDataIndices.has(i)) continue;
-        const entry = dataMap[i];
-        const matchTarget = (field.label + ' ' + field.name).toLowerCase();
-        if (entry.keywords.some(kw => matchTarget.includes(kw))) {
-          textFields[field.name] = entry.value;
-          usedDataIndices.add(i);
-          console.log(`  Matched: "${field.name}" (label: "${field.label}") → "${entry.value}"`);
-          matched = true;
-          break;
-        }
-      }
-
-      // Positional fallback for unmatched fields
-      if (!matched) {
-        for (let i = 0; i < dataMap.length; i++) {
-          if (!usedDataIndices.has(i)) {
-            textFields[field.name] = dataMap[i].value;
-            usedDataIndices.add(i);
-            console.log(`  Positional: "${field.name}" (label: "${field.label}") → "${dataMap[i].value}"`);
-            break;
+          for (const field of formFields) {
+            if (field.type === 'file') { resumeFieldName = field.name; continue; }
+            if (field.type === 'hidden' || field.type === 'submit') continue;
+            let matched = false;
+            for (let i = 0; i < dataMap.length; i++) {
+              if (usedDataIndices.has(i)) continue;
+              const matchTarget = (field.label + ' ' + field.name).toLowerCase();
+              if (dataMap[i].keywords.some(kw => matchTarget.includes(kw))) {
+                textFields[field.name] = dataMap[i].value;
+                usedDataIndices.add(i);
+                matched = true;
+                break;
+              }
+            }
+            if (!matched) {
+              for (let i = 0; i < dataMap.length; i++) {
+                if (!usedDataIndices.has(i)) { textFields[field.name] = dataMap[i].value; usedDataIndices.add(i); break; }
+              }
+            }
           }
+
+          const fileFields = [];
+          if (resumeData) {
+            fileFields.push({ name: resumeFieldName, filename: resumeData.filename, contentType: 'application/pdf', data: resumeData.buffer });
+          }
+
+          const { body, contentType } = buildMultipartBody(textFields, fileFields);
+          await n8nAxios.post(formPageUrl, body, {
+            headers: { 'Content-Type': contentType },
+            maxBodyLength: Infinity,
+            maxContentLength: Infinity,
+            validateStatus: () => true,
+          });
+          console.log('N8N background trigger completed');
+        } catch (err) {
+          console.error('N8N background trigger error:', err.message);
         }
-      }
+      })(); // Fire and forget — don't await
     }
 
-    // Step 2: Download resume and attach as file
-    const fileFields = [];
-    if (user.resumeUrl) {
-      try {
-        console.log('Downloading resume from:', user.resumeUrl);
-        const resumeResp = await n8nAxios.get(user.resumeUrl, { responseType: 'arraybuffer' });
-        const resumeBuffer = Buffer.from(resumeResp.data);
-        const filename = user.resumeUrl.split('/').pop().split('?')[0] || 'resume.pdf';
-        console.log('Resume downloaded, size:', resumeBuffer.length, 'bytes');
-        fileFields.push({ name: resumeFieldName, filename, contentType: 'application/pdf', data: resumeBuffer });
-      } catch (dlErr) {
-        console.warn('Could not download resume:', dlErr.message);
-      }
+    // Increment search count and update lastSearchReset
+    try {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
+      });
+    } catch (err) {
+      console.error('Failed to increment search count:', err.message);
     }
 
-    // Step 3: Build and POST multipart to the /form/ endpoint
-    const { body, contentType } = buildMultipartBody(textFields, fileFields);
-
-    console.log('Step 3: Posting multipart to:', formPageUrl);
-    console.log('Final text fields:', JSON.stringify(textFields));
-    console.log('Body size:', body.length, 'bytes');
-
-    const n8nResponse = await n8nAxios.post(formPageUrl, body, {
-      headers: { 'Content-Type': contentType },
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      validateStatus: () => true,
+    // Return immediately — jobs will appear in Google Sheet via n8n
+    return res.json({
+      message: n8nTriggered
+        ? 'Job search triggered! Jobs will appear shortly...'
+        : 'N8N webhook not configured. Please set up n8n.',
+      jobs: [],
+      mode: 'n8n',
+      n8nTriggered,
     });
-
-    console.log('N8N response status:', n8nResponse.status);
-    console.log('N8N response:', JSON.stringify(n8nResponse.data).substring(0, 300));
-
-    if (n8nResponse.status >= 400) {
-      return res.status(502).json({ message: 'N8N workflow error', details: JSON.stringify(n8nResponse.data).substring(0, 200) });
-    }
-
-    res.json({ message: 'Job search triggered successfully. Jobs will appear shortly.' });
-
-    // Increment search count after successful trigger (fire-and-forget)
-    prisma.user.update({
-      where: { id: userId },
-      data: { jobSearchCount: { increment: 1 } },
-    }).catch(() => {});
   } catch (error) {
-    console.error('N8N trigger error:', error.message || error);
-    console.error('N8N trigger stack:', error.stack);
+    console.error('Job search error:', error.message || error);
+    console.error('Job search stack:', error.stack);
     res.status(500).json({ message: 'Failed to trigger job search', error: error.message || String(error) });
   }
 };
@@ -655,8 +628,23 @@ exports.getMyApplications = async (req, res) => {
       prisma.jobApplication.count({ where }),
     ]);
 
+    // Enrich with appliedBy info
+    const appliedByIds = [...new Set(applications.filter(a => a.appliedById).map(a => a.appliedById))];
+    let appliedByMap = {};
+    if (appliedByIds.length > 0) {
+      const users = await prisma.user.findMany({
+        where: { id: { in: appliedByIds } },
+        select: { id: true, fullName: true, role: true },
+      });
+      users.forEach(u => { appliedByMap[u.id] = u; });
+    }
+    const enriched = applications.map(a => ({
+      ...a,
+      appliedBy: a.appliedById ? (appliedByMap[a.appliedById] || null) : null,
+    }));
+
     res.json({
-      applications,
+      applications: enriched,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -751,12 +739,15 @@ exports.getDashboardStats = async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs] = await Promise.all([
+    const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
       prisma.jobApplication.count({ where: { userId, status: 'APPLIED' } }),
       prisma.jobApplication.count({ where: { userId, status: 'INTERVIEW_SCHEDULED' } }),
       prisma.jobApplication.count({ where: { userId, status: 'REJECTED' } }),
       prisma.jobApplication.count({ where: { userId, status: 'OFFER_RECEIVED' } }),
       prisma.job.count({ where: { isActive: true } }),
+      prisma.jobApplication.count({ where: { userId, appliedById: { not: null } } }),
+      prisma.sheetJobApplication.count({ where: { userId, appliedById: { not: null } } }),
+      prisma.sheetJobApplication.count({ where: { userId } }),
     ]);
 
     const manualPending = await prisma.job.count({
@@ -771,13 +762,20 @@ exports.getDashboardStats = async (req, res) => {
       },
     });
 
+    const allDbApplied = totalApplied + interviewScheduled + rejected + offerReceived;
+    const adminApplyCount = dbAdminApplied + sheetAdminApplied;
+    const candidateApplyCount = (allDbApplied - dbAdminApplied) + (sheetTotalApplied - sheetAdminApplied);
+
     res.json({
       totalJobs,
-      totalApplied: totalApplied + interviewScheduled + rejected + offerReceived,
+      totalApplied: allDbApplied,
       interviewScheduled,
       rejected,
       offerReceived,
       manualPending,
+      adminApplyCount,
+      candidateApplyCount,
+      sheetAppliedCount: sheetTotalApplied,
     });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch stats', error: error.message });
@@ -951,7 +949,7 @@ exports.getSheetAppliedStatus = async (req, res) => {
     const userId = req.user.id;
     const applications = await prisma.sheetJobApplication.findMany({
       where: { userId },
-      select: { jobLink: true, status: true, appliedMethod: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
+      select: { jobLink: true, status: true, appliedMethod: true, appliedById: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
       orderBy: { createdAt: 'desc' },
     });
     res.json({ applications });
@@ -1104,4 +1102,55 @@ exports.autoApplyToJob = async (req, res) => {
   }
 
   res.end();
+};
+
+// ─── Get saved job results for a user ───
+exports.getSavedJobs = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const skip = (page - 1) * limit;
+
+    const [jobs, total] = await Promise.all([
+      prisma.savedJobResult.findMany({
+        where: { userId },
+        orderBy: { matchScore: 'desc' },
+        skip,
+        take: limit,
+      }),
+      prisma.savedJobResult.count({ where: { userId } }),
+    ]);
+
+    // Map to frontend-compatible format
+    const mapped = jobs.map(j => ({
+      employer_name: j.employerName,
+      job_title: j.jobTitle,
+      job_city: j.jobCity,
+      job_state: j.jobState,
+      job_country: j.jobCountry,
+      job_employment_type: j.employmentType,
+      job_apply_link: j.applyLink?.startsWith('http') ? j.applyLink : null,
+      employer_logo: j.employerLogo,
+      source: j.source,
+      posted: j.postedAt,
+      jd: j.jd,
+      match_score: j.matchScore,
+      strong_matches: JSON.stringify(j.strongMatches),
+      missing_skills: JSON.stringify(j.missingSkills),
+      match_summary: j.matchSummary,
+      resume_text: j.resumeText,
+      original_resume: j.originalResume,
+      job_min_salary: j.salaryMin,
+      job_max_salary: j.salaryMax,
+      job_salary_currency: j.salaryCurrency,
+      saved_at: j.createdAt,
+    }));
+
+    res.json({ jobs: mapped, total, page, limit });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to retrieve saved jobs' });
+  }
 };
