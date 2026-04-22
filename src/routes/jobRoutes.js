@@ -9,7 +9,6 @@ router.get('/sheet/applied-status', authenticate, jobController.getSheetAppliedS
 router.get('/usage', authenticate, jobController.getUsage);
 router.get('/saved-jobs', authenticate, jobController.getSavedJobs);
 router.post('/sheet/mark-applied', authenticate, authorize('STUDENT'), jobController.markSheetJobApplied);
-router.get('/extension-data', authenticate, jobController.getExtensionData);
 router.post('/trigger-n8n', authenticate, authorize('STUDENT'), jobController.triggerN8nWorkflow);
 router.post('/auto-apply-all', authenticate, authorize('STUDENT'), jobController.autoApplyAllSheetJobs);
 router.post('/auto-apply', authenticate, authorize('STUDENT'), jobController.autoApplyToJob);

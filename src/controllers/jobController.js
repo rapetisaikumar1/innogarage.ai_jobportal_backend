@@ -14,8 +14,8 @@ const JOB_SEARCH_MODE = process.env.JOB_SEARCH_MODE || 'js';
 
 // Force IPv4 to avoid AggregateError on Render/cloud platforms
 const n8nAxios = axios.create({
-  timeout: 60000,
-  httpsAgent: new https.Agent({ family: 4 }),
+  timeout: 20000,
+  httpsAgent: new https.Agent({ family: 4, keepAlive: true }),
 });
 
 // Cache n8n form field discovery (avoids re-fetching HTML every trigger)
@@ -74,7 +74,15 @@ exports.getGoogleSheetJobs = async (req, res) => {
     const userId = req.user.id;
     const userEmail = req.user.email;
 
-    const response = await fetch(GOOGLE_SHEET_CSV_URL, { redirect: 'follow' });
+    // Hard timeout so a slow/hanging Google Sheet fetch cannot freeze the app.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    let response;
+    try {
+      response = await fetch(GOOGLE_SHEET_CSV_URL, { redirect: 'follow', signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!response.ok) throw new Error('Failed to fetch Google Sheet');
     const csvText = await response.text();
     const rows = parseCSV(csvText);
@@ -922,24 +930,6 @@ exports.autoApplyAllSheetJobs = async (req, res) => {
   } catch (error) {
     console.error('Apply all error:', error.message);
     res.status(500).json({ message: 'Apply all failed', error: error.message });
-  }
-};
-
-// Get extension data for chrome extension
-exports.getExtensionData = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, fullName: true, email: true, phone: true, resumePath: true },
-    });
-    const applications = await prisma.sheetJobApplication.findMany({
-      where: { userId },
-      select: { jobLink: true, status: true, appliedMethod: true, employerName: true },
-    });
-    res.json({ user, applications });
-  } catch (error) {
-    res.json({ user: null, applications: [] });
   }
 };
 
