@@ -38,5 +38,6 @@ router.post('/students/:studentId/trigger-job-search', authenticate, authorize('
 router.post('/students/:studentId/apply-job', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.applyJobForStudent);
 router.post('/students/:studentId/mark-external-applied', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.markExternalJobAppliedForStudent);
 router.patch('/students/:studentId/application-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.updateApplicationStatus);
+router.post('/students/:studentId/resume/generate', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.generateResumeForStudent);
 
 module.exports = router;

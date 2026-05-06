@@ -38,8 +38,17 @@ class AIService {
           return null;
         }
 
-        if (message.includes('404') || message.includes('not found') || message.includes('no longer available')) {
-          console.warn(`Gemini model ${modelName} unavailable — trying next model`);
+        // Model unavailable or overloaded — try next model
+        if (
+          message.includes('404') ||
+          message.includes('not found') ||
+          message.includes('no longer available') ||
+          message.includes('503') ||
+          message.includes('Service Unavailable') ||
+          message.includes('overloaded') ||
+          message.includes('high demand')
+        ) {
+          console.warn(`Gemini model ${modelName} unavailable/overloaded — trying next model`);
           continue;
         }
 
@@ -142,38 +151,41 @@ Return JSON only:
     }
 
     const prompt = `You are an expert resume writer and senior technical recruiter.
-Your task: tailor the candidate's uploaded resume to the target job — keeping the candidate's OWN FORMAT exactly.
+Your task: take the candidate's ORIGINAL uploaded resume and produce an enhanced version tailored to the target job.
+The output must be the candidate's OWN resume — same structure, same content — with targeted additions for the JD.
 
-CRITICAL RULES:
-1. FORMAT PRESERVATION
-   - Read the original uploaded resume and identify every section heading it contains.
-   - Use the EXACT SAME section headings in the EXACT SAME ORDER as in the original.
-   - Do NOT rename, merge, reorder, or add any section that is not present in the original resume.
-   - Do NOT add an "ATS KEYWORDS" section. Do NOT add "CORE SKILLS" if not in the original.
+CRITICAL RULES (follow all strictly):
 
-2. FACTS ONLY — NO HALLUCINATION
-   - Preserve all job titles, employers, companies, dates, education, degrees, and certifications EXACTLY as in the original.
-   - Do NOT invent any new employer, project, certification, technology, or achievement.
-   - Do NOT fabricate metrics or numbers not present in the original resume.
+1. FORMAT PRESERVATION — MANDATORY
+   - Identify every section heading in the original resume (e.g. PROFESSIONAL SUMMARY, CORE SKILLS, PROFESSIONAL EXPERIENCE, CERTIFICATIONS, EDUCATION, etc.).
+   - Output EXACTLY those headings in EXACTLY the same order. Do NOT rename, merge, reorder, or skip any section.
+   - Do NOT add any new section that is not in the original (no "ATS KEYWORDS", no "KEY ACHIEVEMENTS", no "PROJECTS" unless already present).
+   - The structure of the output must be a mirror of the original structure.
 
-3. REWRITE BULLETS FOR THE JOB
-   - Rewrite existing bullet points to incorporate relevant keywords and responsibilities from the target job description.
-  - Keep the target role aligned to the Target Job title only; do not turn skills, tools, or summary phrases into the role title.
-   - Use strong action verbs. Quantify impact where the original already implies it.
-   - Keep all real experience entries — do not collapse multiple roles into one.
-  - Use bullet points for Skills, Experience, Certifications, Education, Projects, and other section content wherever the original section can naturally support bullets.
+2. PRESERVE ALL ORIGINAL CONTENT — MANDATORY
+   - Copy EVERY bullet point, sentence, and line from the original resume into the output exactly as written.
+   - Do NOT remove, shorten, or replace any bullet point from the original.
+   - Do NOT change any job title, employer name, company, date, degree, certification, or location.
+   - Do NOT change or remove any skill listed in the original resume.
+   - The output must contain ALL the content from the original resume plus additions.
+
+3. ADD JD-RELEVANT CONTENT — ADDITIVE ONLY
+   - After copying original bullets for each role, you may ADD 1–2 new bullet points per role that highlight skills or responsibilities from the target JD that are genuinely relevant to that role.
+   - For skills/tools sections: you may ADD a few JD-relevant skills/technologies at the end IF they are plausible given the candidate's background — do NOT invent skills.
+   - In the PROFESSIONAL SUMMARY (or equivalent first section): you may rewrite the summary to 3-4 sentences that align the candidate's real background to the target role — this is the ONLY section where rewriting (not just adding) is allowed.
+   - Do NOT invent new employers, projects, certifications, metrics, or achievements not in the original resume.
+   - Do NOT fabricate any numbers, tools, or technologies that are not present in the original.
 
 4. NO CONTACT HEADER IN OUTPUT
-   - Do NOT output the candidate's name, phone, email, or any URL as a header block at the top.
-   - The resume display system renders the contact header separately from the text.
-   - Begin the resume output DIRECTLY with the first section heading (e.g. PROFESSIONAL SUMMARY).
-   - There must be NO lines before the first section heading.
+   - Do NOT output the candidate's name, phone, email, location, or any URL as a header block at the top.
+   - The resume display system renders the contact header separately.
+   - Begin the output DIRECTLY with the first section heading (e.g. PROFESSIONAL SUMMARY). No blank lines before it.
 
 5. OUTPUT FORMAT
    - Plain text only. No markdown, **, code fences, tables, emojis, or decorative symbols.
-  - Every bullet starts with "- ". Prefer bullet points over long paragraphs except inside PROFESSIONAL SUMMARY.
-   - Clean readable lines. No PDF glyphs or random symbols.
-   - Target 700-1100 words if the original resume has enough content.
+   - Every bullet starts with "- ". Use bullet points for Experience, Skills, Certifications, and Education entries.
+   - Clean readable lines. No PDF glyphs, control characters, or random symbols.
+   - The output should be at least as long as the original resume, ideally 800–1200 words.
 
 Candidate Profile:
 - Name: ${userData.fullName || 'Candidate'}

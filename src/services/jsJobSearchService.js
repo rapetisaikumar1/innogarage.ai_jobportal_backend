@@ -398,7 +398,7 @@ async function searchJobicy(query, limit = 50) {
 
 // ───── Module-Level Constants (allocated once, not per-call) ─────
 
-const TECH_EXTRACT_RE = /\b(Java|Python|JavaScript|TypeScript|React|Angular|Vue|Next\.?js|Node\.?js|Express|NestJS|Spring|Django|Flask|FastAPI|AWS|Azure|GCP|Docker|Kubernetes|SQL|NoSQL|MongoDB|PostgreSQL|MySQL|Redis|GraphQL|REST|Git|CI\/CD|Agile|Scrum|HTML|CSS|Tailwind|Bootstrap|C\+\+|C#|\.NET|Go|Rust|Swift|Kotlin|PHP|Ruby|Rails|Laravel|TensorFlow|PyTorch|Machine Learning|AI|Data Science|DevOps|Linux|Terraform|Kafka|Microservices|Selenium|Jest|Figma|Jira|Salesforce|SAP|Oracle|Flutter|React Native|Pandas|NumPy|Power\s?BI|Tableau|Spark|Hadoop|Snowflake|Databricks|Cypress|Playwright|Webpack|Vite|Nginx|Prometheus|Grafana|Jenkins|CRM|PowerPlatform|Power\s?Apps|Dynamics|AEP|Adobe|Marketo|HubSpot|MERN|MEAN|Full\s*Stack|Frontend|Backend|Web\s*Development|Mobile\s*Development|Cloud|API|Blockchain|Web3|Unity|Unreal)\b/gi;
+const TECH_EXTRACT_RE = /\b(Java|Python|JavaScript|TypeScript|React|Angular|Vue|Next\.?js|Node\.?js|Express|NestJS|Spring|Django|Flask|FastAPI|AWS|Azure|GCP|Docker|Kubernetes|SQL|NoSQL|MongoDB|PostgreSQL|MySQL|Redis|GraphQL|REST|Git|CI\/CD|Agile|Scrum|HTML|CSS|Tailwind|Bootstrap|C\+\+|C#|\.NET|Go|Rust|Swift|Kotlin|PHP|Ruby|Rails|Laravel|TensorFlow|PyTorch|Machine Learning|AI|Data Science|DevOps|Linux|Terraform|Kafka|Microservices|Selenium|Jest|Figma|Jira|Salesforce|SAP|Oracle|Flutter|React Native|Pandas|NumPy|Power\s?BI|Tableau|Spark|Hadoop|Snowflake|Databricks|Cypress|Playwright|Webpack|Vite|Nginx|Prometheus|Grafana|Jenkins|CRM|PowerPlatform|Power\s?Apps|Dynamics|AEP|AJO|Adobe\s+Journey\s+Optimizer|Journey\s+Orchestration|Real[-\s]?Time\s+CDP|Customer\s+Journey\s+Analytics|Adobe|Marketo|HubSpot|MERN|MEAN|Full\s*Stack|Frontend|Backend|Web\s*Development|Mobile\s*Development|Cloud|API|Blockchain|Web3|Unity|Unreal)\b/gi;
 
 const SKILL_ALIASES = {
   'node.js': ['node', 'nodejs', 'node.js', 'node js'],
@@ -483,6 +483,10 @@ const SKILL_ALIASES = {
   'aep': ['aep', 'adobe experience platform', 'adobe'],
   'aep devloper': ['aep', 'adobe experience platform', 'adobe', 'experience platform'],
   'aep developer': ['aep', 'adobe experience platform', 'adobe', 'experience platform'],
+  'ajo': ['ajo', 'adobe journey optimizer', 'journey optimizer', 'journey orchestration'],
+  'adobe journey optimizer': ['adobe journey optimizer', 'ajo', 'journey optimizer', 'journey orchestration'],
+  'journey orchestration': ['journey orchestration', 'adobe journey optimizer', 'ajo'],
+  'real-time cdp': ['real-time cdp', 'rt-cdp', 'real time cdp', 'customer data platform'],
   'full stack': ['full stack', 'fullstack', 'full-stack'],
   'fullstack': ['full stack', 'fullstack', 'full-stack'],
   'full-stack': ['full stack', 'fullstack', 'full-stack'],
@@ -567,6 +571,9 @@ function normalizeProfileSkills(rawSkills) {
     acronymMatches.forEach((match) => normalized.add(match[1].toLowerCase()));
 
     if (lower.includes('adobe experience platform')) normalized.add('adobe experience platform');
+    if (lower.includes('adobe journey optimizer')) normalized.add('adobe journey optimizer');
+    if (lower.includes('journey orchestration')) normalized.add('journey orchestration');
+    if (lower.includes('real-time cdp') || lower.includes('real time cdp')) normalized.add('real-time cdp');
     if (lower.includes('customer data platform')) normalized.add('customer data platform');
     if (lower.includes('real-time customer data platform')) normalized.add('real-time customer data platform');
     if (lower.includes('marketo')) normalized.add('marketo');
@@ -1029,6 +1036,11 @@ function generateTemplateResume(student, job, matchResult) {
 
 /** Map of common misspelled/non-standard role names to proper job titles */
 const ROLE_NORMALIZATION = {
+  'adobe journey optimizer': 'Adobe Journey Optimizer',
+  'adobe journey optimizer developer': 'Adobe Journey Optimizer Developer',
+  'ajo': 'Adobe Journey Optimizer',
+  'ajo developer': 'Adobe Journey Optimizer Developer',
+  'journey optimizer': 'Adobe Journey Optimizer',
   'aep devloper': 'Adobe Experience Platform Developer',
   'aep developer': 'Adobe Experience Platform Developer',
   'aepdevloper': 'Adobe Experience Platform Developer',
@@ -1119,6 +1131,9 @@ function normalizeJobTitle(rawRole) {
     'machine learning': 'Machine Learning Engineer', 'ai': 'AI Engineer',
     'data': 'Data Engineer', 'tableau': 'Data Analyst', 'power bi': 'Data Analyst',
     'crm': 'CRM Developer', 'powerplatform': 'Power Platform Developer',
+    'adobe journey optimizer': 'Adobe Journey Optimizer',
+    'journey optimizer': 'Adobe Journey Optimizer',
+    'ajo': 'Adobe Journey Optimizer',
     'adobe': 'Adobe Experience Platform Developer',
   };
   for (const [tech, title] of Object.entries(techToRole)) {
@@ -1139,6 +1154,8 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
 
   // Map of niche roles to broader, more searchable queries
   const BROADER_QUERIES = {
+    'adobe journey optimizer': ['Adobe Journey Optimizer', 'AJO Developer', 'Adobe Experience Platform'],
+    'adobe journey optimizer developer': ['Adobe Journey Optimizer', 'AJO Developer', 'Adobe Experience Platform'],
     'adobe experience platform developer': ['Adobe Experience Platform', 'AEP Developer', 'Adobe developer'],
     'salesforce developer': ['Salesforce developer', 'Salesforce engineer', 'CRM developer'],
     'microsoft dynamics crm developer': ['Dynamics 365 developer', 'CRM developer', 'Microsoft Dynamics'],
@@ -1155,8 +1172,8 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
   queries.push(normalizedRole);
 
   if (broaderAlts) {
-    // For niche roles, use a tightly related alternate query instead of a broad one.
-    queries.push(broaderAlts[0]);
+    // For niche roles, use tightly related alternates instead of a broad generic one.
+    queries.push(...broaderAlts);
   } else if ((skills || []).length > 0) {
     // For broader roles, add a skill-enriched secondary query for better relevance.
     const topKeywords = (skills || []).slice(0, 2).map(s => s.trim()).filter(Boolean).join(' ');
@@ -1165,7 +1182,7 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
 
   // Secondary query: use top skills to find more relevant jobs
   // Known real tech terms for validation
-  const KNOWN_TECH = new Set(['java','python','javascript','typescript','react','react.js','angular','vue','vue.js','next.js','nuxt','node.js','node','express','nestjs','spring','django','flask','fastapi','aws','azure','gcp','docker','kubernetes','sql','nosql','mongodb','postgresql','mysql','redis','graphql','rest','git','html','css','tailwind','bootstrap','c++','c#','.net','go','golang','rust','swift','kotlin','php','ruby','rails','laravel','tensorflow','pytorch','machine learning','ml','ai','data science','devops','linux','terraform','kafka','microservices','selenium','jest','figma','jira','salesforce','sap','oracle','flutter','react native','pandas','numpy','tableau','power bi','spark','hadoop','cypress','firebase','prisma','nginx','webpack','vite','crm','powerplatform','aep','adobe','mern','mean','blockchain','web3','unity','jenkins','agile','scrum']);
+  const KNOWN_TECH = new Set(['java','python','javascript','typescript','react','react.js','angular','vue','vue.js','next.js','nuxt','node.js','node','express','nestjs','spring','django','flask','fastapi','aws','azure','gcp','docker','kubernetes','sql','nosql','mongodb','postgresql','mysql','redis','graphql','rest','git','html','css','tailwind','bootstrap','c++','c#','.net','go','golang','rust','swift','kotlin','php','ruby','rails','laravel','tensorflow','pytorch','machine learning','ml','ai','data science','devops','linux','terraform','kafka','microservices','selenium','jest','figma','jira','salesforce','sap','oracle','flutter','react native','pandas','numpy','tableau','power bi','spark','hadoop','cypress','firebase','prisma','nginx','webpack','vite','crm','powerplatform','aep','ajo','adobe','adobe journey optimizer','journey orchestration','real-time cdp','customer data platform','mern','mean','blockchain','web3','unity','jenkins','agile','scrum']);
 
   const cleanSkills = (skills || [])
     .map(s => s.trim().toLowerCase())
@@ -1193,7 +1210,7 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
     }
   }
 
-  return [...new Set(queries.map(q => (q || '').trim()).filter(Boolean))].slice(0, 2); // Max 2 queries to avoid API rate limits
+  return [...new Set(queries.map(q => (q || '').trim()).filter(Boolean))].slice(0, 4);
 }
 
 // ───── Main Search Function ─────
@@ -1208,7 +1225,7 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
 async function searchJobs(student, days = 1) {
   const selectedDays = Math.max(1, parseInt(days, 10) || 1);
   const location = student.location || '';
-  const skills = student.keySkills || [];
+  const skills = normalizeProfileSkills(student.keySkills || []);
   const experience = student.experience || '';
 
   const regions = resolveSearchRegions(location);
@@ -1225,7 +1242,7 @@ async function searchJobs(student, days = 1) {
   const secondaryQuery = searchQueries.length > 1 ? searchQueries[1] : null;
 
   // Check cache for repeat searches
-  const cacheKey = `${primaryQuery}|${regions.join(',')}|${selectedDays}`;
+  const cacheKey = `${searchQueries.join('|')}|${regions.join(',')}|${selectedDays}`;
   const cached = apiCache.get(cacheKey);
   if (cached) return cached;
 
@@ -1304,7 +1321,7 @@ async function searchJobs(student, days = 1) {
   if (allJobs.length === 0) {
     const fallbackQueries = [
       normalizedRole.split(' ').slice(0, 2).join(' '),
-      `${(skills[0] || 'software')} developer`,
+      `${(skills[0] || student.keySkills?.[0] || 'software')} developer`,
       'software developer',
     ];
     for (const fq of fallbackQueries) {
@@ -1358,11 +1375,9 @@ async function searchJobs(student, days = 1) {
   // niche profiles (e.g., AEP Developer must see Adobe/AEP-related jobs only).
   const relevant = scored.filter(({ job, match }) => isJobRelevantToProfile(job, student, match));
 
-  // Quality threshold — only return jobs that score well AND pass relevance.
-  // No low-quality fallback: better to return fewer accurate jobs than 30 random ones.
-  const MIN_SCORE = 60;
-  const topResults = relevant
-    .filter(({ match }) => match.score >= MIN_SCORE)
+  const strictMatches = relevant.filter(({ match }) => match.score >= 60);
+  const supplementalMatches = relevant.filter(({ match }) => match.score >= 45 && match.score < 60);
+  const topResults = (strictMatches.length >= 12 ? strictMatches : [...strictMatches, ...supplementalMatches])
     .slice(0, 30);
 
   const results = topResults.map(({ job, match }) => ({

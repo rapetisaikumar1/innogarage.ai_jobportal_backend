@@ -69,6 +69,78 @@ const parseJsonField = (value, fallback = []) => {
   }
 };
 
+const RESUME_STOP_WORDS = new Set([
+  'about', 'above', 'across', 'after', 'again', 'against', 'also', 'among', 'and', 'any', 'are', 'as', 'at', 'be', 'been',
+  'being', 'but', 'by', 'can', 'company', 'could', 'day', 'description', 'do', 'does', 'during', 'each', 'for', 'from',
+  'has', 'have', 'having', 'here', 'how', 'in', 'into', 'is', 'it', 'its', 'job', 'more', 'must', 'not', 'of', 'on', 'or',
+  'our', 'position', 'required', 'requirements', 'role', 'should', 'team', 'than', 'that', 'the', 'their', 'this', 'to',
+  'use', 'using', 'we', 'will', 'with', 'work', 'you', 'your'
+]);
+
+const RESUME_SKILL_TERMS = [
+  'Adobe Experience Platform', 'AEP', 'Adobe Journey Optimizer', 'AJO', 'Real-Time CDP', 'RT-CDP', 'Customer Journey Analytics',
+  'CJA', 'Adobe Analytics', 'Adobe Target', 'Adobe Launch', 'Data Collection', 'Adobe Campaign', 'XDM', 'Identity Resolution',
+  'SQL', 'JavaScript', 'Python', 'React', 'Node.js', 'AWS', 'Azure', 'Git', 'Jenkins', 'Azure DevOps', 'Jira', 'Agile',
+  'REST API', 'APIs', 'Data Governance', 'GDPR', 'CCPA', 'Tag Management', 'ETL', 'CI/CD', 'Dashboarding', 'Tableau',
+  'A/B Testing', 'Segmentation', 'Attribution', 'Journey Orchestration', 'Marketing Automation', 'Stakeholder Management',
+  'Program Governance', 'Delivery Leadership', 'Risk Management', 'Quarterly Business Review', 'QBR'
+];
+
+const ACTION_VERBS = [
+  'Architected', 'Delivered', 'Optimized', 'Led', 'Implemented', 'Designed', 'Automated', 'Integrated', 'Analyzed', 'Improved',
+  'Accelerated', 'Standardized', 'Orchestrated', 'Resolved', 'Launched', 'Enhanced', 'Governed', 'Collaborated', 'Streamlined'
+];
+
+const normalizeResumeToken = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9+#.\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+
+const extractResumeKeywords = (text, extraSkills = [], limit = 36) => {
+  const source = normalizeResumeToken(text);
+  const foundTerms = [];
+
+  for (const term of RESUME_SKILL_TERMS.concat(extraSkills || [])) {
+    const cleanTerm = String(term || '').trim();
+    if (!cleanTerm) continue;
+    const escaped = cleanTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${escaped}\\b`, 'i').test(text || source)) foundTerms.push(cleanTerm);
+  }
+
+  const counts = new Map();
+  source.split(/\s+/).forEach((word) => {
+    if (!word || word.length < 3 || RESUME_STOP_WORDS.has(word) || /^\d+$/.test(word)) return;
+    counts.set(word, (counts.get(word) || 0) + 1);
+  });
+
+  const rankedWords = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([word]) => word.replace(/\b\w/g, (char) => char.toUpperCase()));
+
+  return [...new Set([...foundTerms, ...rankedWords])].slice(0, limit);
+};
+
+const calculateResumeIntelligence = ({ jd = '', resumeText = '', userSkills = [], existingScore = 0 }) => {
+  const jdKeywords = extractResumeKeywords(jd, userSkills, 42);
+  const resumeNormalized = normalizeResumeToken(resumeText);
+  const matchedKeywords = jdKeywords.filter((keyword) => resumeNormalized.includes(normalizeResumeToken(keyword)));
+  const missingKeywords = jdKeywords.filter((keyword) => !matchedKeywords.includes(keyword)).slice(0, 12);
+  const coverage = jdKeywords.length ? Math.round((matchedKeywords.length / jdKeywords.length) * 100) : 0;
+  const score = Math.max(parseInt(existingScore, 10) || 0, Math.min(98, Math.round((coverage * 0.7) + (matchedKeywords.length >= 12 ? 20 : matchedKeywords.length * 1.5))));
+
+  return {
+    score,
+    coverage,
+    jdKeywords,
+    matchedKeywords: matchedKeywords.slice(0, 18),
+    missingKeywords,
+    actionVerbs: ACTION_VERBS.slice(0, 10),
+    suggestions: [
+      missingKeywords.length ? `Naturally include ${missingKeywords.slice(0, 4).join(', ')} where they match real experience.` : 'Keyword coverage is strong for this JD.',
+      'Start experience bullets with direct action verbs and keep them impact-focused.',
+      'Keep the resume single-column with standard headings for ATS parsing.',
+      'Use the JD title in the resume header and align the summary to the selected role.',
+    ],
+  };
+};
+
 const isReusableGeneratedResume = (text) => {
   if (!text || typeof text !== 'string') return false;
   const clean = text.trim();
@@ -114,6 +186,8 @@ const getParsedResumeTextForUser = async (user) => {
 
   return existingText;
 };
+// Export so admin controller can reuse without duplicating PDF-parse logic
+exports._getParsedResumeTextForUser = getParsedResumeTextForUser;
 
 const mapSavedJobToListing = (job, user = {}) => ({
   id: job.id,
@@ -142,6 +216,10 @@ const mapSavedJobToListing = (job, user = {}) => ({
   candidate_name: user.fullName || '',
   email: user.email || '',
 });
+
+const normalizeSavedJobDedupeKey = (job) => [job.employerName, job.jobTitle, job.jobCountry]
+  .map(value => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim())
+  .join('|');
 
 const saveSearchResultsForUser = async (userId, results) => {
   const seenLinks = new Set();
@@ -180,7 +258,17 @@ const saveSearchResultsForUser = async (userId, results) => {
     };
 
     const existing = await prisma.savedJobResult.findFirst({
-      where: { userId, applyLink: data.applyLink },
+      where: {
+        userId,
+        OR: [
+          { applyLink: data.applyLink },
+          {
+            employerName: data.employerName,
+            jobTitle: data.jobTitle,
+            jobCountry: data.jobCountry,
+          },
+        ],
+      },
       select: { id: true, resumeText: true },
     });
 
@@ -382,7 +470,8 @@ const PLAN_LIMITS = {
   ultra: { maxSearches: 999999, label: 'Ultra' },
 };
 
-const getPlanLimit = (plan) => PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+const normalizePlan = (plan) => String(plan || 'free').toLowerCase();
+const getPlanLimit = (plan) => PLAN_LIMITS[normalizePlan(plan)] || PLAN_LIMITS.free;
 
 // Reset search count if a new day has started
 const resetSearchCountIfNeeded = async (user) => {
@@ -401,7 +490,7 @@ const resetSearchCountIfNeeded = async (user) => {
 // Auto-verify Stripe session and update plan if payment completed but plan never saved
 const autoVerifyStripeSession = async (user) => {
   try {
-    if (user.subscriptionPlan && user.subscriptionPlan !== 'free') return user.subscriptionPlan;
+    if (user.subscriptionPlan && normalizePlan(user.subscriptionPlan) !== 'free') return normalizePlan(user.subscriptionPlan);
     if (!user.stripeSessionId) return user.subscriptionPlan || 'free';
 
     const config = require('../config');
@@ -414,7 +503,7 @@ const autoVerifyStripeSession = async (user) => {
     );
 
     if (session.payment_status === 'paid' && session.metadata?.plan) {
-      const plan = session.metadata.plan;
+      const plan = normalizePlan(session.metadata.plan);
       await prisma.user.update({
         where: { id: user.id },
         data: {
@@ -441,7 +530,7 @@ exports.getUsage = async (req, res) => {
       select: { id: true, email: true, subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true },
     });
     // Self-healing: if plan is free but a Stripe session exists, auto-verify payment
-    const plan = await autoVerifyStripeSession(user);
+    const plan = normalizePlan(await autoVerifyStripeSession(user));
     const limit = getPlanLimit(plan);
     const used = await resetSearchCountIfNeeded(user);
     res.json({ plan, used, max: limit.maxSearches, label: limit.label });
@@ -468,7 +557,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     // Self-healing plan check
-    const plan = await autoVerifyStripeSession(user);
+    const plan = normalizePlan(await autoVerifyStripeSession(user));
     const limit = getPlanLimit(plan);
     const used = await resetSearchCountIfNeeded(user);
 
@@ -886,11 +975,12 @@ exports.getDashboardStats = async (req, res) => {
       return res.json(cachedStats.data);
     }
 
-    const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
+    const [totalApplied, interviewScheduled, rejected, offerReceived, totalMatchedJobs, totalInternalJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
       prisma.jobApplication.count({ where: { userId, status: 'APPLIED' } }),
       prisma.jobApplication.count({ where: { userId, status: 'INTERVIEW_SCHEDULED' } }),
       prisma.jobApplication.count({ where: { userId, status: 'REJECTED' } }),
       prisma.jobApplication.count({ where: { userId, status: 'OFFER_RECEIVED' } }),
+      prisma.savedJobResult.count({ where: { userId, matchScore: { gte: 60 } } }),
       prisma.job.count({ where: { isActive: true } }),
       prisma.jobApplication.count({ where: { userId, appliedById: { not: null } } }),
       prisma.sheetJobApplication.count({ where: { userId, appliedById: { not: null } } }),
@@ -914,8 +1004,11 @@ exports.getDashboardStats = async (req, res) => {
     const candidateApplyCount = (allDbApplied - dbAdminApplied) + (sheetTotalApplied - sheetAdminApplied);
 
     const stats = {
-      totalJobs,
+      totalJobs: totalMatchedJobs,
+      totalSheetJobs: totalMatchedJobs,
+      totalInternalJobs,
       totalApplied: allDbApplied,
+      totalApplications: allDbApplied + sheetTotalApplied,
       interviewScheduled,
       rejected,
       offerReceived,
@@ -1081,10 +1174,11 @@ exports.markSheetJobApplied = async (req, res) => {
     const { jobLink, employerName, matchScore, jobTitle } = req.body;
     if (!jobLink) return res.status(400).json({ message: 'jobLink is required' });
 
+    const scoreStr = matchScore != null ? String(matchScore) : null;
     const application = await prisma.sheetJobApplication.upsert({
       where: { userId_jobLink: { userId, jobLink } },
-      update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
-      create: { userId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
+      update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore: scoreStr, jobTitle },
+      create: { userId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore: scoreStr, jobTitle },
     });
 
     invalidateDashboardStatsCache(userId);
@@ -1234,28 +1328,112 @@ exports.getSavedJobs = async (req, res) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Not authenticated' });
 
-    const MIN_MATCH_SCORE = 60;
+    const STRICT_MATCH_SCORE = 60;
+    const FALLBACK_MATCH_SCORE = 45;
 
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const skip = (page - 1) * limit;
 
-    const [jobs, total] = await Promise.all([
-      prisma.savedJobResult.findMany({
-        where: { userId, matchScore: { gte: MIN_MATCH_SCORE } },
-        orderBy: { matchScore: 'desc' },
-        skip,
-        take: limit,
-      }),
-      prisma.savedJobResult.count({ where: { userId, matchScore: { gte: MIN_MATCH_SCORE } } }),
-    ]);
+    const strictTotal = await prisma.savedJobResult.count({ where: { userId, matchScore: { gte: STRICT_MATCH_SCORE } } });
+    const minScore = strictTotal >= 10 ? STRICT_MATCH_SCORE : FALLBACK_MATCH_SCORE;
+    const allJobs = await prisma.savedJobResult.findMany({
+      where: { userId, matchScore: { gte: minScore } },
+      orderBy: [{ matchScore: 'desc' }, { createdAt: 'desc' }],
+      take: Math.max(150, limit * 4),
+    });
+
+    const deduped = [];
+    const seenJobKeys = new Set();
+    for (const job of allJobs) {
+      const key = normalizeSavedJobDedupeKey(job) || job.applyLink || job.id;
+      if (seenJobKeys.has(key)) continue;
+      seenJobKeys.add(key);
+      deduped.push(job);
+    }
+
+    const jobs = deduped.slice(skip, skip + limit);
+    const total = deduped.length;
 
     const mapped = jobs.map((job) => mapSavedJobToListing(job, req.user || {}));
 
-    res.json({ jobs: mapped, total, page, limit });
+    res.json({ jobs: mapped, total, page, limit, minScore });
   } catch (error) {
     res.status(500).json({ error: 'Failed to retrieve saved jobs' });
   }
+};
+
+exports.analyzeJobDescription = async (req, res) => {
+  try {
+    const jd = req.body?.jd || req.body?.job_description || '';
+    const resumeText = req.body?.resume_text || '';
+    const userSkills = Array.isArray(req.body?.skills) ? req.body.skills : [];
+
+    if (!jd || jd.trim().length < 80) {
+      return res.status(400).json({ message: 'A full job description is required for JD analysis.' });
+    }
+
+    const analysis = calculateResumeIntelligence({ jd, resumeText, userSkills, existingScore: req.body?.match_score });
+    res.json({
+      jobTitle: req.body?.job_title || 'Target Role',
+      keywords: analysis.jdKeywords,
+      matchedKeywords: analysis.matchedKeywords,
+      missingSkills: analysis.missingKeywords,
+      suggestedActionVerbs: analysis.actionVerbs,
+      suggestions: analysis.suggestions,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to analyze job description', error: error.message || String(error) });
+  }
+};
+
+exports.calculateResumeMatchScore = async (req, res) => {
+  try {
+    const jd = req.body?.jd || '';
+    const resumeText = req.body?.resume_text || '';
+    const userSkills = Array.isArray(req.body?.skills) ? req.body.skills : [];
+
+    if (!jd || !resumeText) {
+      return res.status(400).json({ message: 'Job description and resume text are required.' });
+    }
+
+    res.json(calculateResumeIntelligence({ jd, resumeText, userSkills, existingScore: req.body?.match_score }));
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to calculate resume match score', error: error.message || String(error) });
+  }
+};
+
+exports.saveGeneratedResumeText = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { id, job_apply_link, resume_text } = req.body || {};
+    if (!userId) return res.status(401).json({ message: 'Not authenticated' });
+    if (!resume_text || resume_text.trim().length < 800) return res.status(400).json({ message: 'Resume text is too short to save.' });
+
+    const where = id
+      ? { id, userId }
+      : { userId, applyLink: job_apply_link || undefined };
+    const existing = await prisma.savedJobResult.findFirst({ where });
+    if (!existing) return res.status(404).json({ message: 'Saved job was not found.' });
+
+    const savedJob = await prisma.savedJobResult.update({
+      where: { id: existing.id },
+      data: { resumeText: resume_text.trim() },
+    });
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, fullName: true, email: true } });
+    res.json({ message: 'Resume edits saved.', job: mapSavedJobToListing(savedJob, user || {}) });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to save resume edits', error: error.message || String(error) });
+  }
+};
+
+exports.exportPdfInstructions = async (_req, res) => {
+  res.json({
+    message: 'PDF export is handled in the browser with selectable text and print-safe ATS spacing.',
+    engine: 'html2pdf.js',
+    atsRules: ['single-column layout', 'standard headings', 'readable fonts', 'selectable text', 'multi-page support'],
+  });
 };
 
 // Generate or regenerate an ATS resume for a saved/external job.
@@ -1384,6 +1562,12 @@ exports.generateSavedJobResume = async (req, res) => {
       message: 'ATS resume created successfully.',
       job: mapSavedJobToListing(savedJob, user),
       provider,
+      analysis: calculateResumeIntelligence({
+        jd: jobData.jd,
+        resumeText,
+        userSkills: user.keySkills || [],
+        existingScore: jobData.match_score,
+      }),
     });
   } catch (error) {
     console.error('Generate ATS resume error:', error.message || error);

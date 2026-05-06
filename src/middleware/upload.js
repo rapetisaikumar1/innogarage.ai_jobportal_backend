@@ -6,7 +6,7 @@ const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   const allowedTypes = {
-    resume: ['.pdf'],
+    resume: ['.pdf', '.doc', '.docx'],
     material: ['.pdf', '.doc', '.docx', '.mp4', '.avi', '.mov', '.pptx', '.ppt'],
     avatar: ['.jpg', '.jpeg', '.png', '.gif', '.webp'],
     document: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf'],

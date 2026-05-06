@@ -1,5 +1,33 @@
 const prisma = require('../config/database');
 
+const getAssignedAdminIdsForStudent = async (studentId) => {
+  const [assignments, student] = await Promise.all([
+    prisma.studentAdminAssignment.findMany({ where: { studentId }, select: { adminId: true } }),
+    prisma.user.findUnique({ where: { id: studentId }, select: { assignedMentorId: true } }),
+  ]);
+
+  const adminIds = [...new Set([
+    ...assignments.map(a => a.adminId),
+    ...(student?.assignedMentorId ? [student.assignedMentorId] : []),
+  ])];
+
+  if (adminIds.length === 0) return [];
+  const activeAdmins = await prisma.user.findMany({
+    where: { id: { in: adminIds }, role: 'ADMIN', isActive: true },
+    select: { id: true },
+  });
+  return activeAdmins.map(admin => admin.id);
+};
+
+const getStudentIdsForAdmin = async (adminId) => {
+  const [assignments, legacyStudents] = await Promise.all([
+    prisma.studentAdminAssignment.findMany({ where: { adminId }, select: { studentId: true } }),
+    prisma.user.findMany({ where: { role: 'STUDENT', isActive: true, assignedMentorId: adminId }, select: { id: true } }),
+  ]);
+
+  return [...new Set([...assignments.map(a => a.studentId), ...legacyStudents.map(s => s.id)])];
+};
+
 // Get chat messages between two users
 exports.getMessages = async (req, res) => {
   try {
@@ -117,10 +145,17 @@ exports.getContacts = async (req, res) => {
       ...receivedFrom.map(m => m.senderId),
     ])];
 
-    // If student, include ALL active admins (Marketing, HR, Proxy) + all super admins
+    // If student, include assigned admins + all super admins
     if (req.user.role === 'STUDENT') {
+      const assignedAdminIds = await getAssignedAdminIdsForStudent(userId);
       const allStaff = await prisma.user.findMany({
-        where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
+        where: {
+          isActive: true,
+          OR: [
+            { role: 'SUPER_ADMIN' },
+            { id: { in: assignedAdminIds } },
+          ],
+        },
         select: { id: true },
       });
       allStaff.forEach(s => {
@@ -128,12 +163,13 @@ exports.getContacts = async (req, res) => {
       });
     }
 
-    // If admin, include ALL active students + other admins/super admins
+    // If admin, include assigned students + other admins/super admins
     if (req.user.role === 'ADMIN') {
-      const allStudents = await prisma.user.findMany({
-        where: { role: 'STUDENT', isActive: true },
+      const assignedStudentIds = await getStudentIdsForAdmin(userId);
+      const allStudents = assignedStudentIds.length > 0 ? await prisma.user.findMany({
+        where: { id: { in: assignedStudentIds }, role: 'STUDENT', isActive: true },
         select: { id: true },
-      });
+      }) : [];
       allStudents.forEach(s => {
         if (!contactIds.includes(s.id)) contactIds.push(s.id);
       });

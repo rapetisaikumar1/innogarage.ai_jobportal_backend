@@ -34,10 +34,12 @@ const createQuery = async (req, res) => {
       },
     });
 
-    // Send notification to all admins and super admins about new query
+    // Send notification to relevant staff about the new query
     const staffUsers = await prisma.user.findMany({
-      where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
-      select: { id: true },
+      where: assignedToId
+        ? { OR: [{ id: assignedToId }, { role: 'SUPER_ADMIN' }], isActive: true }
+        : { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
+      select: { id: true, role: true },
     });
     if (staffUsers.length > 0) {
       await prisma.notification.createMany({
@@ -46,7 +48,7 @@ const createQuery = async (req, res) => {
           title: 'New Support Query',
           message: `${query.user.fullName} raised a query: "${subject}"`,
           type: 'query',
-          link: '/superadmin/queries',
+          link: s.role === 'ADMIN' ? '/admin/queries' : '/superadmin/queries',
         })),
       });
     }
@@ -75,10 +77,12 @@ const getMyQueries = async (req, res) => {
   }
 };
 
-// Admin / Super Admin: Get queries (ADMIN sees only assigned-to-them, SUPER_ADMIN sees all)
+// Admin / Super Admin: Get queries (ADMIN sees assigned and unassigned, SUPER_ADMIN sees all)
 const getAllQueries = async (req, res) => {
   try {
-    const where = req.user.role === 'ADMIN' ? { assignedToId: req.user.id } : {};
+    const where = req.user.role === 'ADMIN'
+      ? { OR: [{ assignedToId: req.user.id }, { assignedToId: null }] }
+      : {};
     const queries = await prisma.supportQuery.findMany({
       where,
       include: {
@@ -148,7 +152,7 @@ const updateQuery = async (req, res) => {
           title: 'Query Updated',
           message: msg,
           type: 'query',
-          link: '/dashboard/help',
+          link: '/dashboard/help-support',
         },
       });
     }
@@ -165,7 +169,7 @@ const getNewQueryCount = async (req, res) => {
   try {
     const since = req.query.since;
     const where = { status: { not: 'CLOSED' } };
-    if (req.user.role === 'ADMIN') where.assignedToId = req.user.id;
+    if (req.user.role === 'ADMIN') where.OR = [{ assignedToId: req.user.id }, { assignedToId: null }];
     if (since) where.createdAt = { gt: new Date(since) };
     const count = await prisma.supportQuery.count({ where });
     res.json({ count });
@@ -222,7 +226,9 @@ const getStaffList = async (req, res) => {
 // Admin / Super Admin: Get query stats by status
 const getQueryStats = async (req, res) => {
   try {
-    const baseWhere = req.user.role === 'ADMIN' ? { assignedToId: req.user.id } : {};
+    const baseWhere = req.user.role === 'ADMIN'
+      ? { OR: [{ assignedToId: req.user.id }, { assignedToId: null }] }
+      : {};
     const [open, inProgress, closed, total] = await Promise.all([
       prisma.supportQuery.count({ where: { ...baseWhere, status: 'OPEN' } }),
       prisma.supportQuery.count({ where: { ...baseWhere, status: 'IN_PROGRESS' } }),

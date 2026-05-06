@@ -2,6 +2,7 @@ const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jsJobSearchService = require('../services/jsJobSearchService');
+const aiService = require('../services/aiService');
 
 const parseJsonField = (value, fallback = []) => {
   if (value == null) return fallback;
@@ -37,7 +38,8 @@ const mapSavedJobToListing = (job, student = {}) => ({
   missing_skills: JSON.stringify(job.missingSkills || []),
   pdf_link: '',
   jd: job.jd || '',
-  resume_text: '',
+  // Include persisted resume text so the portal shows "Resume" instead of "Gen Resume"
+  resume_text: job.resumeText || '',
 });
 
 const saveSearchResultsForStudent = async (studentId, results) => {
@@ -663,41 +665,45 @@ exports.getAnalytics = async (req, res) => {
   try {
     const [
       totalStudents,
-      totalMentors,
-      totalJobs,
-      totalApplications,
+      totalAdmins,
+      totalInternalJobs,
+      totalMatchedJobs,
+      totalInternalApplications,
+      totalSheetApplications,
       activeStudents,
-      interviewsScheduled,
-      offersReceived,
       totalBookings,
-      rejectedApplications,
       studentsWithoutMentor,
       completedBookings,
+      totalMaterials,
     ] = await Promise.all([
       prisma.user.count({ where: { role: 'STUDENT' } }),
       prisma.user.count({ where: { role: 'ADMIN' } }),
       prisma.job.count({ where: { isActive: true } }),
+      prisma.savedJobResult.count(),
       prisma.jobApplication.count(),
+      prisma.sheetJobApplication.count(),
       prisma.user.count({ where: { role: 'STUDENT', isActive: true } }),
-      prisma.jobApplication.count({ where: { status: 'INTERVIEW_SCHEDULED' } }),
-      prisma.jobApplication.count({ where: { status: 'OFFER_RECEIVED' } }),
       prisma.mentorBooking.count(),
-      prisma.jobApplication.count({ where: { status: 'REJECTED' } }),
-      prisma.user.count({ where: { role: 'STUDENT', assignedMentorId: null } }),
+      prisma.user.count({ where: { role: 'STUDENT', assignedMentorId: null, adminAssignments: { none: {} } } }),
       prisma.mentorBooking.count({ where: { status: 'COMPLETED' } }),
+      prisma.trainingMaterial.count(),
     ]);
 
-    // Parallel: recent apps, status breakdown, technology breakdown
+    // Parallel: recent apps, combined status breakdown, technology breakdown
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const [recentApplications, applicationsByStatus, studentsWithRole] = await Promise.all([
+    const [recentApplications, internalApplicationsByStatus, sheetApplicationsByStatus, studentsWithRole] = await Promise.all([
       prisma.jobApplication.groupBy({
         by: ['appliedAt'],
         where: { appliedAt: { gte: sevenDaysAgo } },
-        _count: true,
+        _count: { _all: true },
       }),
       prisma.jobApplication.groupBy({
         by: ['status'],
-        _count: true,
+        _count: { _all: true },
+      }),
+      prisma.sheetJobApplication.groupBy({
+        by: ['status'],
+        _count: { _all: true },
       }),
       prisma.user.findMany({
         where: { role: 'STUDENT', jobRole: { not: null } },
@@ -707,9 +713,12 @@ exports.getAnalytics = async (req, res) => {
 
     // Application status breakdown
     const statusBreakdown = {};
-    applicationsByStatus.forEach(item => {
-      statusBreakdown[item.status] = item._count;
-    });
+    const addStatusCount = (status, count) => {
+      if (!status) return;
+      statusBreakdown[status] = (statusBreakdown[status] || 0) + (count || 0);
+    };
+    internalApplicationsByStatus.forEach(item => addStatusCount(item.status, item._count?._all || 0));
+    sheetApplicationsByStatus.forEach(item => addStatusCount(item.status, item._count?._all || 0));
 
     // Technology/Role-wise candidate breakdown
     const technologyBreakdown = {};
@@ -720,11 +729,22 @@ exports.getAnalytics = async (req, res) => {
       }
     });
 
+    const totalJobs = totalInternalJobs + totalMatchedJobs;
+    const totalApplications = totalInternalApplications + totalSheetApplications;
+    const interviewsScheduled = statusBreakdown.INTERVIEW_SCHEDULED || 0;
+    const offersReceived = statusBreakdown.OFFER_RECEIVED || 0;
+    const rejectedApplications = statusBreakdown.REJECTED || 0;
+
     res.json({
       totalStudents,
-      totalMentors,
+      totalAdmins,
+      totalMentors: totalAdmins,
       totalJobs,
+      totalInternalJobs,
+      totalMatchedJobs,
       totalApplications,
+      totalInternalApplications,
+      totalSheetApplications,
       activeStudents,
       interviewsScheduled,
       offersReceived,
@@ -732,6 +752,7 @@ exports.getAnalytics = async (req, res) => {
       rejectedApplications,
       studentsWithoutMentor,
       completedBookings,
+      totalMaterials,
       recentApplications,
       applicationsByStatus: statusBreakdown,
       technologyBreakdown,
@@ -775,7 +796,7 @@ exports.getAssignedStudents = async (req, res) => {
         status: true,
         createdAt: true,
         _count: {
-          select: { jobApplications: true },
+          select: { jobApplications: true, sheetApplications: true },
         },
       },
       orderBy: { createdAt: 'desc' },
@@ -851,19 +872,13 @@ exports.getStudentDashboardData = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs, manualPending, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
+    const [totalApplied, interviewScheduled, rejected, offerReceived, totalMatchedJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
       prisma.jobApplication.count({ where: { userId: studentId, status: 'APPLIED' } }),
       prisma.jobApplication.count({ where: { userId: studentId, status: 'INTERVIEW_SCHEDULED' } }),
       prisma.jobApplication.count({ where: { userId: studentId, status: 'REJECTED' } }),
       prisma.jobApplication.count({ where: { userId: studentId, status: 'OFFER_RECEIVED' } }),
-      prisma.job.count({ where: { isActive: true } }),
-      prisma.job.count({
-        where: {
-          isActive: true,
-          applicationType: 'MANUAL_APPLY',
-          NOT: { applications: { some: { userId: studentId } } },
-        },
-      }),
+      // Count the student's visible AI-matched jobs, not the internal Job table
+      prisma.savedJobResult.count({ where: { userId: studentId, matchScore: { gte: 60 } } }),
       prisma.jobApplication.count({ where: { userId: studentId, appliedById: { not: null } } }),
       prisma.sheetJobApplication.count({ where: { userId: studentId, appliedById: { not: null } } }),
       prisma.sheetJobApplication.count({ where: { userId: studentId } }),
@@ -891,12 +906,12 @@ exports.getStudentDashboardData = async (req, res) => {
 
     res.json({
       stats: {
-        totalJobs,
+        totalJobs: totalMatchedJobs,
+        totalSheetJobs: totalMatchedJobs,
         totalApplied: allDbApplied,
         interviewScheduled,
         rejected,
         offerReceived,
-        manualPending,
         sheetAppliedCount: sheetTotalApplied,
         adminApplyCount,
         candidateApplyCount,
@@ -1166,8 +1181,8 @@ exports.markExternalJobAppliedForStudent = async (req, res) => {
 
     const application = await prisma.sheetJobApplication.upsert({
       where: { userId_jobLink: { userId: studentId, jobLink } },
-      update: { status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore, jobTitle },
-      create: { userId: studentId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore, jobTitle },
+      update: { status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore: matchScore != null ? String(matchScore) : null, jobTitle },
+      create: { userId: studentId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore: matchScore != null ? String(matchScore) : null, jobTitle },
     });
 
     res.json({ message: 'Marked as applied for student', application });
@@ -1209,5 +1224,139 @@ exports.getStudentAdmins = async (req, res) => {
     res.json(assignments.map(a => ({ ...a.admin, department: a.department, assignedAt: a.createdAt })));
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch student admins', error: error.message });
+  }
+};
+
+// Generate a tailored ATS resume for a student (admin acting on behalf)
+exports.generateResumeForStudent = async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { forceRegenerate, ...jobData } = req.body || {};
+
+    const student = await prisma.user.findUnique({
+      where: { id: studentId },
+      select: {
+        id: true, fullName: true, email: true, phone: true,
+        linkedinProfile: true, keySkills: true, jobRole: true,
+        location: true, education: true, experience: true,
+        resumeUrl: true, parsedResumeText: true,
+      },
+    });
+    if (!student || !['STUDENT'].includes((await prisma.user.findUnique({ where: { id: studentId }, select: { role: true } }))?.role)) {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    const jobApplyLink = jobData.job_apply_link;
+
+    const existing = jobApplyLink
+      ? await prisma.savedJobResult.findFirst({ where: { userId: studentId, applyLink: jobApplyLink } })
+      : null;
+
+    const isReusable = (text) => {
+      if (!text || text.length < 1200) return false;
+      return /PROFESSIONAL\s+SUMMARY/i.test(text) && /(?:PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE)/i.test(text);
+    };
+
+    if (existing && isReusable(existing.resumeText) && !forceRegenerate) {
+      const mapJob = (j) => ({
+        id: j.id,
+        job_apply_link: j.applyLink,
+        employer_name: j.employerName,
+        job_title: j.jobTitle,
+        job_city: j.jobCity,
+        job_state: j.jobState,
+        job_country: j.jobCountry,
+        job_employment_type: j.employmentType,
+        employer_logo: j.employerLogo,
+        source: j.source,
+        posted: j.postedAt,
+        jd: j.jd,
+        match_score: j.matchScore,
+        strong_matches: j.strongMatches,
+        missing_skills: j.missingSkills,
+        match_summary: j.matchSummary,
+        resume_text: j.resumeText,
+        candidate_name: student.fullName,
+      });
+      return res.json({ message: 'Existing ATS resume loaded.', job: mapJob(existing), provider: 'cached' });
+    }
+
+    // Get resume text from DB or URL (reuse job controller's PDF-parse helper)
+    const jobCtrl = require('./jobController');
+    const parsedResumeText = await jobCtrl._getParsedResumeTextForUser(student);
+
+    if (!parsedResumeText || parsedResumeText.length < 800) {
+      return res.status(400).json({ message: 'Student has no uploaded resume. Please ask them to upload their resume first.' });
+    }
+
+    const fullJobData = {
+      job_apply_link: jobApplyLink || existing?.applyLink || null,
+      employer_name: jobData.employer_name || existing?.employerName || '',
+      job_title: jobData.job_title || existing?.jobTitle || '',
+      job_city: jobData.job_city || existing?.jobCity || '',
+      job_state: jobData.job_state || existing?.jobState || '',
+      job_country: jobData.job_country || existing?.jobCountry || '',
+      job_employment_type: jobData.job_employment_type || existing?.employmentType || '',
+      jd: jobData.jd || existing?.jd || '',
+      match_score: parseInt(jobData.match_score, 10) || existing?.matchScore || 0,
+      strong_matches: jobData.strong_matches ?? existing?.strongMatches ?? [],
+      missing_skills: jobData.missing_skills ?? existing?.missingSkills ?? [],
+      match_summary: jobData.match_summary || existing?.matchSummary || '',
+    };
+
+    if (!fullJobData.jd) {
+      return res.status(400).json({ message: 'Job description is required to generate a resume.' });
+    }
+
+    const generatedResume = await aiService.generateATSResumeText({ ...student, parsedResumeText }, fullJobData);
+    const resumeText = typeof generatedResume === 'string' ? generatedResume : generatedResume?.text;
+    if (!resumeText || !resumeText.trim()) {
+      return res.status(500).json({ message: 'Failed to generate ATS resume.' });
+    }
+
+    const savedData = {
+      userId: studentId,
+      employerName: fullJobData.employer_name || null,
+      jobTitle: fullJobData.job_title || null,
+      jobCity: fullJobData.job_city || null,
+      jobState: fullJobData.job_state || null,
+      jobCountry: fullJobData.job_country || null,
+      applyLink: fullJobData.job_apply_link || null,
+      jd: fullJobData.jd || null,
+      matchScore: fullJobData.match_score || 0,
+      strongMatches: Array.isArray(fullJobData.strong_matches) ? JSON.stringify(fullJobData.strong_matches) : (fullJobData.strong_matches || null),
+      missingSkills: Array.isArray(fullJobData.missing_skills) ? JSON.stringify(fullJobData.missing_skills) : (fullJobData.missing_skills || null),
+      matchSummary: fullJobData.match_summary || null,
+      resumeText,
+    };
+
+    const savedJob = existing
+      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data: savedData })
+      : await prisma.savedJobResult.create({ data: savedData });
+
+    const mapJob = (j) => ({
+      id: j.id,
+      job_apply_link: j.applyLink,
+      employer_name: j.employerName,
+      job_title: j.jobTitle,
+      job_city: j.jobCity,
+      job_state: j.jobState,
+      job_country: j.jobCountry,
+      job_employment_type: j.employmentType,
+      employer_logo: j.employerLogo,
+      source: j.source,
+      posted: j.postedAt,
+      jd: j.jd,
+      match_score: j.matchScore,
+      strong_matches: j.strongMatches,
+      missing_skills: j.missingSkills,
+      match_summary: j.matchSummary,
+      resume_text: j.resumeText,
+      candidate_name: student.fullName,
+    });
+
+    res.json({ message: 'ATS resume generated successfully.', job: mapJob(savedJob) });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to generate resume', error: error.message });
   }
 };

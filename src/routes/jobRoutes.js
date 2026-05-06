@@ -17,7 +17,12 @@ router.post('/search', authenticate, authorize('STUDENT'), jobController.trigger
 router.post('/trigger-n8n', authenticate, authorize('STUDENT'), jobController.triggerN8nWorkflow);
 router.post('/auto-apply-all', authenticate, authorize('STUDENT'), jobController.autoApplyAllSheetJobs);
 router.post('/auto-apply', authenticate, authorize('STUDENT'), jobController.autoApplyToJob);
+router.post('/analyze-jd', authenticate, authorize('STUDENT'), jobController.analyzeJobDescription);
+router.post('/match-score', authenticate, authorize('STUDENT'), jobController.calculateResumeMatchScore);
+router.post('/generate-resume', authenticate, authorize('STUDENT'), jobController.generateSavedJobResume);
+router.post('/export-pdf', authenticate, authorize('STUDENT'), jobController.exportPdfInstructions);
 router.post('/resume/generate', authenticate, authorize('STUDENT'), jobController.generateSavedJobResume);
+router.post('/resume/save', authenticate, authorize('STUDENT'), jobController.saveGeneratedResumeText);
 router.get('/stats', authenticate, jobController.getDashboardStats);
 router.get('/applications/mine', authenticate, jobController.getMyApplications);
 router.get('/applications/all', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getAllApplications);

@@ -42,13 +42,16 @@ exports.updateProfile = async (req, res) => {
         try {
           const result = await uploadToCloudinary(req.file.buffer, { folder: 'resumes', resourceType: 'raw' });
           updateData.resumeUrl = result.url;
-          // Extract text from PDF resume
-          try {
-            const resumeText = await parseResumePdfBuffer(req.file.buffer);
-            if (resumeText.length > 20) {
-              updateData.parsedResumeText = resumeText.substring(0, 20000);
-            }
-          } catch { /* PDF parse failed — continue without text */ }
+          // Extract text only from PDF resumes
+          const ext = require('path').extname(req.file.originalname).toLowerCase();
+          if (ext === '.pdf') {
+            try {
+              const resumeText = await parseResumePdfBuffer(req.file.buffer);
+              if (resumeText.length > 20) {
+                updateData.parsedResumeText = resumeText.substring(0, 20000);
+              }
+            } catch { /* PDF parse failed — continue without text */ }
+          }
         } catch (uploadErr) {
           return res.status(500).json({ message: 'Resume upload failed', error: uploadErr.message });
         }

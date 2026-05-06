@@ -130,8 +130,12 @@ exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
+    if (!user || !user.password) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
@@ -601,6 +605,7 @@ exports.completeProfile = async (req, res) => {
         },
         select: {
           id: true,
+          department: true,
           createdAt: true,
           _count: {
             select: { assignedStudents: true },
@@ -609,15 +614,19 @@ exports.completeProfile = async (req, res) => {
       });
 
       if (mentors.length > 0) {
+        const mentorPool = mentors.some(m => m.department === 'MARKETING')
+          ? mentors.filter(m => m.department === 'MARKETING')
+          : mentors;
+
         // Sort by student count (ascending), then by createdAt (ascending)
-        mentors.sort((a, b) => {
+        mentorPool.sort((a, b) => {
           const countDiff = a._count.assignedStudents - b._count.assignedStudents;
           if (countDiff !== 0) return countDiff;
           return new Date(a.createdAt) - new Date(b.createdAt);
         });
 
         // Select the mentor with the least load
-        const selectedMentor = mentors[0];
+        const selectedMentor = mentorPool[0];
 
         // Assign the mentor to the student
         user = await prisma.user.update({
@@ -642,6 +651,12 @@ exports.completeProfile = async (req, res) => {
           },
         });
 
+        await prisma.studentAdminAssignment.upsert({
+          where: { studentId_adminId: { studentId: userId, adminId: selectedMentor.id } },
+          update: { department: selectedMentor.department || null },
+          create: { studentId: userId, adminId: selectedMentor.id, department: selectedMentor.department || null },
+        });
+
         console.log(`Auto-assigned mentor ${selectedMentor.id} to student ${userId} (mentor load: ${selectedMentor._count.assignedStudents} students)`);
       }
     }
@@ -650,23 +665,21 @@ exports.completeProfile = async (req, res) => {
     if (user.role === 'STUDENT') {
       const existingGroup = await prisma.chatGroup.findUnique({ where: { studentId: userId } });
       if (!existingGroup) {
-        const staff = await prisma.user.findMany({
-          where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true },
-          select: { id: true },
-        });
+        const [assignments, superAdmins] = await Promise.all([
+          prisma.studentAdminAssignment.findMany({ where: { studentId: userId }, select: { adminId: true } }),
+          prisma.user.findMany({ where: { role: 'SUPER_ADMIN', isActive: true }, select: { id: true } }),
+        ]);
+        const memberIds = [...new Set([userId, ...assignments.map(a => a.adminId), ...superAdmins.map(s => s.id)])];
         await prisma.chatGroup.create({
           data: {
             name: `${user.fullName}'s Group`,
             studentId: userId,
             members: {
-              create: [
-                { userId },
-                ...staff.map(s => ({ userId: s.id })),
-              ],
+              create: memberIds.map(id => ({ userId: id })),
             },
           },
         });
-        console.log(`Auto-created group chat for student ${userId} with ${staff.length} staff members`);
+        console.log(`Auto-created group chat for student ${userId} with ${memberIds.length - 1} staff members`);
       }
     }
 

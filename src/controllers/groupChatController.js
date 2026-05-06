@@ -1,5 +1,33 @@
 const prisma = require('../config/database');
 
+const getAssignedAdminIdsForStudent = async (studentId) => {
+  const [assignments, student] = await Promise.all([
+    prisma.studentAdminAssignment.findMany({ where: { studentId }, select: { adminId: true } }),
+    prisma.user.findUnique({ where: { id: studentId }, select: { assignedMentorId: true } }),
+  ]);
+
+  const adminIds = [...new Set([
+    ...assignments.map(a => a.adminId),
+    ...(student?.assignedMentorId ? [student.assignedMentorId] : []),
+  ])];
+
+  if (adminIds.length === 0) return [];
+  const activeAdmins = await prisma.user.findMany({
+    where: { id: { in: adminIds }, role: 'ADMIN', isActive: true },
+    select: { id: true },
+  });
+  return activeAdmins.map(admin => admin.id);
+};
+
+const getStudentIdsForAdmin = async (adminId) => {
+  const [assignments, legacyStudents] = await Promise.all([
+    prisma.studentAdminAssignment.findMany({ where: { adminId }, select: { studentId: true } }),
+    prisma.user.findMany({ where: { role: 'STUDENT', isActive: true, assignedMentorId: adminId }, select: { id: true } }),
+  ]);
+
+  return [...new Set([...assignments.map(a => a.studentId), ...legacyStudents.map(s => s.id)])];
+};
+
 // Get or create the group chat for the current student
 // Each student gets ONE group with super admins + their assigned admins
 const ensureStudentGroup = async (studentId, studentName) => {
@@ -18,18 +46,13 @@ const ensureStudentGroup = async (studentId, studentName) => {
   });
 
   if (!group) {
-    // Get ALL active admins + super admins
-    const allAdmins = await prisma.user.findMany({
-      where: { role: 'ADMIN', isActive: true },
-      select: { id: true },
-    });
-    const superAdmins = await prisma.user.findMany({
-      where: { role: 'SUPER_ADMIN', isActive: true },
-      select: { id: true },
-    });
+    const [assignedAdminIds, superAdmins] = await Promise.all([
+      getAssignedAdminIdsForStudent(studentId),
+      prisma.user.findMany({ where: { role: 'SUPER_ADMIN', isActive: true }, select: { id: true } }),
+    ]);
     const memberIds = [
       studentId,
-      ...allAdmins.map(a => a.id),
+      ...assignedAdminIds,
       ...superAdmins.map(s => s.id),
     ];
     const uniqueMemberIds = [...new Set(memberIds)];
@@ -49,18 +72,13 @@ const ensureStudentGroup = async (studentId, studentName) => {
     if (group.name !== groupName) {
       await prisma.chatGroup.update({ where: { id: group.id }, data: { name: groupName } });
     }
-    // Sync: ensure ALL active admins + super admins are members
-    const allAdmins = await prisma.user.findMany({
-      where: { role: 'ADMIN', isActive: true },
-      select: { id: true },
-    });
-    const superAdmins = await prisma.user.findMany({
-      where: { role: 'SUPER_ADMIN', isActive: true },
-      select: { id: true },
-    });
+    const [assignedAdminIds, superAdmins] = await Promise.all([
+      getAssignedAdminIdsForStudent(studentId),
+      prisma.user.findMany({ where: { role: 'SUPER_ADMIN', isActive: true }, select: { id: true } }),
+    ]);
     const shouldBeMembers = [
       studentId,
-      ...allAdmins.map(a => a.id),
+      ...assignedAdminIds,
       ...superAdmins.map(s => s.id),
     ];
     const uniqueShouldBe = [...new Set(shouldBeMembers)];
@@ -70,6 +88,14 @@ const ensureStudentGroup = async (studentId, studentName) => {
       await prisma.chatGroupMember.createMany({
         data: toAdd.map(uid => ({ groupId: group.id, userId: uid })),
         skipDuplicates: true,
+      });
+    }
+    const staleAdminIds = group.members
+      .filter(m => m.user?.role === 'ADMIN' && !assignedAdminIds.includes(m.userId))
+      .map(m => m.userId);
+    if (staleAdminIds.length > 0) {
+      await prisma.chatGroupMember.deleteMany({
+        where: { groupId: group.id, userId: { in: staleAdminIds } },
       });
     }
     // Re-fetch
@@ -119,13 +145,28 @@ exports.getMyGroups = async (req, res) => {
         await ensureStudentGroup(student.id, student.fullName);
       }
     } else if (role === 'ADMIN') {
-      // All admins (Marketing, HR, Proxy) see groups for ALL active students
-      const allStudents = await prisma.user.findMany({
-        where: { role: 'STUDENT', isActive: true },
-        select: { id: true, fullName: true },
-      });
-      for (const student of allStudents) {
+      const assignedStudentIds = await getStudentIdsForAdmin(userId);
+      const assignedStudents = assignedStudentIds.length > 0
+        ? await prisma.user.findMany({
+          where: { id: { in: assignedStudentIds }, role: 'STUDENT', isActive: true },
+          select: { id: true, fullName: true },
+        })
+        : [];
+      for (const student of assignedStudents) {
         await ensureStudentGroup(student.id, student.fullName);
+      }
+
+      const activeAssignedStudentIds = assignedStudents.map(student => student.id);
+      const staleGroupWhere = { members: { some: { userId } } };
+      if (activeAssignedStudentIds.length > 0) staleGroupWhere.studentId = { notIn: activeAssignedStudentIds };
+      const staleGroups = await prisma.chatGroup.findMany({
+        where: staleGroupWhere,
+        select: { id: true },
+      });
+      if (staleGroups.length > 0) {
+        await prisma.chatGroupMember.deleteMany({
+          where: { userId, groupId: { in: staleGroups.map(g => g.id) } },
+        });
       }
     }
 

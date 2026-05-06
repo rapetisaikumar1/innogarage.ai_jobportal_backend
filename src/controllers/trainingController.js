@@ -244,7 +244,10 @@ exports.getStudentsForAssignment = async (req, res) => {
     const where = { role: 'STUDENT' };
 
     if (req.user.role === 'ADMIN') {
-      where.assignedMentorId = req.user.id;
+      where.OR = [
+        { assignedMentorId: req.user.id },
+        { adminAssignments: { some: { adminId: req.user.id } } },
+      ];
     }
 
     const students = await prisma.user.findMany({
