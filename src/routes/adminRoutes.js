@@ -30,13 +30,13 @@ router.get('/student-progress/:studentId', authenticate, authorize('ADMIN', 'SUP
 // Admin view-as-student routes
 router.get('/students/:studentId/dashboard-data', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentDashboardData);
 router.get('/students/:studentId/applications', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentApplications);
-router.get('/students/:studentId/sheet-jobs', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentSheetJobs);
-router.get('/students/:studentId/sheet-applied-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentSheetAppliedStatus);
+router.get('/students/:studentId/matched-jobs', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentMatchedJobs);
+router.get('/students/:studentId/external-applied-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentExternalAppliedStatus);
 
 // Admin act-on-behalf-of-student routes
 router.post('/students/:studentId/trigger-job-search', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.triggerStudentJobSearch);
 router.post('/students/:studentId/apply-job', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.applyJobForStudent);
-router.post('/students/:studentId/mark-sheet-applied', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.markSheetJobAppliedForStudent);
+router.post('/students/:studentId/mark-external-applied', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.markExternalJobAppliedForStudent);
 router.patch('/students/:studentId/application-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.updateApplicationStatus);
 
 module.exports = router;

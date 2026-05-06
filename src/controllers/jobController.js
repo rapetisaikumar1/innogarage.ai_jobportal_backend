@@ -2,6 +2,8 @@ const prisma = require('../config/database');
 const jobScraperService = require('../services/jobScraperService');
 const resumeService = require('../services/resumeService');
 const jsJobSearchService = require('../services/jsJobSearchService');
+const aiService = require('../services/aiService');
+const { PDFParse } = require('pdf-parse');
 const axios = require('axios');
 
 const crypto = require('crypto');
@@ -24,6 +26,177 @@ const n8nFormFieldsCache = { fields: null, expiry: 0 };
 // Google Sheet config
 const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
 const GOOGLE_SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
+const GOOGLE_SHEET_CACHE_TTL_MS = 2 * 60 * 1000;
+const GOOGLE_SHEET_TIMEOUT_MS = 15000;
+const DASHBOARD_STATS_CACHE_TTL_MS = 30 * 1000;
+
+const googleSheetCache = {
+  jobs: [],
+  expiry: 0,
+  pendingPromise: null,
+};
+
+const dashboardStatsCache = new Map();
+
+const invalidateGoogleSheetCache = () => {
+  googleSheetCache.jobs = [];
+  googleSheetCache.expiry = 0;
+  googleSheetCache.pendingPromise = null;
+};
+
+const invalidateDashboardStatsCache = (userId) => {
+  if (userId) {
+    dashboardStatsCache.delete(userId);
+    return;
+  }
+
+  dashboardStatsCache.clear();
+};
+
+const invalidateUserJobCaches = (userId) => {
+  invalidateGoogleSheetCache();
+  invalidateDashboardStatsCache(userId);
+};
+
+const parseJsonField = (value, fallback = []) => {
+  if (value == null) return fallback;
+  if (Array.isArray(value) || typeof value === 'object') return value;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+
+const isReusableGeneratedResume = (text) => {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text.trim();
+  if (clean.length < 1200) return false;
+  // Skills section name varies by user's resume format — only require SUMMARY + EXPERIENCE
+  return /PROFESSIONAL\s+SUMMARY/i.test(clean)
+    && /(?:PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE)/i.test(clean);
+};
+
+const parseResumePdfBuffer = async (buffer) => {
+  const parser = new PDFParse({ data: buffer });
+  try {
+    const parsed = await parser.getText();
+    return (parsed.text || '').trim();
+  } finally {
+    await parser.destroy();
+  }
+};
+
+const getParsedResumeTextForUser = async (user) => {
+  const existingText = (user.parsedResumeText || '').trim();
+  if (existingText.length >= 800) return existingText;
+
+  if (!user.resumeUrl) return existingText;
+
+  try {
+    const response = await axios.get(user.resumeUrl, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      maxContentLength: 15 * 1024 * 1024,
+    });
+    const parsedText = await parseResumePdfBuffer(Buffer.from(response.data));
+    if (parsedText.length >= 800) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { parsedResumeText: parsedText.substring(0, 20000) },
+      });
+      return parsedText.substring(0, 20000);
+    }
+  } catch (error) {
+    console.error('Uploaded resume parse error:', error.message || error);
+  }
+
+  return existingText;
+};
+
+const mapSavedJobToListing = (job, user = {}) => ({
+  id: job.id,
+  employer_name: job.employerName,
+  job_title: job.jobTitle,
+  job_city: job.jobCity,
+  job_state: job.jobState,
+  job_country: job.jobCountry,
+  job_employment_type: job.employmentType,
+  job_apply_link: job.applyLink?.startsWith('http') ? job.applyLink : null,
+  employer_logo: job.employerLogo,
+  source: job.source,
+  posted: job.postedAt,
+  jd: job.jd,
+  match_score: job.matchScore,
+  strong_matches: JSON.stringify(job.strongMatches),
+  missing_skills: JSON.stringify(job.missingSkills),
+  match_summary: job.matchSummary,
+  resume_text: job.resumeText,
+  original_resume: job.originalResume,
+  job_min_salary: job.salaryMin,
+  job_max_salary: job.salaryMax,
+  job_salary_currency: job.salaryCurrency,
+  saved_at: job.createdAt,
+  candidate_id: user.id || job.userId || '',
+  candidate_name: user.fullName || '',
+  email: user.email || '',
+});
+
+const saveSearchResultsForUser = async (userId, results) => {
+  const seenLinks = new Set();
+  const topResults = (results || [])
+    .filter((job) => job.job_apply_link && job.job_apply_link.startsWith('http'))
+    .filter((job) => {
+      const key = job.job_apply_link.toLowerCase();
+      if (seenLinks.has(key)) return false;
+      seenLinks.add(key);
+      return true;
+    })
+    .sort((a, b) => (parseInt(b.match_score, 10) || 0) - (parseInt(a.match_score, 10) || 0))
+    .slice(0, 30);
+
+  const saved = [];
+
+  for (const result of topResults) {
+    const data = {
+      userId,
+      employerName: result.employer_name || null,
+      jobTitle: result.job_title || null,
+      jobCity: result.job_city || null,
+      jobState: result.job_state || null,
+      jobCountry: result.job_country || null,
+      employmentType: result.job_employment_type || null,
+      applyLink: result.job_apply_link || null,
+      employerLogo: result.employer_logo || null,
+      source: result.source || result.job_publisher || null,
+      postedAt: result.posted || result.timestamp || null,
+      jd: result.jd || null,
+      matchScore: parseInt(result.match_score, 10) || 0,
+      strongMatches: parseJsonField(result.strong_matches),
+      missingSkills: parseJsonField(result.missing_skills),
+      matchSummary: result.match_summary || null,
+      resumeText: result.resume_text || null,
+    };
+
+    const existing = await prisma.savedJobResult.findFirst({
+      where: { userId, applyLink: data.applyLink },
+      select: { id: true, resumeText: true },
+    });
+
+    if (!data.resumeText && existing?.resumeText) {
+      data.resumeText = existing.resumeText;
+    }
+
+    const savedJob = existing
+      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data })
+      : await prisma.savedJobResult.create({ data });
+
+    saved.push(savedJob);
+  }
+
+  return saved;
+};
 
 // Parse CSV text into array of objects
 function parseCSV(text) {
@@ -68,57 +241,106 @@ function parseCSV(text) {
   return rows;
 }
 
+const mapGoogleSheetRowsToJobs = (rows) => {
+  if (rows.length < 2) return [];
+
+  const headers = rows[0].map((header) => header.trim().toLowerCase());
+
+  return rows.slice(1).map((row, idx) => {
+    const obj = {};
+    headers.forEach((header, i) => {
+      obj[header] = (row[i] || '').trim();
+    });
+
+    return {
+      id: idx + 1,
+      candidate_id: obj['candidate_id'] || obj['candidate id'] || '',
+      candidate_email: obj['email'] || obj['candidate_email'] || obj['candidate email'] || '',
+      employer_name: obj['employer_name'] || obj['employer name'] || '',
+      job_title: obj['job_title'] || obj['job title'] || '',
+      job_city: obj['job_city'] || obj['job city'] || obj['location'] || '',
+      job_state: obj['job_state'] || obj['job state'] || '',
+      job_country: obj['job_country'] || obj['job country'] || '',
+      job_employment_type: obj['job_employment_type'] || obj['job employment type'] || obj['employment_type'] || '',
+      match_score: obj['match_score'] || obj['match score'] || '',
+      job_apply_link: obj['job_apply_link'] || obj['job apply link'] || '',
+      timestamp: obj['timestamp'] || '',
+      candidate_name: obj['candidate_name'] || obj['candidate name'] || '',
+      match_summary: obj['match_summary'] || obj['match summary'] || '',
+      strong_matches: obj['strong_matches'] || obj['strong matches'] || '',
+      partial_matches: obj['partial_matches'] || obj['partial matches'] || '',
+      missing_skills: obj['missing_skills'] || obj['missing skills'] || '',
+      pdf_link: obj['pdf_link'] || obj['pdf link'] || '',
+      jd: obj['jd'] || obj['job_description'] || obj['job description'] || '',
+      resume_text: obj['resume_text'] || obj['resume text'] || obj['resume'] || obj['tailored_resume'] || obj['tailored resume'] || '',
+    };
+  }).filter((job) => job.employer_name);
+};
+
+const filterJobsForUser = (jobs, userId, userEmail) => jobs.filter((job) => (
+  job.candidate_id === userId || job.candidate_email === userEmail
+));
+
+const fetchGoogleSheetJobsFresh = async () => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GOOGLE_SHEET_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(GOOGLE_SHEET_CSV_URL, {
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch Google Sheet');
+    }
+
+    const csvText = await response.text();
+    const jobs = mapGoogleSheetRowsToJobs(parseCSV(csvText));
+
+    googleSheetCache.jobs = jobs;
+    googleSheetCache.expiry = Date.now() + GOOGLE_SHEET_CACHE_TTL_MS;
+
+    return jobs;
+  } catch (error) {
+    if (googleSheetCache.jobs.length > 0) {
+      return googleSheetCache.jobs;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const getGoogleSheetJobsCached = async ({ forceRefresh = false } = {}) => {
+  const hasFreshCache = googleSheetCache.jobs.length > 0 && Date.now() < googleSheetCache.expiry;
+
+  if (!forceRefresh && hasFreshCache) {
+    return googleSheetCache.jobs;
+  }
+
+  if (!forceRefresh && googleSheetCache.pendingPromise) {
+    return googleSheetCache.pendingPromise;
+  }
+
+  googleSheetCache.pendingPromise = fetchGoogleSheetJobsFresh()
+    .finally(() => {
+      googleSheetCache.pendingPromise = null;
+    });
+
+  return googleSheetCache.pendingPromise;
+};
+
 // Fetch Google Sheet data — filtered per logged-in user
 exports.getGoogleSheetJobs = async (req, res) => {
   try {
     const userId = req.user.id;
     const userEmail = req.user.email;
 
-    // Hard timeout so a slow/hanging Google Sheet fetch cannot freeze the app.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    let response;
-    try {
-      response = await fetch(GOOGLE_SHEET_CSV_URL, { redirect: 'follow', signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!response.ok) throw new Error('Failed to fetch Google Sheet');
-    const csvText = await response.text();
-    const rows = parseCSV(csvText);
-    if (rows.length < 2) return res.json({ jobs: [] });
-
-    const headers = rows[0].map(h => h.trim().toLowerCase());
-    const allJobs = rows.slice(1).map((row, idx) => {
-      const obj = {};
-      headers.forEach((h, i) => { obj[h] = (row[i] || '').trim(); });
-      return {
-        id: idx + 1,
-        candidate_id: obj['candidate_id'] || obj['candidate id'] || '',
-        candidate_email: obj['email'] || obj['candidate_email'] || obj['candidate email'] || '',
-        employer_name: obj['employer_name'] || obj['employer name'] || '',
-        job_title: obj['job_title'] || obj['job title'] || '',
-        job_city: obj['job_city'] || obj['job city'] || obj['location'] || '',
-        job_state: obj['job_state'] || obj['job state'] || '',
-        job_country: obj['job_country'] || obj['job country'] || '',
-        job_employment_type: obj['job_employment_type'] || obj['job employment type'] || obj['employment_type'] || '',
-        match_score: obj['match_score'] || obj['match score'] || '',
-        job_apply_link: obj['job_apply_link'] || obj['job apply link'] || '',
-        timestamp: obj['timestamp'] || '',
-        candidate_name: obj['candidate_name'] || obj['candidate name'] || '',
-        match_summary: obj['match_summary'] || obj['match summary'] || '',
-        strong_matches: obj['strong_matches'] || obj['strong matches'] || '',
-        missing_skills: obj['missing_skills'] || obj['missing skills'] || '',
-        pdf_link: obj['pdf_link'] || obj['pdf link'] || '',
-        jd: obj['jd'] || obj['job_description'] || obj['job description'] || '',
-        resume_text: obj['resume_text'] || obj['resume text'] || obj['resume'] || obj['tailored_resume'] || obj['tailored resume'] || '',
-      };
-    }).filter(j => j.employer_name);
-
-    // Filter: show only jobs belonging to the logged-in user (match by candidate_id or email)
-    const jobs = allJobs.filter(j =>
-      j.candidate_id === userId || j.candidate_email === userEmail
-    );
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const allJobs = await getGoogleSheetJobsCached({ forceRefresh });
+    const jobs = filterJobsForUser(allJobs, userId, userEmail);
 
     res.json({ jobs });
   } catch (error) {
@@ -228,10 +450,11 @@ exports.getUsage = async (req, res) => {
   }
 };
 
-// Trigger job search — auto-switches between JS mode and n8n mode
+// Trigger job search directly and save results for immediate frontend display.
 exports.triggerN8nWorkflow = async (req, res) => {
   try {
     const userId = req.user.id;
+    invalidateUserJobCaches(userId);
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -258,105 +481,9 @@ exports.triggerN8nWorkflow = async (req, res) => {
       });
     }
 
-    // Parse days from request body
-    const days = parseInt(req.body.days) || 1;
-
-    // ─── N8N-ONLY MODE: trigger n8n webhook, results appear in Google Sheet ───
-    let n8nTriggered = false;
-
-    if (config.n8n.webhookUrl) {
-      n8nTriggered = true;
-      (async () => {
-        try {
-          const formPageUrl = config.n8n.webhookUrl.replace('/webhook/', '/form/');
-
-          // Fetch form fields (cached) and resume in parallel
-          const formFieldsPromise = (async () => {
-            if (n8nFormFieldsCache.fields && Date.now() < n8nFormFieldsCache.expiry) {
-              return n8nFormFieldsCache.fields;
-            }
-            const formPageResp = await n8nAxios.get(formPageUrl);
-            const $ = require('cheerio').load(formPageResp.data);
-            const formFields = [];
-            $('input, textarea, select').each((i, el) => {
-              const name = $(el).attr('name');
-              if (!name) return;
-              const type = $(el).attr('type') || 'text';
-              let label = '';
-              const id = $(el).attr('id');
-              if (id) label = $(`label[for="${id}"]`).text().trim();
-              if (!label) label = $(el).closest('label').text().trim();
-              if (!label) label = $(el).closest('.form-group, .field, div').find('label').first().text().trim();
-              formFields.push({ name, type, label: label.toLowerCase() });
-            });
-            n8nFormFieldsCache.fields = formFields;
-            n8nFormFieldsCache.expiry = Date.now() + 10 * 60 * 1000;
-            return formFields;
-          })();
-
-          const resumePromise = (async () => {
-            if (!user.resumeUrl) return null;
-            try {
-              const resumeResp = await n8nAxios.get(user.resumeUrl, { responseType: 'arraybuffer' });
-              return { buffer: Buffer.from(resumeResp.data), filename: user.resumeUrl.split('/').pop().split('?')[0] || 'resume.pdf' };
-            } catch { return null; }
-          })();
-
-          const [formFields, resumeData] = await Promise.all([formFieldsPromise, resumePromise]);
-
-          const dataMap = [
-            { keywords: ['candidate id', 'candidate_id', 'candidateid', 'id'], value: String(user.id) },
-            { keywords: ['candidate_name', 'candidate name', 'name'], value: user.fullName || '' },
-            { keywords: ['email', 'e-mail'], value: user.email || '' },
-            { keywords: ['role', 'job role', 'jobrole'], value: user.jobRole || 'Software Developer' },
-            { keywords: ['keywords', 'skills', 'key skills'], value: (user.keySkills || []).join(', ') },
-            { keywords: ['location', 'city'], value: user.location || '' },
-            { keywords: ['days', 'day', 'date'], value: days },
-          ];
-
-          const textFields = {};
-          let resumeFieldName = 'resume';
-          const usedDataIndices = new Set();
-
-          for (const field of formFields) {
-            if (field.type === 'file') { resumeFieldName = field.name; continue; }
-            if (field.type === 'hidden' || field.type === 'submit') continue;
-            let matched = false;
-            for (let i = 0; i < dataMap.length; i++) {
-              if (usedDataIndices.has(i)) continue;
-              const matchTarget = (field.label + ' ' + field.name).toLowerCase();
-              if (dataMap[i].keywords.some(kw => matchTarget.includes(kw))) {
-                textFields[field.name] = dataMap[i].value;
-                usedDataIndices.add(i);
-                matched = true;
-                break;
-              }
-            }
-            if (!matched) {
-              for (let i = 0; i < dataMap.length; i++) {
-                if (!usedDataIndices.has(i)) { textFields[field.name] = dataMap[i].value; usedDataIndices.add(i); break; }
-              }
-            }
-          }
-
-          const fileFields = [];
-          if (resumeData) {
-            fileFields.push({ name: resumeFieldName, filename: resumeData.filename, contentType: 'application/pdf', data: resumeData.buffer });
-          }
-
-          const { body, contentType } = buildMultipartBody(textFields, fileFields);
-          await n8nAxios.post(formPageUrl, body, {
-            headers: { 'Content-Type': contentType },
-            maxBodyLength: Infinity,
-            maxContentLength: Infinity,
-            validateStatus: () => true,
-          });
-          console.log('N8N background trigger completed');
-        } catch (err) {
-          console.error('N8N background trigger error:', err.message);
-        }
-      })(); // Fire and forget — don't await
-    }
+    const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
+    const results = await jsJobSearchService.searchJobs(user, days);
+    const savedJobs = await saveSearchResultsForUser(userId, results);
 
     // Increment search count and update lastSearchReset
     try {
@@ -368,14 +495,14 @@ exports.triggerN8nWorkflow = async (req, res) => {
       console.error('Failed to increment search count:', err.message);
     }
 
-    // Return immediately — jobs will appear in Google Sheet via n8n
+    invalidateDashboardStatsCache(userId);
+
     return res.json({
-      message: n8nTriggered
-        ? 'Job search triggered! Jobs will appear shortly...'
-        : 'N8N webhook not configured. Please set up n8n.',
-      jobs: [],
-      mode: 'n8n',
-      n8nTriggered,
+      message: savedJobs.length > 0
+        ? `Found ${savedJobs.length} matching job${savedJobs.length === 1 ? '' : 's'}.`
+        : 'No matching jobs found for this profile and time window.',
+      jobs: savedJobs.map((job) => mapSavedJobToListing(job, user)),
+      mode: 'js',
     });
   } catch (error) {
     console.error('Job search error:', error.message || error);
@@ -527,6 +654,8 @@ exports.applyForJob = async (req, res) => {
       },
     });
 
+    invalidateDashboardStatsCache(userId);
+
     res.status(201).json({
       message: 'Application submitted successfully',
       application,
@@ -601,6 +730,8 @@ exports.easyApplyAll = async (req, res) => {
         },
       });
     }
+
+    invalidateDashboardStatsCache(userId);
 
     res.json({
       message: 'Easy apply completed',
@@ -692,6 +823,8 @@ exports.updateApplicationStatus = async (req, res) => {
       },
     });
 
+    invalidateDashboardStatsCache(application.user.id);
+
     res.json(application);
   } catch (error) {
     res.status(500).json({ message: 'Failed to update application', error: error.message });
@@ -746,6 +879,12 @@ exports.getAllApplications = async (req, res) => {
 exports.getDashboardStats = async (req, res) => {
   try {
     const userId = req.user.id;
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const cachedStats = dashboardStatsCache.get(userId);
+
+    if (!forceRefresh && cachedStats && Date.now() < cachedStats.expiry) {
+      return res.json(cachedStats.data);
+    }
 
     const [totalApplied, interviewScheduled, rejected, offerReceived, totalJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
       prisma.jobApplication.count({ where: { userId, status: 'APPLIED' } }),
@@ -774,7 +913,7 @@ exports.getDashboardStats = async (req, res) => {
     const adminApplyCount = dbAdminApplied + sheetAdminApplied;
     const candidateApplyCount = (allDbApplied - dbAdminApplied) + (sheetTotalApplied - sheetAdminApplied);
 
-    res.json({
+    const stats = {
       totalJobs,
       totalApplied: allDbApplied,
       interviewScheduled,
@@ -784,7 +923,14 @@ exports.getDashboardStats = async (req, res) => {
       adminApplyCount,
       candidateApplyCount,
       sheetAppliedCount: sheetTotalApplied,
+    };
+
+    dashboardStatsCache.set(userId, {
+      data: stats,
+      expiry: Date.now() + DASHBOARD_STATS_CACHE_TTL_MS,
     });
+
+    res.json(stats);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch stats', error: error.message });
   }
@@ -834,31 +980,8 @@ exports.autoApplyAllSheetJobs = async (req, res) => {
     const userId = req.user.id;
     const userEmail = req.user.email;
 
-    // 1. Fetch all jobs from Google Sheet for this user
-    const sheetResp = await fetch(GOOGLE_SHEET_CSV_URL, { redirect: 'follow' });
-    if (!sheetResp.ok) throw new Error('Failed to fetch Google Sheet');
-    const csvText = await sheetResp.text();
-    const rows = parseCSV(csvText);
-    if (rows.length < 2) return res.json({ message: 'No jobs found', summary: { total: 0, readyToApply: 0, alreadyApplied: 0, noLink: 0 }, results: [], applyLinks: [] });
-
-    const headers = rows[0].map(h => h.trim().toLowerCase());
-    const allJobs = rows.slice(1).map((row) => {
-      const obj = {};
-      headers.forEach((h, i) => { obj[h] = (row[i] || '').trim(); });
-      return {
-        candidate_id: obj['candidate_id'] || obj['candidate id'] || '',
-        candidate_email: obj['email'] || obj['candidate_email'] || obj['candidate email'] || '',
-        employer_name: obj['employer_name'] || obj['employer name'] || '',
-        job_apply_link: obj['job_apply_link'] || obj['job apply link'] || '',
-        match_score: obj['match_score'] || obj['match score'] || '',
-        pdf_link: obj['pdf_link'] || obj['pdf link'] || '',
-      };
-    }).filter(j => j.employer_name);
-
-    // Filter to only this user's jobs
-    const myJobs = allJobs.filter(j =>
-      j.candidate_id === userId || j.candidate_email === userEmail
-    );
+    const allJobs = await getGoogleSheetJobsCached({ forceRefresh: true });
+    const myJobs = filterJobsForUser(allJobs, userId, userEmail);
 
     if (myJobs.length === 0) {
       return res.json({ message: 'No jobs found for your account', summary: { total: 0, readyToApply: 0, alreadyApplied: 0, noLink: 0 }, results: [], applyLinks: [] });
@@ -921,6 +1044,8 @@ exports.autoApplyAllSheetJobs = async (req, res) => {
       });
     } catch { /* ignore */ }
 
+    invalidateDashboardStatsCache(userId);
+
     res.json({
       message: `${readyToApply} job${readyToApply !== 1 ? 's' : ''} ready — opening in your browser`,
       summary: { total: myJobs.length, readyToApply, alreadyApplied, noLink },
@@ -961,6 +1086,8 @@ exports.markSheetJobApplied = async (req, res) => {
       update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
       create: { userId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore, jobTitle },
     });
+
+    invalidateDashboardStatsCache(userId);
 
     res.json({ message: 'Marked as applied', application });
   } catch (error) {
@@ -1047,6 +1174,8 @@ exports.autoApplyToJob = async (req, res) => {
           reportUrl: result.reportUrl || null,
         },
       });
+
+      invalidateDashboardStatsCache(userId);
     } catch (err) {
       console.error('Failed to save auto-apply record:', err.message);
     }
@@ -1094,11 +1223,18 @@ exports.autoApplyToJob = async (req, res) => {
   res.end();
 };
 
+exports.clearJobCaches = async (req, res) => {
+  invalidateUserJobCaches(req.user.id);
+  res.json({ message: 'Backend caches cleared' });
+};
+
 // ─── Get saved job results for a user ───
 exports.getSavedJobs = async (req, res) => {
   try {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+    const MIN_MATCH_SCORE = 60;
 
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
@@ -1106,41 +1242,151 @@ exports.getSavedJobs = async (req, res) => {
 
     const [jobs, total] = await Promise.all([
       prisma.savedJobResult.findMany({
-        where: { userId },
+        where: { userId, matchScore: { gte: MIN_MATCH_SCORE } },
         orderBy: { matchScore: 'desc' },
         skip,
         take: limit,
       }),
-      prisma.savedJobResult.count({ where: { userId } }),
+      prisma.savedJobResult.count({ where: { userId, matchScore: { gte: MIN_MATCH_SCORE } } }),
     ]);
 
-    // Map to frontend-compatible format
-    const mapped = jobs.map(j => ({
-      employer_name: j.employerName,
-      job_title: j.jobTitle,
-      job_city: j.jobCity,
-      job_state: j.jobState,
-      job_country: j.jobCountry,
-      job_employment_type: j.employmentType,
-      job_apply_link: j.applyLink?.startsWith('http') ? j.applyLink : null,
-      employer_logo: j.employerLogo,
-      source: j.source,
-      posted: j.postedAt,
-      jd: j.jd,
-      match_score: j.matchScore,
-      strong_matches: JSON.stringify(j.strongMatches),
-      missing_skills: JSON.stringify(j.missingSkills),
-      match_summary: j.matchSummary,
-      resume_text: j.resumeText,
-      original_resume: j.originalResume,
-      job_min_salary: j.salaryMin,
-      job_max_salary: j.salaryMax,
-      job_salary_currency: j.salaryCurrency,
-      saved_at: j.createdAt,
-    }));
+    const mapped = jobs.map((job) => mapSavedJobToListing(job, req.user || {}));
 
     res.json({ jobs: mapped, total, page, limit });
   } catch (error) {
     res.status(500).json({ error: 'Failed to retrieve saved jobs' });
+  }
+};
+
+// Generate or regenerate an ATS resume for a saved/external job.
+exports.generateSavedJobResume = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ message: 'Not authenticated' });
+
+    const {
+      job_apply_link,
+      employer_name,
+      job_title,
+      job_city,
+      job_state,
+      job_country,
+      job_employment_type,
+      employer_logo,
+      source,
+      posted,
+      jd,
+      match_score,
+      strong_matches,
+      missing_skills,
+      match_summary,
+    } = req.body || {};
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        fullName: true,
+        email: true,
+        phone: true,
+        linkedinProfile: true,
+        keySkills: true,
+        jobRole: true,
+        location: true,
+        education: true,
+        experience: true,
+        resumeUrl: true,
+        parsedResumeText: true,
+      },
+    });
+
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const existing = job_apply_link
+      ? await prisma.savedJobResult.findFirst({ where: { userId, applyLink: job_apply_link } })
+      : await prisma.savedJobResult.findFirst({
+          where: {
+            userId,
+            employerName: employer_name || undefined,
+            jobTitle: job_title || undefined,
+          },
+        });
+
+    if (existing && isReusableGeneratedResume(existing.resumeText) && !req.body?.forceRegenerate) {
+      return res.json({
+        message: 'Existing ATS resume loaded.',
+        job: mapSavedJobToListing(existing, user),
+        provider: 'cached',
+      });
+    }
+
+    const jobData = {
+      job_apply_link: job_apply_link || existing?.applyLink || null,
+      employer_name: employer_name || existing?.employerName || '',
+      job_title: job_title || existing?.jobTitle || '',
+      job_city: job_city || existing?.jobCity || '',
+      job_state: job_state || existing?.jobState || '',
+      job_country: job_country || existing?.jobCountry || '',
+      job_employment_type: job_employment_type || existing?.employmentType || '',
+      employer_logo: employer_logo || existing?.employerLogo || '',
+      source: source || existing?.source || '',
+      posted: posted || existing?.postedAt || '',
+      jd: jd || existing?.jd || '',
+      match_score: parseInt(match_score, 10) || existing?.matchScore || 0,
+      strong_matches: strong_matches ?? existing?.strongMatches ?? [],
+      missing_skills: missing_skills ?? existing?.missingSkills ?? [],
+      match_summary: match_summary || existing?.matchSummary || '',
+    };
+
+    if (!jobData.jd) {
+      return res.status(400).json({ message: 'Job description is required to create an ATS resume.' });
+    }
+
+    const parsedResumeText = await getParsedResumeTextForUser(user);
+    if (!parsedResumeText || parsedResumeText.length < 800) {
+      return res.status(400).json({
+        message: 'Please upload a readable PDF resume in your profile before creating an ATS resume.',
+      });
+    }
+
+    const generatedResume = await aiService.generateATSResumeText({ ...user, parsedResumeText }, jobData);
+    const resumeText = typeof generatedResume === 'string' ? generatedResume : generatedResume?.text;
+    const provider = typeof generatedResume === 'string' ? 'gemini' : generatedResume?.provider || 'fallback';
+    if (!resumeText || !resumeText.trim()) {
+      return res.status(500).json({ message: 'Failed to generate ATS resume.' });
+    }
+
+    const savedData = {
+      userId,
+      employerName: jobData.employer_name || null,
+      jobTitle: jobData.job_title || null,
+      jobCity: jobData.job_city || null,
+      jobState: jobData.job_state || null,
+      jobCountry: jobData.job_country || null,
+      employmentType: jobData.job_employment_type || null,
+      applyLink: jobData.job_apply_link || null,
+      employerLogo: jobData.employer_logo || null,
+      source: jobData.source || null,
+      postedAt: jobData.posted || null,
+      jd: jobData.jd || null,
+      matchScore: parseInt(jobData.match_score, 10) || 0,
+      strongMatches: parseJsonField(jobData.strong_matches),
+      missingSkills: parseJsonField(jobData.missing_skills),
+      matchSummary: jobData.match_summary || null,
+      resumeText,
+    };
+
+    const savedJob = existing
+      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data: savedData })
+      : await prisma.savedJobResult.create({ data: savedData });
+
+    res.json({
+      message: 'ATS resume created successfully.',
+      job: mapSavedJobToListing(savedJob, user),
+      provider,
+    });
+  } catch (error) {
+    console.error('Generate ATS resume error:', error.message || error);
+    res.status(500).json({ message: 'Failed to generate ATS resume', error: error.message || String(error) });
   }
 };

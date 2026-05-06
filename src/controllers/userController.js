@@ -1,6 +1,16 @@
 const prisma = require('../config/database');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
+
+const parseResumePdfBuffer = async (buffer) => {
+  const parser = new PDFParse({ data: buffer });
+  try {
+    const parsed = await parser.getText();
+    return (parsed.text || '').trim();
+  } finally {
+    await parser.destroy();
+  }
+};
 
 // Update user profile
 exports.updateProfile = async (req, res) => {
@@ -34,9 +44,9 @@ exports.updateProfile = async (req, res) => {
           updateData.resumeUrl = result.url;
           // Extract text from PDF resume
           try {
-            const pdfData = await pdfParse(req.file.buffer);
-            if (pdfData.text && pdfData.text.trim().length > 20) {
-              updateData.parsedResumeText = pdfData.text.trim().substring(0, 10000);
+            const resumeText = await parseResumePdfBuffer(req.file.buffer);
+            if (resumeText.length > 20) {
+              updateData.parsedResumeText = resumeText.substring(0, 20000);
             }
           } catch { /* PDF parse failed — continue without text */ }
         } catch (uploadErr) {

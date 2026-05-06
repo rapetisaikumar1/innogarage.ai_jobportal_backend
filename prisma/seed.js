@@ -5,14 +5,14 @@ const prisma = new PrismaClient();
 
 async function main() {
   // Create Super Admin
-  const hashedPassword = await bcrypt.hash(process.env.SUPER_ADMIN_PASSWORD || 'Saikumar273@', 12);
+  const hashedPassword = await bcrypt.hash(process.env.SUPER_ADMIN_PASSWORD || 'Mig@1206', 12);
   
   const superAdmin = await prisma.user.upsert({
-    where: { email: process.env.SUPER_ADMIN_EMAIL || 'rapetisaikumar7@gmail.com' },
+    where: { email: process.env.SUPER_ADMIN_EMAIL || 'teammavericks56@gmail.com' },
     update: {},
     create: {
       fullName: process.env.SUPER_ADMIN_NAME || 'Super Admin',
-      email: process.env.SUPER_ADMIN_EMAIL || 'rapetisaikumar7@gmail.com',
+      email: process.env.SUPER_ADMIN_EMAIL || 'teammavericks56@gmail.com',
       password: hashedPassword,
       role: 'SUPER_ADMIN',
       isActive: true,

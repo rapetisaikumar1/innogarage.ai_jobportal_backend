@@ -99,17 +99,18 @@ exports.getContacts = async (req, res) => {
     const userId = req.user.id;
 
     // Get unique users this user has chatted with
-    const sentTo = await prisma.chatMessage.findMany({
-      where: { senderId: userId },
-      select: { receiverId: true },
-      distinct: ['receiverId'],
-    });
-
-    const receivedFrom = await prisma.chatMessage.findMany({
-      where: { receiverId: userId },
-      select: { senderId: true },
-      distinct: ['senderId'],
-    });
+    const [sentTo, receivedFrom] = await Promise.all([
+      prisma.chatMessage.findMany({
+        where: { senderId: userId },
+        select: { receiverId: true },
+        distinct: ['receiverId'],
+      }),
+      prisma.chatMessage.findMany({
+        where: { receiverId: userId },
+        select: { senderId: true },
+        distinct: ['senderId'],
+      }),
+    ]);
 
     const contactIds = [...new Set([
       ...sentTo.map(m => m.receiverId),
@@ -171,19 +172,26 @@ exports.getContacts = async (req, res) => {
       },
     });
 
-    // Add unread count for each contact
-    const contactsWithUnread = await Promise.all(
-      contacts.map(async (contact) => {
-        const unreadCount = await prisma.chatMessage.count({
+    const unreadCounts = contactIds.length > 0
+      ? await prisma.chatMessage.groupBy({
+          by: ['senderId'],
           where: {
-            senderId: contact.id,
             receiverId: userId,
             isRead: false,
+            senderId: { in: contactIds },
           },
-        });
-        return { ...contact, unreadCount };
-      })
+          _count: { _all: true },
+        })
+      : [];
+
+    const unreadCountBySenderId = new Map(
+      unreadCounts.map((entry) => [entry.senderId, entry._count._all])
     );
+
+    const contactsWithUnread = contacts.map((contact) => ({
+      ...contact,
+      unreadCount: unreadCountBySenderId.get(contact.id) || 0,
+    }));
 
     res.json(contactsWithUnread);
   } catch (error) {

@@ -5,6 +5,17 @@ const config = require('../config');
 const prisma = require('../config/database');
 const { sendVerificationEmail, sendPasswordResetEmail, sendLoginOtpEmail } = require('../services/emailService');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
+const { PDFParse } = require('pdf-parse');
+
+const parseResumePdfBuffer = async (buffer) => {
+  const parser = new PDFParse({ data: buffer });
+  try {
+    const parsed = await parser.getText();
+    return (parsed.text || '').trim();
+  } finally {
+    await parser.destroy();
+  }
+};
 
 // Generate unique registration number: MIG-26XXX
 const generateRegistrationNumber = async () => {
@@ -50,10 +61,15 @@ exports.signup = async (req, res) => {
     const verificationToken = crypto.randomBytes(32).toString('hex');
 
     let resumeUrl = null;
+    let parsedResumeText = null;
     if (req.file) {
       try {
         const result = await uploadToCloudinary(req.file.buffer, { folder: 'resumes', resourceType: 'raw' });
         resumeUrl = result.url;
+        try {
+          const resumeText = await parseResumePdfBuffer(req.file.buffer);
+          if (resumeText.length > 20) parsedResumeText = resumeText.substring(0, 20000);
+        } catch { /* continue without parsed text */ }
       } catch (uploadErr) {
         console.warn('Resume upload skipped:', uploadErr.message);
       }
@@ -72,6 +88,7 @@ exports.signup = async (req, res) => {
         experience,
         keySkills: Array.isArray(keySkills) ? keySkills : keySkills ? keySkills.split(',').map(s => s.trim()) : [],
         resumeUrl,
+        parsedResumeText,
         role: 'STUDENT',
         isActive: true, // Active after registration, email verification optional
         isEmailVerified: false,
@@ -521,10 +538,15 @@ exports.completeProfile = async (req, res) => {
     const userId = req.user.id;
 
     let resumeUrl = null;
+    let parsedResumeText = null;
     if (req.file) {
       try {
         const result = await uploadToCloudinary(req.file.buffer, { folder: 'resumes', resourceType: 'raw' });
         resumeUrl = result.url;
+        try {
+          const resumeText = await parseResumePdfBuffer(req.file.buffer);
+          if (resumeText.length > 20) parsedResumeText = resumeText.substring(0, 20000);
+        } catch { /* continue without parsed text */ }
       } catch (uploadErr) {
         console.warn('Resume upload skipped:', uploadErr.message);
       }
@@ -542,6 +564,7 @@ exports.completeProfile = async (req, res) => {
       profileCompleted: true,
     };
     if (resumeUrl) updateData.resumeUrl = resumeUrl;
+    if (parsedResumeText) updateData.parsedResumeText = parsedResumeText;
 
     let user = await prisma.user.update({
       where: { id: userId },

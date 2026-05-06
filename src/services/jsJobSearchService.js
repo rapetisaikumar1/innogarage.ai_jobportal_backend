@@ -1,11 +1,10 @@
 /**
  * JS-based Job Search Service
- * Flow: Student profile → JSearch + Remotive + RemoteOK APIs → deep match scoring → tailored resume → Google Sheet
+ * Flow: Student profile -> job APIs -> deep match scoring -> top listing results
  */
 
 const axios = require('axios');
 const https = require('https');
-const { google } = require('googleapis');
 
 const httpClient = axios.create({
   timeout: 20000,
@@ -32,54 +31,6 @@ class MemCache {
 }
 
 const apiCache = new MemCache(5 * 60 * 1000); // 5-minute TTL for API results
-
-// ───── Google Sheets Write ─────
-
-const GOOGLE_SHEET_ID = '1P1jruNXUrazTqZkKjf0y2mY7-ii8IkDJznjJSyS5R-w';
-
-async function getSheetsClient() {
-  const saKeyJson = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
-  if (saKeyJson) {
-    try {
-      const key = JSON.parse(saKeyJson);
-      const auth = new google.auth.GoogleAuth({
-        credentials: key,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-      });
-      return google.sheets({ version: 'v4', auth });
-    } catch { /* auth unavailable */ }
-  }
-
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const refreshToken = process.env.GOOGLE_SHEETS_REFRESH_TOKEN;
-  if (clientId && clientSecret && refreshToken) {
-    try {
-      const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
-      oauth2.setCredentials({ refresh_token: refreshToken });
-      return google.sheets({ version: 'v4', auth: oauth2 });
-    } catch { /* auth unavailable */ }
-  }
-
-  return null;
-}
-
-async function appendToSheet(rows) {
-  const sheets = await getSheetsClient();
-  if (!sheets) return false;
-  try {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A1',
-      valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: rows },
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 // ───── JD Analysis Helpers ─────
 
@@ -214,16 +165,11 @@ function getAllowedCountryCodes(regions) {
 }
 
 /** Search JSearch (RapidAPI — PRIMARY source) */
-async function searchJSearch(query, regions, days, experienceLevel, limit = 80) {
+async function searchJSearch(query, regions, days, experienceYears, limit = 80) {
   const apiKey = process.env.RAPIDAPI_KEY;
   if (!apiKey) return [];
   try {
     const datePosted = days <= 1 ? 'today' : days <= 3 ? '3days' : days <= 7 ? 'week' : 'month';
-
-    // Map experience level to JSearch requirement
-    const expRequirement = experienceLevel === 'senior' ? 'more_than_3_years'
-      : experienceLevel === 'mid' ? 'under_3_years'
-      : experienceLevel === 'junior' ? 'no_experience' : '';
 
     // Build targeted queries for major job boards
     const queries = [];
@@ -243,7 +189,6 @@ async function searchJSearch(query, regions, days, experienceLevel, limit = 80) 
         date_posted: datePosted,
         remote_jobs_only: remoteOnly,
       };
-      if (expRequirement) params.job_requirements = expRequirement;
       return httpClient.get('https://jsearch.p.rapidapi.com/search', {
         params,
         headers: {
@@ -583,6 +528,77 @@ const IMPLIED_BY = {
   'typescript': ['angular', 'next.js', 'nextjs', 'nestjs'],
 };
 
+// Generic role suffixes/prefixes that should NOT be used alone for relevance matching
+// (because every dev job contains "developer", "engineer", etc.)
+const GENERIC_ROLE_WORDS = new Set([
+  'developer','engineer','designer','analyst','architect','consultant','manager',
+  'administrator','scientist','specialist','programmer','dev','eng','lead','senior',
+  'sr','junior','jr','staff','principal','associate','intern','head','director',
+  'officer','professional','expert','team','member','worker','employee','position',
+  'role','full','part','time','stack','software','tech','it','data',
+]);
+
+/**
+ * Extract meaningful role-specific keywords from a user-entered job role string.
+ * Filters out generic words like "developer", "engineer" that match any tech job.
+ * Example: "AEP DEVELOPER" → ["aep"]; "Salesforce Admin" → ["salesforce"]
+ */
+function extractRoleKeywords(rawRole) {
+  if (!rawRole) return [];
+  return rawRole
+    .toLowerCase()
+    .split(/[\s/,+&|()\-_.]+/)
+    .map(w => w.trim())
+    .filter(w => w.length >= 2 && !GENERIC_ROLE_WORDS.has(w));
+}
+
+function normalizeProfileSkills(rawSkills) {
+  const normalized = new Set();
+
+  for (const raw of rawSkills || []) {
+    const original = String(raw || '').trim();
+    const lower = original.toLowerCase();
+    if (!lower) continue;
+
+    const techMatches = original.match(TECH_EXTRACT_RE) || [];
+    techMatches.forEach((match) => normalized.add(match.toLowerCase().trim()));
+
+    const acronymMatches = [...original.matchAll(/\(([A-Za-z0-9-]{2,12})\)/g)];
+    acronymMatches.forEach((match) => normalized.add(match[1].toLowerCase()));
+
+    if (lower.includes('adobe experience platform')) normalized.add('adobe experience platform');
+    if (lower.includes('customer data platform')) normalized.add('customer data platform');
+    if (lower.includes('real-time customer data platform')) normalized.add('real-time customer data platform');
+    if (lower.includes('marketo')) normalized.add('marketo');
+    if (lower.includes('salesforce')) normalized.add('salesforce');
+    if (lower.includes('power bi')) normalized.add('power bi');
+
+    if (lower.length <= 30) {
+      normalized.add(lower);
+    }
+
+    if (lower.includes('adobe experience platform')) {
+      normalized.delete('adobe');
+    }
+  }
+
+  return [...normalized].filter(Boolean);
+}
+
+function hasBusinessRoleMismatch(jobTitle, studentRole) {
+  const title = (jobTitle || '').toLowerCase();
+  const role = (studentRole || '').toLowerCase();
+
+  const technicalTerms = ['developer', 'engineer', 'architect', 'consultant', 'analyst', 'administrator', 'admin', 'specialist', 'programmer'];
+  const businessTerms = ['manager', 'director', 'executive', 'sales', 'recruiter', 'marketing', 'account manager', 'account executive', 'program manager', 'product manager'];
+
+  const userIsTechnical = technicalTerms.some(term => role.includes(term));
+  const titleIsTechnical = technicalTerms.some(term => title.includes(term));
+  const titleIsBusiness = businessTerms.some(term => title.includes(term));
+
+  return userIsTechnical && titleIsBusiness && !titleIsTechnical;
+}
+
 const DOMAIN_KEYWORDS = {
   frontend: ['frontend', 'front end', 'front-end', 'react', 'angular', 'vue', 'ui ', 'web developer'],
   backend: ['backend', 'back end', 'back-end', 'server', 'api developer', 'node.js developer', 'java developer', 'python developer'],
@@ -592,6 +608,86 @@ const DOMAIN_KEYWORDS = {
   mobile: ['mobile', 'ios', 'android', 'flutter', 'react native'],
   security: ['security', 'cybersecurity', 'infosec', 'penetration'],
 };
+
+// ───── Profile-Based Relevance & Location Gates ─────
+
+/**
+ * Hard relevance gate: a job is relevant only if it matches the user's profile
+ * on at least one of:
+ *   1) A meaningful role keyword (excluding generic words like "developer")
+ *      appears in the job title or top of the JD.
+ *   2) At least one strong skill match exists.
+ *   3) Any of the user's key-skill aliases appears verbatim in the title.
+ *
+ * This is what stops random tech jobs from being shown for niche profiles
+ * (e.g., AEP Developer + Adobe Experience Platform skills must see Adobe/AEP jobs).
+ */
+function isJobRelevantToProfile(job, student, match) {
+  const title = (job.job_title || '').toLowerCase();
+  const jd = (job.jd || '').toLowerCase();
+  const haystack = `${title} ${jd}`;
+
+  if (hasBusinessRoleMismatch(job.job_title, student.jobRole)) return false;
+
+  // 1) Strong skill match (computed by computeMatchScore against title+JD)
+  if ((match.strongMatches || []).length >= 1) return true;
+
+  // 2) Role-specific keyword in title or JD (excluding generic words)
+  const roleKeywords = extractRoleKeywords(student.jobRole);
+  if (roleKeywords.length > 0 && roleKeywords.some(w => haystack.includes(w))) {
+    return true;
+  }
+
+  // 3) Skill aliases in title (covers cases where computeMatchScore split differently)
+  const skills = normalizeProfileSkills(student.keySkills || []);
+  for (const skill of skills) {
+    const aliases = SKILL_ALIASES[skill] || [skill];
+    if (aliases.some(a => a && a.length >= 3 && haystack.includes(a))) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Strict location filter: when the user has set a preferred location, drop jobs
+ * whose country does not match AND whose JD/title does not mention the region.
+ * Pure "Anywhere" remote jobs are dropped if they don't mention the user's region.
+ */
+function jobMatchesPreferredLocation(job, allowedCodes, allowedRegionTerms, userSetLocation) {
+  const country = (job.job_country || '').toUpperCase();
+  if (country && allowedCodes.has(country)) return true;
+
+  const text = `${(job.job_title || '').toLowerCase()} ${(job.job_city || '').toLowerCase()} ${(job.jd || '').toLowerCase()}`;
+
+  // If the JD/title explicitly references the user's region, allow
+  if (allowedRegionTerms.some(term => text.includes(term))) return true;
+
+  // If user did NOT specify a location, allow remote/anywhere jobs without country
+  if (!userSetLocation) {
+    if (!country) return true;
+    return false;
+  }
+
+  // User set a location — only allow if there's NO country and the job is clearly remote AND
+  // does not specify any other country.
+  // Free-API "Anywhere" without any region marker is considered too risky and dropped.
+  return false;
+}
+
+function buildAllowedRegionTerms(regions) {
+  const terms = new Set();
+  for (const r of regions) {
+    const rl = r.toLowerCase();
+    terms.add(rl);
+    if (rl.includes('united states')) { terms.add('usa'); terms.add('u.s.'); terms.add('u.s'); terms.add('us '); terms.add('america'); terms.add('north america'); }
+    if (rl.includes('canada')) { terms.add('canada'); terms.add('ca '); }
+    if (rl.includes('united kingdom')) { terms.add('uk'); terms.add('britain'); terms.add('england'); }
+    if (rl.includes('india')) { terms.add('india'); terms.add('bharat'); }
+    if (rl.includes('australia')) { terms.add('australia'); terms.add('aus '); }
+    if (rl.includes('germany')) { terms.add('germany'); terms.add('deutschland'); }
+  }
+  return Array.from(terms);
+}
 
 // ───── Resume Section Extractor ─────
 
@@ -619,15 +715,15 @@ function extractResumeSection(resumeText, sectionName) {
  *   - Education (10%): education level alignment
  */
 function computeMatchScore(job, student) {
-  const rawSkills = (student.keySkills || []).map(s => s.toLowerCase().trim()).filter(Boolean);
+  const rawSkills = normalizeProfileSkills(student.keySkills || []);
   const role = (student.jobRole || '').toLowerCase();
   const jdAnalysis = analyzeJD(job.jd);
   const jobText = `${job.job_title} ${job.jd}`.toLowerCase();
 
-  const roleSkills = (student.jobRole || '').match(TECH_EXTRACT_RE) || [];
-  const expSkills = (student.experience || '').match(TECH_EXTRACT_RE) || [];
+  const roleSkills = normalizeProfileSkills([student.jobRole || '']);
+  const expSkills = normalizeProfileSkills((student.experience || '').match(TECH_EXTRACT_RE) || []);
   // Also extract skills from parsed resume text
-  const resumeSkills = (student.parsedResumeText || '').match(TECH_EXTRACT_RE) || [];
+  const resumeSkills = normalizeProfileSkills((student.parsedResumeText || '').match(TECH_EXTRACT_RE) || []);
   const extractedSkills = [...new Set([...roleSkills, ...expSkills, ...resumeSkills].map(s => s.toLowerCase().trim()))];
 
   // Merge: keySkills + extracted skills from role/experience (deduplicated)
@@ -661,9 +757,15 @@ function computeMatchScore(job, student) {
     if (matched) {
       strongMatches.push(skill);
     } else {
-      // Fuzzy: check for partial/related matches (split by word)
-      const skillWords = skillLower.split(/[\s/.\-]+/).filter(w => w.length > 2);
-      const hasPartial = skillWords.some(w => jobText.includes(w));
+      // Fuzzy: only count as partial if a non-generic acronym matches or
+      // at least two meaningful tokens match. Single generic words like
+      // "experience" or "platform" should never qualify.
+      const skillWords = skillLower
+        .split(/[\s/.\-()]+/)
+        .filter(w => w.length > 2 && !GENERIC_ROLE_WORDS.has(w));
+      const acronymMatch = skillWords.find(w => /^[a-z]{2,12}(?:-[a-z]{2,12})?$/.test(w) && jobText.includes(w));
+      const partialHits = skillWords.filter(w => jobText.includes(w)).length;
+      const hasPartial = Boolean(acronymMatch) || partialHits >= 2;
       if (hasPartial) {
         partialMatches.push(skill);
       } else {
@@ -700,16 +802,18 @@ function computeMatchScore(job, student) {
   // ── 2. Role Fit (25%) ──
   let roleFitScore = 0;
   if (role) {
-    const roleWords = role.split(/\s+/).filter(w => w.length > 2);
+    const roleWords = extractRoleKeywords(student.jobRole);
+    const fallbackRoleWords = roleWords.length > 0
+      ? roleWords
+      : role.split(/\s+/).filter(w => w.length > 2 && !['developer', 'engineer', 'designer', 'analyst', 'architect', 'consultant', 'manager'].includes(w));
     const titleLower = job.job_title.toLowerCase();
-    const titleWords = titleLower.split(/\s+/).filter(w => w.length > 2);
 
     // Exact role word matches in title
-    const titleMatchCount = roleWords.filter(w => titleLower.includes(w)).length;
-    const roleInTitle = roleWords.length > 0 ? titleMatchCount / roleWords.length : 0;
+    const titleMatchCount = fallbackRoleWords.filter(w => titleLower.includes(w)).length;
+    const roleInTitle = fallbackRoleWords.length > 0 ? titleMatchCount / fallbackRoleWords.length : 0;
 
     // Also check if role words appear in JD
-    const roleInJD = roleWords.filter(w => jobText.includes(w)).length / Math.max(roleWords.length, 1);
+    const roleInJD = fallbackRoleWords.filter(w => jobText.includes(w)).length / Math.max(fallbackRoleWords.length, 1);
 
     roleFitScore = (roleInTitle * 0.7 + roleInJD * 0.3) * 25;
   } else {
@@ -1035,7 +1139,7 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
 
   // Map of niche roles to broader, more searchable queries
   const BROADER_QUERIES = {
-    'adobe experience platform developer': ['Adobe developer', 'marketing technology developer', 'Adobe Experience Platform', 'MarTech developer'],
+    'adobe experience platform developer': ['Adobe Experience Platform', 'AEP Developer', 'Adobe developer'],
     'salesforce developer': ['Salesforce developer', 'Salesforce engineer', 'CRM developer'],
     'microsoft dynamics crm developer': ['Dynamics 365 developer', 'CRM developer', 'Microsoft Dynamics'],
     'sap consultant': ['SAP consultant', 'SAP developer', 'ERP consultant'],
@@ -1047,13 +1151,16 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
   const lowerRole = normalizedRole.toLowerCase();
   const broaderAlts = BROADER_QUERIES[lowerRole];
 
+  // Always keep the exact normalized role as the primary query.
+  queries.push(normalizedRole);
+
   if (broaderAlts) {
-    // For niche roles, use the broader alternatives as search queries
-    queries.push(...broaderAlts.slice(0, 2));
-  } else {
-    // Primary query: role + top keywords for better relevance
-    const topKeywords = (skills || []).slice(0, 3).map(s => s.trim()).filter(Boolean).join(' ');
-    queries.push(topKeywords ? `${normalizedRole} ${topKeywords}` : normalizedRole);
+    // For niche roles, use a tightly related alternate query instead of a broad one.
+    queries.push(broaderAlts[0]);
+  } else if ((skills || []).length > 0) {
+    // For broader roles, add a skill-enriched secondary query for better relevance.
+    const topKeywords = (skills || []).slice(0, 2).map(s => s.trim()).filter(Boolean).join(' ');
+    if (topKeywords) queries.push(`${normalizedRole} ${topKeywords}`);
   }
 
   // Secondary query: use top skills to find more relevant jobs
@@ -1086,7 +1193,7 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
     }
   }
 
-  return queries.slice(0, 2); // Max 2 queries to avoid API rate limits
+  return [...new Set(queries.map(q => (q || '').trim()).filter(Boolean))].slice(0, 2); // Max 2 queries to avoid API rate limits
 }
 
 // ───── Main Search Function ─────
@@ -1099,6 +1206,7 @@ function buildSearchQueries(normalizedRole, skills, expLevel) {
  * @returns {Array} job results with match scores and tailored resumes
  */
 async function searchJobs(student, days = 1) {
+  const selectedDays = Math.max(1, parseInt(days, 10) || 1);
   const location = student.location || '';
   const skills = student.keySkills || [];
   const experience = student.experience || '';
@@ -1111,12 +1219,13 @@ async function searchJobs(student, days = 1) {
   const normalizedRole = normalizeJobTitle(rawRole);
   const searchQueries = buildSearchQueries(normalizedRole, skills, expLevel);
 
-  const DATE_TIERS = [1, 3, 7];
+  const DATE_TIERS = [...new Set([1, 3, 7, 30].filter((tier) => tier <= selectedDays).concat(selectedDays))]
+    .sort((a, b) => a - b);
   const primaryQuery = searchQueries[0];
   const secondaryQuery = searchQueries.length > 1 ? searchQueries[1] : null;
 
   // Check cache for repeat searches
-  const cacheKey = `${primaryQuery}|${regions.join(',')}|${days}`;
+  const cacheKey = `${primaryQuery}|${regions.join(',')}|${selectedDays}`;
   const cached = apiCache.get(cacheKey);
   if (cached) return cached;
 
@@ -1124,11 +1233,11 @@ async function searchJobs(student, days = 1) {
   let jsearchJobs = [];
   for (const searchDays of DATE_TIERS) {
     jsearchJobs = [];
-    const primaryResults = await searchJSearch(primaryQuery, regions, searchDays, expLevel, 80);
+    const primaryResults = await searchJSearch(primaryQuery, regions, searchDays, experienceYears, 80);
     jsearchJobs.push(...primaryResults);
 
     if (secondaryQuery) {
-      const secondaryResults = await searchJSearch(secondaryQuery, regions, searchDays, expLevel, 60);
+      const secondaryResults = await searchJSearch(secondaryQuery, regions, searchDays, experienceYears, 60);
       jsearchJobs.push(...secondaryResults);
     }
 
@@ -1156,17 +1265,13 @@ async function searchJobs(student, days = 1) {
     searchRemoteOK(primaryQuery),
   ]);
 
-  // Filter free API results to user's regions (they return global results)
+  // Strict location filter: respect user's preferred location explicitly.
+  const userSetLocation = !!(student.location && String(student.location).trim());
   const allowedCodes = getAllowedCountryCodes(regions);
-  const filterByRegion = (jobs) => jobs.filter(j => {
-    const country = (j.job_country || '').toUpperCase();
-    const city = (j.job_city || '').toLowerCase();
-    // Allow if country matches user's region
-    if (country && allowedCodes.has(country)) return true;
-    // Allow remote jobs (no specific country or marked remote)
-    if (!country || country === '' || city === 'remote' || city.includes('remote') || city === 'anywhere') return true;
-    return false;
-  });
+  const allowedRegionTerms = buildAllowedRegionTerms(regions);
+  const filterByRegion = (jobs) => jobs.filter(j =>
+    jobMatchesPreferredLocation(j, allowedCodes, allowedRegionTerms, userSetLocation)
+  );
 
   // Filter free API results by experience level (title-based)
   const filterByExperience = (jobs) => {
@@ -1204,7 +1309,7 @@ async function searchJobs(student, days = 1) {
     ];
     for (const fq of fallbackQueries) {
       const [fb1, fb2, fb3] = await Promise.all([
-        searchJSearch(fq, regions, 7, expLevel, 60),
+        searchJSearch(fq, regions, 7, experienceYears, 60),
         searchRemoteOK(fq, 20),
         searchRemotive(fq, 20),
       ]);
@@ -1248,13 +1353,18 @@ async function searchJobs(student, days = 1) {
     return { job, match: { ...match, score: adjustedScore } };
   }).sort((a, b) => b.match.score - a.match.score);
 
-  const MIN_SCORE = 70;
-  const qualityJobs = scored.filter(({ match }) => match.score >= MIN_SCORE);
-  const topResults = qualityJobs.length >= 5
-    ? qualityJobs.slice(0, 80)
-    : scored.slice(0, Math.max(20, qualityJobs.length));
+  // Hard profile-relevance gate: drop jobs that don't actually match the user's
+  // role keywords or skills. This prevents random tech jobs being shown for
+  // niche profiles (e.g., AEP Developer must see Adobe/AEP-related jobs only).
+  const relevant = scored.filter(({ job, match }) => isJobRelevantToProfile(job, student, match));
 
-  // Generate template resumes for all jobs
+  // Quality threshold — only return jobs that score well AND pass relevance.
+  // No low-quality fallback: better to return fewer accurate jobs than 30 random ones.
+  const MIN_SCORE = 60;
+  const topResults = relevant
+    .filter(({ match }) => match.score >= MIN_SCORE)
+    .slice(0, 30);
+
   const results = topResults.map(({ job, match }) => ({
     ...job,
     match_score: match.score,
@@ -1266,27 +1376,9 @@ async function searchJobs(student, days = 1) {
     candidate_name: student.fullName || '',
     email: student.email || '',
     timestamp: new Date().toISOString(),
-    pdf_link: student.resumeUrl || '',
-    resume_text: generateTemplateResume(student, job, match),
+    pdf_link: '',
+    resume_text: '',
   }));
-
-  // Upgrade top 5 with AI resumes in parallel
-  if (process.env.OPENAI_API_KEY && topResults.length > 0) {
-    const AI_COUNT = 5;
-    const aiJobs = topResults.slice(0, AI_COUNT);
-    const aiResults = await Promise.all(
-      aiJobs.map(({ job, match }) => generateResumeWithAI(student, job, match).catch(() => null))
-    );
-    aiResults.forEach((text, i) => { if (text) results[i].resume_text = text; });
-  }
-
-  // Write to Google Sheet (fire and forget)
-  const sheetRows = results.map(r => [
-    '', '', r.candidate_id, r.candidate_name, r.email, r.employer_name,
-    String(r.match_score), r.strong_matches, r.missing_skills, r.job_apply_link,
-    r.match_summary, r.timestamp, r.pdf_link, r.jd.substring(0, 500), r.resume_text.substring(0, 2000),
-  ]);
-  appendToSheet(sheetRows);
 
   // Cache results before returning
   apiCache.set(cacheKey, results);

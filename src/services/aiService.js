@@ -9,7 +9,14 @@ class AIService {
       return;
     }
     this.genAI = new GoogleGenerativeAI(apiKey);
-    this.model = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash-lite' });
+    this.modelNames = [
+      process.env.GEMINI_MODEL,
+      'gemini-flash-latest',
+      'gemini-2.5-flash',
+      'gemini-2.0-flash-001',
+      'gemini-2.0-flash',
+      'gemini-2.0-flash-lite-001',
+    ].filter(Boolean);
     this.enabled = true;
     this._quotaExhausted = false;
   }
@@ -17,18 +24,32 @@ class AIService {
   /** Call Gemini with quota-aware fallback */
   async _generate(prompt) {
     if (this._quotaExhausted) return null;
-    try {
-      const result = await this.model.generateContent(prompt);
-      return result.response.text();
-    } catch (err) {
-      if (err.message && err.message.includes('429')) {
-        this._quotaExhausted = true;
-        console.warn('AI quota exhausted — switching to basic mode for remaining calls');
-      } else {
-        console.error('AI generate error:', err.message);
+
+    for (const modelName of this.modelNames) {
+      try {
+        const model = this.genAI.getGenerativeModel({ model: modelName });
+        const result = await model.generateContent(prompt);
+        return result.response.text();
+      } catch (err) {
+        const message = err.message || '';
+        if (message.includes('429')) {
+          this._quotaExhausted = true;
+          console.warn('AI quota exhausted — switching to basic mode for remaining calls');
+          return null;
+        }
+
+        if (message.includes('404') || message.includes('not found') || message.includes('no longer available')) {
+          console.warn(`Gemini model ${modelName} unavailable — trying next model`);
+          continue;
+        }
+
+        console.error('AI generate error:', message);
+        return null;
       }
-      return null;
     }
+
+    console.error('AI generate error: no configured Gemini model is available');
+    return null;
   }
 
   /** Analyze a job page's text to extract JD, requirements, skills */
@@ -102,6 +123,82 @@ Return JSON only:
       highlightedSkills: userData.keySkills || [],
       tailoredExperience: userData.experience || '',
     };
+  }
+
+  /** Generate ATS-friendly plain-text resume content for an external/saved job */
+  async generateATSResumeText(userData, jobData) {
+    const candidateResume = this._normalizeResumeSourceText(userData.parsedResumeText || '');
+    const jobTitle = jobData.job_title || jobData.title || userData.jobRole || 'Target Role';
+    const company = jobData.employer_name || jobData.company || 'Target Company';
+    const jobDescription = (jobData.jd || jobData.description || '').trim();
+    const safeLinkedIn = this._safeProfessionalUrl(userData.linkedinProfile);
+
+    if (!candidateResume && !(userData.experience || userData.education || (userData.keySkills || []).length > 0)) {
+      return { text: this._fallbackATSResumeText(userData, jobData), provider: 'fallback' };
+    }
+
+    if (!this.enabled || this._quotaExhausted) {
+      return { text: this._fallbackATSResumeText(userData, jobData), provider: 'fallback' };
+    }
+
+    const prompt = `You are an expert resume writer and senior technical recruiter.
+Your task: tailor the candidate's uploaded resume to the target job — keeping the candidate's OWN FORMAT exactly.
+
+CRITICAL RULES:
+1. FORMAT PRESERVATION
+   - Read the original uploaded resume and identify every section heading it contains.
+   - Use the EXACT SAME section headings in the EXACT SAME ORDER as in the original.
+   - Do NOT rename, merge, reorder, or add any section that is not present in the original resume.
+   - Do NOT add an "ATS KEYWORDS" section. Do NOT add "CORE SKILLS" if not in the original.
+
+2. FACTS ONLY — NO HALLUCINATION
+   - Preserve all job titles, employers, companies, dates, education, degrees, and certifications EXACTLY as in the original.
+   - Do NOT invent any new employer, project, certification, technology, or achievement.
+   - Do NOT fabricate metrics or numbers not present in the original resume.
+
+3. REWRITE BULLETS FOR THE JOB
+   - Rewrite existing bullet points to incorporate relevant keywords and responsibilities from the target job description.
+  - Keep the target role aligned to the Target Job title only; do not turn skills, tools, or summary phrases into the role title.
+   - Use strong action verbs. Quantify impact where the original already implies it.
+   - Keep all real experience entries — do not collapse multiple roles into one.
+  - Use bullet points for Skills, Experience, Certifications, Education, Projects, and other section content wherever the original section can naturally support bullets.
+
+4. NO CONTACT HEADER IN OUTPUT
+   - Do NOT output the candidate's name, phone, email, or any URL as a header block at the top.
+   - The resume display system renders the contact header separately from the text.
+   - Begin the resume output DIRECTLY with the first section heading (e.g. PROFESSIONAL SUMMARY).
+   - There must be NO lines before the first section heading.
+
+5. OUTPUT FORMAT
+   - Plain text only. No markdown, **, code fences, tables, emojis, or decorative symbols.
+  - Every bullet starts with "- ". Prefer bullet points over long paragraphs except inside PROFESSIONAL SUMMARY.
+   - Clean readable lines. No PDF glyphs or random symbols.
+   - Target 700-1100 words if the original resume has enough content.
+
+Candidate Profile:
+- Name: ${userData.fullName || 'Candidate'}
+- Email: ${userData.email || 'Not provided'}
+- Phone: ${userData.phone || 'Not provided'}${safeLinkedIn ? `\n- LinkedIn: ${safeLinkedIn}` : ''}
+- Target Role: ${userData.jobRole || 'Not provided'}
+- Skills: ${(userData.keySkills || []).join(', ') || 'Not provided'}
+- Experience: ${userData.experience || 'Not provided'}
+- Education: ${userData.education || 'Not provided'}
+
+Candidate Original Uploaded Resume:
+${candidateResume || 'Not provided — use profile data only'}
+
+Target Job:
+- Title: ${jobTitle}
+- Company: ${company}
+- Description:
+${jobDescription || 'Not provided'}
+
+Return the full tailored resume as plain text only. Start IMMEDIATELY with the first section heading — no name, no contact, no header lines before it. Do not include any explanations or labels before or after the resume.`;
+
+    const text = await this._generate(prompt);
+    return text
+      ? { text: this._cleanGeneratedResumeText(text), provider: 'gemini' }
+      : { text: this._fallbackATSResumeText(userData, jobData), provider: 'fallback' };
   }
 
   /** Analyze HTML form and return field-filling instructions */
@@ -206,6 +303,66 @@ Answer (just the answer text):`;
       hasApplicationForm: text.includes('apply') || text.includes('submit'),
       applicationFormType: 'unknown',
     };
+  }
+
+  _normalizeResumeSourceText(text) {
+    return String(text || '')
+      .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ' ')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  _cleanGeneratedResumeText(text) {
+    return String(text || '')
+      .replace(/^```(?:text)?\s*/i, '')
+      .replace(/```$/i, '')
+      .replace(/\*\*/g, '')
+      .replace(/[•●▪○◦]/g, '-')
+      .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ' ')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  _safeProfessionalUrl(url) {
+    if (!url) return null;
+    const u = String(url).trim();
+    if (/linkedin\.com/i.test(u) || /github\.com/i.test(u)) return u;
+    return null;
+  }
+
+  _fallbackATSResumeText(userData, jobData) {
+    const jobTitle = jobData.job_title || jobData.title || userData.jobRole || 'Target Role';
+    const company = jobData.employer_name || jobData.company || 'Target Company';
+    const safeLinkedIn = this._safeProfessionalUrl(userData.linkedinProfile);
+    const allSkills = (userData.keySkills || []).filter(Boolean);
+
+    const originalResume = this._normalizeResumeSourceText(userData.parsedResumeText || '');
+    const contactLine = [userData.email, userData.phone, safeLinkedIn].filter(Boolean).join(' | ');
+    const sections = [
+      `${userData.fullName || 'Candidate'}`,
+      contactLine,
+      '',
+      'PROFESSIONAL SUMMARY',
+      `${userData.jobRole || 'Professional'} targeting the ${jobTitle} role at ${company}. ${userData.experience ? `Experience: ${userData.experience}.` : ''} ${userData.education ? `Education: ${userData.education}.` : ''}`.trim(),
+    ];
+
+    if (allSkills.length > 0) {
+      sections.push('', 'SKILLS', allSkills.join(', '));
+    }
+
+    if (originalResume) {
+      sections.push('', 'PROFESSIONAL EXPERIENCE', originalResume.substring(0, 8000));
+    } else if (userData.experience) {
+      sections.push('', 'PROFESSIONAL EXPERIENCE', userData.experience);
+    }
+
+    if (userData.education) {
+      sections.push('', 'EDUCATION', userData.education);
+    }
+
+    return sections.filter((line, index, arr) => !(line === '' && arr[index - 1] === '')).join('\n');
   }
 }
 

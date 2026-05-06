@@ -1,34 +1,99 @@
 const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const https = require('https');
 const jsJobSearchService = require('../services/jsJobSearchService');
 
-// Google Sheet config (shared with jobController)
-const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
-const GOOGLE_SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
+const parseJsonField = (value, fallback = []) => {
+  if (value == null) return fallback;
+  if (Array.isArray(value) || typeof value === 'object') return value;
 
-function parseCSV(text) {
-  const lines = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '"') {
-      if (inQuotes && text[i + 1] === '"') { current += '"'; i++; }
-      else inQuotes = !inQuotes;
-    } else if (ch === ',' && !inQuotes) {
-      lines.push(current); current = '';
-    } else if ((ch === '\n' || ch === '\r') && !inQuotes) {
-      if (current || lines.length) { lines.push(current); current = ''; }
-      if (lines.length) { if (!parseCSV._rows) parseCSV._rows = []; parseCSV._rows.push([...lines]); lines.length = 0; }
-    } else { current += ch; }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
   }
-  if (current || lines.length) { lines.push(current); if (!parseCSV._rows) parseCSV._rows = []; parseCSV._rows.push([...lines]); }
-  const rows = parseCSV._rows || [];
-  parseCSV._rows = null;
-  return rows;
-}
+};
+
+const mapSavedJobToListing = (job, student = {}) => ({
+  id: job.id,
+  candidate_id: student.id || job.userId || '',
+  candidate_email: student.email || '',
+  candidate_name: student.fullName || '',
+  employer_name: job.employerName || '',
+  job_title: job.jobTitle || '',
+  job_city: job.jobCity || '',
+  job_state: job.jobState || '',
+  job_country: job.jobCountry || '',
+  job_employment_type: job.employmentType || '',
+  match_score: job.matchScore || 0,
+  job_apply_link: job.applyLink || '',
+  employer_logo: job.employerLogo || '',
+  source: job.source || '',
+  posted: job.postedAt || '',
+  timestamp: job.createdAt,
+  match_summary: job.matchSummary || '',
+  strong_matches: JSON.stringify(job.strongMatches || []),
+  partial_matches: '[]',
+  missing_skills: JSON.stringify(job.missingSkills || []),
+  pdf_link: '',
+  jd: job.jd || '',
+  resume_text: '',
+});
+
+const saveSearchResultsForStudent = async (studentId, results) => {
+  const seenLinks = new Set();
+  const topResults = (results || [])
+    .filter((job) => job.job_apply_link && job.job_apply_link.startsWith('http'))
+    .filter((job) => {
+      const key = job.job_apply_link.toLowerCase();
+      if (seenLinks.has(key)) return false;
+      seenLinks.add(key);
+      return true;
+    })
+    .sort((a, b) => (parseInt(b.match_score, 10) || 0) - (parseInt(a.match_score, 10) || 0))
+    .slice(0, 30);
+
+  const saved = [];
+
+  for (const result of topResults) {
+    const data = {
+      userId: studentId,
+      employerName: result.employer_name || null,
+      jobTitle: result.job_title || null,
+      jobCity: result.job_city || null,
+      jobState: result.job_state || null,
+      jobCountry: result.job_country || null,
+      employmentType: result.job_employment_type || null,
+      applyLink: result.job_apply_link || null,
+      employerLogo: result.employer_logo || null,
+      source: result.source || result.job_publisher || null,
+      postedAt: result.posted || result.timestamp || null,
+      jd: result.jd || null,
+      matchScore: parseInt(result.match_score, 10) || 0,
+      strongMatches: parseJsonField(result.strong_matches),
+      missingSkills: parseJsonField(result.missing_skills),
+      matchSummary: result.match_summary || null,
+      resumeText: null,
+    };
+
+    const existing = await prisma.savedJobResult.findFirst({
+      where: { userId: studentId, applyLink: data.applyLink },
+      select: { id: true, resumeText: true },
+    });
+
+    if (existing?.resumeText) {
+      data.resumeText = existing.resumeText;
+    }
+
+    const savedJob = existing
+      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data })
+      : await prisma.savedJobResult.create({ data });
+
+    saved.push(savedJob);
+  }
+
+  return saved;
+};
 
 // ---- Admin (Mentor) Management ----
 
@@ -892,10 +957,11 @@ exports.getStudentApplications = async (req, res) => {
   }
 };
 
-// Get student's Google Sheet jobs
-exports.getStudentSheetJobs = async (req, res) => {
+// Get a student's saved matched jobs.
+exports.getStudentMatchedJobs = async (req, res) => {
   try {
     const { studentId } = req.params;
+    const MIN_MATCH_SCORE = 60;
 
     const student = await prisma.user.findUnique({
       where: { id: studentId },
@@ -905,46 +971,15 @@ exports.getStudentSheetJobs = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    const response = await fetch(GOOGLE_SHEET_CSV_URL, { redirect: 'follow' });
-    if (!response.ok) throw new Error('Failed to fetch Google Sheet');
-    const csvText = await response.text();
-    const rows = parseCSV(csvText);
-    if (rows.length < 2) return res.json({ jobs: [] });
+    const jobs = await prisma.savedJobResult.findMany({
+      where: { userId: studentId, matchScore: { gte: MIN_MATCH_SCORE } },
+      orderBy: [{ matchScore: 'desc' }, { createdAt: 'desc' }],
+      take: 30,
+    });
 
-    const headers = rows[0].map(h => h.trim().toLowerCase());
-    const allJobs = rows.slice(1).map((row, idx) => {
-      const obj = {};
-      headers.forEach((h, i) => { obj[h] = (row[i] || '').trim(); });
-      return {
-        id: idx + 1,
-        candidate_id: obj['candidate_id'] || obj['candidate id'] || '',
-        candidate_email: obj['email'] || obj['candidate_email'] || obj['candidate email'] || '',
-        employer_name: obj['employer_name'] || obj['employer name'] || '',
-        job_title: obj['job_title'] || obj['job title'] || '',
-        job_city: obj['job_city'] || obj['job city'] || obj['location'] || '',
-        job_state: obj['job_state'] || obj['job state'] || '',
-        job_country: obj['job_country'] || obj['job country'] || '',
-        job_employment_type: obj['job_employment_type'] || obj['job employment type'] || obj['employment_type'] || '',
-        match_score: obj['match_score'] || obj['match score'] || '',
-        job_apply_link: obj['job_apply_link'] || obj['job apply link'] || '',
-        timestamp: obj['timestamp'] || '',
-        candidate_name: obj['candidate_name'] || obj['candidate name'] || '',
-        match_summary: obj['match_summary'] || obj['match summary'] || '',
-        strong_matches: obj['strong_matches'] || obj['strong matches'] || '',
-        missing_skills: obj['missing_skills'] || obj['missing skills'] || '',
-        pdf_link: obj['pdf_link'] || obj['pdf link'] || '',
-        jd: obj['jd'] || obj['job_description'] || obj['job description'] || '',
-        resume_text: obj['resume_text'] || obj['resume text'] || obj['resume'] || obj['tailored_resume'] || obj['tailored resume'] || '',
-      };
-    }).filter(j => j.employer_name);
-
-    const jobs = allJobs.filter(j =>
-      j.candidate_id === studentId || j.candidate_email === student.email
-    );
-
-    res.json({ jobs });
+    res.json({ jobs: jobs.map((job) => mapSavedJobToListing(job, student)) });
   } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch student sheet jobs', error: error.message });
+    res.status(500).json({ message: 'Failed to fetch student job listings', error: error.message });
   }
 };
 
@@ -986,7 +1021,7 @@ exports.unassignAdmin = async (req, res) => {
 
 // ---- Admin Apply on Behalf of Student ----
 
-// Trigger n8n job search on behalf of a student
+// Trigger code-based job search on behalf of a student.
 exports.triggerStudentJobSearch = async (req, res) => {
   try {
     const { studentId } = req.params;
@@ -1002,130 +1037,17 @@ exports.triggerStudentJobSearch = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    const days = parseInt(req.body.days) || 1;
-    const JOB_SEARCH_MODE = process.env.JOB_SEARCH_MODE || 'js';
+    const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
+    const results = await jsJobSearchService.searchJobs(student, days);
+    const savedJobs = await saveSearchResultsForStudent(studentId, results);
 
-    // ─── JS Mode: Direct job search via free APIs ───
-    if (JOB_SEARCH_MODE === 'js') {
-      console.log(`[Admin Job Search] JS mode for student ${student.email}`);
-      const results = await jsJobSearchService.searchJobs(student, days);
-      return res.json({
-        message: results.length > 0
-          ? `Found ${results.length} matching jobs for ${student.fullName}!`
-          : 'No jobs found. Try different keywords.',
-        jobs: results,
-        mode: 'js',
-      });
-    }
-
-    // ─── N8N Mode ───
-    const config = require('../config');
-    if (!config.n8n.webhookUrl) return res.status(500).json({ message: 'N8N webhook not configured' });
-    const axios = require('axios');
-    const cheerio = require('cheerio');
-    const crypto = require('crypto');
-    const https = require('https');
-    const n8nAxios = axios.create({ timeout: 60000, httpsAgent: new https.Agent({ family: 4 }) });
-
-    // Fetch n8n form to discover fields
-    const formPageUrl = config.n8n.webhookUrl.replace('/webhook/', '/form/');
-    const formPageResp = await n8nAxios.get(formPageUrl);
-    const $ = cheerio.load(formPageResp.data);
-
-    const formFields = [];
-    $('input, textarea, select').each((i, el) => {
-      const name = $(el).attr('name');
-      if (!name) return;
-      const type = $(el).attr('type') || 'text';
-      let label = '';
-      const elId = $(el).attr('id');
-      if (elId) label = $(`label[for="${elId}"]`).text().trim();
-      if (!label) label = $(el).closest('label').text().trim();
-      if (!label) label = $(el).closest('.form-group, .field, div').find('label').first().text().trim();
-      formFields.push({ name, type, label: label.toLowerCase() });
+    res.json({
+      message: savedJobs.length > 0
+        ? `Found ${savedJobs.length} matching jobs for ${student.fullName}.`
+        : 'No matching jobs found for this profile and time window.',
+      jobs: savedJobs.map((job) => mapSavedJobToListing(job, student)),
+      mode: 'js',
     });
-
-    const dataMap = [
-      { keywords: ['candidate id', 'candidate_id', 'candidateid', 'id'], value: String(student.id) },
-      { keywords: ['candidate_name', 'candidate name', 'name'], value: student.fullName || '' },
-      { keywords: ['email', 'e-mail'], value: student.email || '' },
-      { keywords: ['role', 'job role', 'jobrole'], value: student.jobRole || 'Software Developer' },
-      { keywords: ['keywords', 'skills', 'key skills'], value: (student.keySkills || []).join(', ') },
-      { keywords: ['location', 'city'], value: student.location || '' },
-      { keywords: ['days', 'day', 'date'], value: days },
-    ];
-
-    const textFields = {};
-    let resumeFieldName = 'resume';
-    const usedDataIndices = new Set();
-
-    for (const field of formFields) {
-      if (field.type === 'file') { resumeFieldName = field.name; continue; }
-      if (field.type === 'hidden' || field.type === 'submit') continue;
-      let matched = false;
-      for (let i = 0; i < dataMap.length; i++) {
-        if (usedDataIndices.has(i)) continue;
-        const entry = dataMap[i];
-        const matchTarget = (field.label + ' ' + field.name).toLowerCase();
-        if (entry.keywords.some(kw => matchTarget.includes(kw))) {
-          textFields[field.name] = entry.value;
-          usedDataIndices.add(i);
-          matched = true;
-          break;
-        }
-      }
-      if (!matched) {
-        for (let i = 0; i < dataMap.length; i++) {
-          if (!usedDataIndices.has(i)) {
-            textFields[field.name] = dataMap[i].value;
-            usedDataIndices.add(i);
-            break;
-          }
-        }
-      }
-    }
-
-    // Download student resume
-    const fileFields = [];
-    if (student.resumeUrl) {
-      try {
-        const resumeResp = await n8nAxios.get(student.resumeUrl, { responseType: 'arraybuffer' });
-        const resumeBuffer = Buffer.from(resumeResp.data);
-        const filename = student.resumeUrl.split('/').pop().split('?')[0] || 'resume.pdf';
-        fileFields.push({ name: resumeFieldName, filename, contentType: 'application/pdf', data: resumeBuffer });
-      } catch (dlErr) {
-        console.warn('Could not download student resume:', dlErr.message);
-      }
-    }
-
-    // Build multipart
-    const boundary = '----FormBoundary' + crypto.randomBytes(8).toString('hex');
-    const CRLF = '\r\n';
-    const parts = [];
-    for (const [name, value] of Object.entries(textFields)) {
-      parts.push(Buffer.from(`--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`));
-    }
-    for (const file of fileFields) {
-      parts.push(Buffer.from(`--${boundary}${CRLF}Content-Disposition: form-data; name="${file.name}"; filename="${file.filename}"${CRLF}Content-Type: ${file.contentType}${CRLF}${CRLF}`));
-      parts.push(file.data);
-      parts.push(Buffer.from(CRLF));
-    }
-    parts.push(Buffer.from(`--${boundary}--${CRLF}`));
-    const body = Buffer.concat(parts);
-    const contentType = `multipart/form-data; boundary=${boundary}`;
-
-    const n8nResponse = await n8nAxios.post(formPageUrl, body, {
-      headers: { 'Content-Type': contentType },
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      validateStatus: () => true,
-    });
-
-    if (n8nResponse.status >= 400) {
-      return res.status(502).json({ message: 'N8N workflow error' });
-    }
-
-    res.json({ message: `Job search triggered for ${student.fullName}. Jobs will appear shortly.` });
   } catch (error) {
     console.error('Admin trigger job search error:', error.message);
     res.status(500).json({ message: 'Failed to trigger job search', error: error.message });
@@ -1185,7 +1107,7 @@ exports.applyJobForStudent = async (req, res) => {
   }
 };
 
-// Mark sheet job as applied on behalf of student
+// Mark an external saved job as applied on behalf of student
 // Update application status (interview/offer/rejection)
 exports.updateApplicationStatus = async (req, res) => {
   try {
@@ -1203,7 +1125,7 @@ exports.updateApplicationStatus = async (req, res) => {
     }
 
     if (source === 'sheet') {
-      // Update sheet job application status
+      // Update external job application status
       const app = await prisma.sheetJobApplication.findFirst({
         where: { userId: studentId, jobLink: applicationId },
       });
@@ -1230,7 +1152,7 @@ exports.updateApplicationStatus = async (req, res) => {
   }
 };
 
-exports.markSheetJobAppliedForStudent = async (req, res) => {
+exports.markExternalJobAppliedForStudent = async (req, res) => {
   try {
     const { studentId } = req.params;
     const { jobLink, employerName, matchScore, jobTitle } = req.body;
@@ -1254,8 +1176,8 @@ exports.markSheetJobAppliedForStudent = async (req, res) => {
   }
 };
 
-// Get applied status for student's sheet jobs
-exports.getStudentSheetAppliedStatus = async (req, res) => {
+// Get applied status for a student's external saved jobs
+exports.getStudentExternalAppliedStatus = async (req, res) => {
   try {
     const { studentId } = req.params;
     const applications = await prisma.sheetJobApplication.findMany({

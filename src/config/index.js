@@ -44,8 +44,8 @@ module.exports = {
   },
 
   superAdmin: {
-    email: process.env.SUPER_ADMIN_EMAIL || 'vinayvds20@gmail.com',
-    password: process.env.SUPER_ADMIN_PASSWORD || 'Vinay@8112',
+    email: process.env.SUPER_ADMIN_EMAIL || 'teammavericks56@gmail.com',
+    password: process.env.SUPER_ADMIN_PASSWORD || 'Mig@1206',
     name: process.env.SUPER_ADMIN_NAME || 'Super Admin',
   },
 };

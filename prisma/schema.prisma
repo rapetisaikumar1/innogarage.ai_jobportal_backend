@@ -177,6 +177,8 @@ model Job {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
+  @@index([isActive, applicationType])
+  @@index([datePosted])
   @@map("jobs")
 }
 
@@ -198,6 +200,9 @@ model JobApplication {
   updatedAt       DateTime          @updatedAt
 
   @@unique([userId, jobId])
+  @@index([userId, status])
+  @@index([appliedAt])
+  @@index([appliedById])
   @@map("job_applications")
 }
 
@@ -264,6 +269,8 @@ model ChatMessage {
 
   createdAt       DateTime  @default(now())
 
+  @@index([senderId, receiverId, createdAt])
+  @@index([receiverId, isRead, senderId])
   @@map("chat_messages")
 }
 
@@ -373,6 +380,8 @@ model Notification {
 
   createdAt       DateTime  @default(now())
 
+  @@index([userId, createdAt])
+  @@index([userId, isRead])
   @@map("notifications")
 }
 
@@ -394,6 +403,8 @@ model SheetJobApplication {
   createdAt       DateTime  @default(now())
 
   @@unique([userId, jobLink])
+  @@index([userId, createdAt])
+  @@index([userId, appliedById])
   @@map("sheet_job_applications")
 }
 
