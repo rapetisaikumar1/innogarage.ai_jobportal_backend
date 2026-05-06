@@ -34,6 +34,7 @@ const allowedOrigins = [
   'https://innogarage.ai',
   'https://maverickproject-finalise-1.vercel.app',
   'http://localhost:5173',
+  'http://127.0.0.1:5173',
 ].filter(Boolean);
 
 const corsOptions = {
