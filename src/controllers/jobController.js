@@ -1355,9 +1355,10 @@ exports.getSavedJobs = async (req, res) => {
     const FALLBACK_MATCH_SCORE = 45;
 
     // Single query: fetch enough rows to determine threshold and deduplicate
+    // Default order: newest first (createdAt desc) — frontend sort controls handle score ordering
     const allJobs = await prisma.savedJobResult.findMany({
       where: { userId, matchScore: { gte: FALLBACK_MATCH_SCORE } },
-      orderBy: [{ matchScore: 'desc' }, { createdAt: 'desc' }],
+      orderBy: [{ createdAt: 'desc' }],
       take: 200,
       select: {
         id: true, userId: true, employerName: true, jobTitle: true,
