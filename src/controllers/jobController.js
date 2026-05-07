@@ -230,22 +230,13 @@ const normalizeSavedJobDedupeKey = (job) => [job.employerName, job.jobTitle, job
   .map(value => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim())
   .join('|');
 
-const saveSearchResultsForUser = async (userId, results) => {
-  const seenLinks = new Set();
-  const topResults = (results || [])
-    .filter((job) => job.job_apply_link && job.job_apply_link.startsWith('http'))
-    .filter((job) => {
-      const key = job.job_apply_link.toLowerCase();
-      if (seenLinks.has(key)) return false;
-      seenLinks.add(key);
-      return true;
-    })
-    .sort((a, b) => (parseInt(b.match_score, 10) || 0) - (parseInt(a.match_score, 10) || 0))
-    .slice(0, 30);
-
-  const saved = [];
-
-  for (const result of topResults) {
+/**
+ * Persist a SINGLE job result for a user immediately (used by the streaming pipeline).
+ * Returns the saved/updated DB record, or null if it could not be saved.
+ */
+const saveOneJobForUser = async (userId, result) => {
+  if (!result?.job_apply_link?.startsWith('http')) return null;
+  try {
     const data = {
       userId,
       employerName: result.employer_name || null,
@@ -254,7 +245,7 @@ const saveSearchResultsForUser = async (userId, results) => {
       jobState: result.job_state || null,
       jobCountry: result.job_country || null,
       employmentType: result.job_employment_type || null,
-      applyLink: result.job_apply_link || null,
+      applyLink: result.job_apply_link,
       employerLogo: result.employer_logo || null,
       source: result.source || result.job_publisher || null,
       postedAt: result.posted || result.timestamp || null,
@@ -271,25 +262,43 @@ const saveSearchResultsForUser = async (userId, results) => {
         userId,
         OR: [
           { applyLink: data.applyLink },
-          {
-            employerName: data.employerName,
-            jobTitle: data.jobTitle,
-            jobCountry: data.jobCountry,
-          },
+          { employerName: data.employerName, jobTitle: data.jobTitle, jobCountry: data.jobCountry },
         ],
       },
       select: { id: true, resumeText: true },
     });
 
+    // Preserve existing resume text if the new record doesn't have one
     if (!data.resumeText && existing?.resumeText) {
       data.resumeText = existing.resumeText;
     }
 
-    const savedJob = existing
+    return existing
       ? await prisma.savedJobResult.update({ where: { id: existing.id }, data })
       : await prisma.savedJobResult.create({ data });
+  } catch (err) {
+    console.error('saveOneJobForUser error:', err.message);
+    return null;
+  }
+};
 
-    saved.push(savedJob);
+const saveSearchResultsForUser = async (userId, results) => {
+  const seenLinks = new Set();
+  const topResults = (results || [])
+    .filter((job) => job.job_apply_link && job.job_apply_link.startsWith('http'))
+    .filter((job) => {
+      const key = job.job_apply_link.toLowerCase();
+      if (seenLinks.has(key)) return false;
+      seenLinks.add(key);
+      return true;
+    })
+    .sort((a, b) => (parseInt(b.match_score, 10) || 0) - (parseInt(a.match_score, 10) || 0))
+    .slice(0, 30);
+
+  const saved = [];
+  for (const result of topResults) {
+    const savedJob = await saveOneJobForUser(userId, result);
+    if (savedJob) saved.push(savedJob);
   }
 
   return saved;
@@ -545,6 +554,146 @@ exports.getUsage = async (req, res) => {
     res.json({ plan, used, max: limit.maxSearches, label: limit.label });
   } catch (err) {
     res.status(500).json({ message: 'Failed to get usage', error: err.message });
+  }
+};
+
+/**
+ * SSE streaming job search.
+ * GET /api/jobs/search/stream?days=N
+ *
+ * Pipeline:
+ *   1. Validate auth + plan limits
+ *   2. Open SSE connection (text/event-stream)
+ *   3. For each job found by searchJobsStreaming → emit immediately so frontend appends it live
+ *   4. After all sources are exhausted → save qualifying jobs to DB → emit 'done'
+ *
+ * Event shapes:
+ *   { type: 'status', message: string }   — progress update
+ *   { type: 'job', job: JobListing }       — a single matching job (emit immediately)
+ *   { type: 'done', count: number, message: string }
+ *   { type: 'error', message: string, limitReached?: boolean }
+ */
+exports.streamJobSearch = async (req, res) => {
+  // ── SSE headers ──
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy buffering
+  res.flushHeaders();
+
+  const send = (obj) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  };
+
+  // Heartbeat keeps the connection alive through proxies / load balancers
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(':heartbeat\n\n');
+  }, 20000);
+
+  const finish = () => {
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
+  };
+
+  try {
+    const userId = req.user.id;
+    invalidateUserJobCaches(userId);
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true, fullName: true, email: true, keySkills: true,
+        resumeUrl: true, parsedResumeText: true, jobRole: true, location: true,
+        experience: true, education: true, subscriptionPlan: true,
+        stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
+      },
+    });
+
+    if (!user) {
+      send({ type: 'error', message: 'User not found' });
+      return finish();
+    }
+
+    const plan = normalizePlan(await autoVerifyStripeSession(user));
+    const limit = getPlanLimit(plan);
+    const used = await resetSearchCountIfNeeded(user);
+
+    if (used >= limit.maxSearches) {
+      send({
+        type: 'error',
+        message: `You've reached your ${limit.label} plan limit of ${limit.maxSearches} searches today. Upgrade for more!`,
+        limitReached: true,
+      });
+      return finish();
+    }
+
+    const days = Math.min(30, Math.max(1, parseInt(req.query.days, 10) || 1));
+    send({ type: 'status', message: 'Starting job search based on your profile…' });
+
+    // Track how many were saved to DB successfully (updated in real time)
+    let savedCount = 0;
+    const seenLinks = new Set(); // deduplicate within this stream session
+
+    /**
+     * onJobFound callback — called by searchJobsStreaming for every qualifying job.
+     * We save the job to DB immediately, then emit the DB record (with real id) to the frontend.
+     * This way the frontend gets the real DB id and the job is persisted even if the connection drops.
+     */
+    const onJobFound = async (job) => {
+      // Skip duplicate apply links within this session
+      const linkKey = (job.job_apply_link || '').toLowerCase();
+      if (linkKey && seenLinks.has(linkKey)) return;
+      if (linkKey) seenLinks.add(linkKey);
+
+      // Save to DB immediately — fire-and-forget pattern with await so we get the real id
+      const dbRecord = await saveOneJobForUser(userId, job);
+      savedCount += dbRecord ? 1 : 0;
+
+      // Emit the job with the real DB id (so frontend job.id is always the real PK)
+      const jobWithId = dbRecord
+        ? { ...job, id: dbRecord.id, saved_at: dbRecord.createdAt }
+        : job;
+
+      send({ type: 'job', job: jobWithId });
+
+      // Invalidate the in-memory matched-jobs cache so the refreshed list is always fresh
+      invalidateMatchedJobsCache(userId);
+    };
+
+    const emittedJobs = await jsJobSearchService.searchJobsStreaming(
+      user,
+      days,
+      onJobFound,
+      (msg) => send({ type: 'status', message: msg }),
+    );
+
+    // Increment search count once the full pipeline finishes
+    try {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
+      });
+    } catch (err) {
+      console.error('streamJobSearch count increment error:', err.message);
+    }
+
+    invalidateDashboardStatsCache(userId);
+    invalidateMatchedJobsCache(userId);
+
+    send({
+      type: 'done',
+      count: savedCount,
+      message: savedCount > 0
+        ? `Found ${savedCount} matching job${savedCount === 1 ? '' : 's'} for your profile!`
+        : emittedJobs.length > 0
+          ? 'Jobs found but could not be saved. Please refresh.'
+          : 'No matching jobs found for your profile and time window.',
+    });
+  } catch (error) {
+    console.error('streamJobSearch error:', error.message || error);
+    send({ type: 'error', message: error.message || 'Job search failed. Please try again.' });
+  } finally {
+    finish();
   }
 };
 

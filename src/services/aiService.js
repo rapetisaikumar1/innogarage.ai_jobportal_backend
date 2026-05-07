@@ -134,13 +134,59 @@ Return JSON only:
     };
   }
 
+  /**
+   * Resume Pipeline — Phase 0: Analyze the candidate's uploaded resume format.
+   * Extracts section headings (in order) and the bullet character used, so the
+   * AI can replicate the EXACT structure and style rather than inventing its own.
+   */
+  _analyzeResumeFormat(resumeText) {
+    if (!resumeText) return { sections: [], bulletChar: '-' };
+
+    const SECTION_RE = /^(?:[A-Z][A-Z\s&/,\-–]{2,60}:?\s*)$/;
+    const KNOWN_SECTIONS = /^(?:PROFESSIONAL\s+SUMMARY|PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE|SKILLS|TECHNICAL\s+SKILLS|KEY\s+SKILLS|CORE\s+COMPETENCIES|EDUCATION|CERTIFICATIONS?|LICENSES?|PROJECTS?|ACHIEVEMENTS?|AWARDS?|PUBLICATIONS?|REFERENCES?|SUMMARY|OBJECTIVE|PROFILE|CONTACT|LANGUAGES?|VOLUNTEERING?|INTERESTS?|HOBBIES|ADDITIONAL|HIGHLIGHTS?|ACCOMPLISHMENTS?)/i;
+
+    const sections = [];
+    const seenSections = new Set();
+    let bulletChar = '-';
+    let bulletVotes = { '-': 0, '•': 0, '*': 0 };
+
+    for (const line of resumeText.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      if (SECTION_RE.test(trimmed) || KNOWN_SECTIONS.test(trimmed)) {
+        const heading = trimmed.replace(/:+\s*$/, '').trim().toUpperCase();
+        if (!seenSections.has(heading)) { sections.push(heading); seenSections.add(heading); }
+      }
+
+      // Count bullet character votes
+      if (/^\s*•/.test(line)) bulletVotes['•']++;
+      else if (/^\s*-\s/.test(line)) bulletVotes['-']++;
+      else if (/^\s*\*\s/.test(line)) bulletVotes['*']++;
+    }
+
+    // Determine dominant bullet character
+    const winner = Object.entries(bulletVotes).sort((a, b) => b[1] - a[1])[0];
+    if (winner && winner[1] > 0) bulletChar = winner[0];
+
+    return { sections: sections.length > 0 ? sections : null, bulletChar };
+  }
+
   /** Generate ATS-friendly plain-text resume content for an external/saved job */
   async generateATSResumeText(userData, jobData) {
     const candidateResume = this._normalizeResumeSourceText(userData.parsedResumeText || '');
     const jobTitle = jobData.job_title || jobData.title || userData.jobRole || 'Target Role';
     const company = jobData.employer_name || jobData.company || 'Target Company';
-    const jobDescription = (jobData.jd || jobData.description || '').trim();
+    const jobDescription = (jobData.jd || jobData.description || '').trim().substring(0, 3000);
     const safeLinkedIn = this._safeProfessionalUrl(userData.linkedinProfile);
+
+    // Parse strong matches and missing skills for context
+    const strongMatches = Array.isArray(jobData.strong_matches)
+      ? jobData.strong_matches
+      : (() => { try { return JSON.parse(jobData.strong_matches || '[]'); } catch { return []; } })();
+    const missingSkills = Array.isArray(jobData.missing_skills)
+      ? jobData.missing_skills
+      : (() => { try { return JSON.parse(jobData.missing_skills || '[]'); } catch { return []; } })();
 
     if (!candidateResume && !(userData.experience || userData.education || (userData.keySkills || []).length > 0)) {
       return { text: this._fallbackATSResumeText(userData, jobData), provider: 'fallback' };
@@ -150,62 +196,80 @@ Return JSON only:
       return { text: this._fallbackATSResumeText(userData, jobData), provider: 'fallback' };
     }
 
-    const prompt = `You are an expert resume writer and senior technical recruiter.
-Your task: take the candidate's ORIGINAL uploaded resume and produce an enhanced version tailored to the target job.
-The output must be the candidate's OWN resume — same structure, same content — with targeted additions for the JD.
+    // ── Phase 0: Analyze resume format so AI can replicate it exactly ──
+    const fmt = this._analyzeResumeFormat(candidateResume);
+    const sectionList = fmt.sections
+      ? `The resume has these sections in this exact order:\n${fmt.sections.map((s, i) => `  ${i + 1}. ${s}`).join('\n')}\n\nUse EXACTLY these section headings in EXACTLY this order — do not add, remove, rename, or reorder any section.`
+      : 'Preserve all section headings from the original resume, in the same order they appear.';
 
-CRITICAL RULES (follow all strictly):
+    const bulletNote = `The resume uses "${fmt.bulletChar}" as the bullet character. Use "${fmt.bulletChar} " (with one space) for ALL bullet points in the output. Do NOT switch to a different character.`;
 
-1. FORMAT PRESERVATION — MANDATORY
-   - Identify every section heading in the original resume (e.g. PROFESSIONAL SUMMARY, CORE SKILLS, PROFESSIONAL EXPERIENCE, CERTIFICATIONS, EDUCATION, etc.).
-   - Output EXACTLY those headings in EXACTLY the same order. Do NOT rename, merge, reorder, or skip any section.
-   - Do NOT add any new section that is not in the original (no "ATS KEYWORDS", no "KEY ACHIEVEMENTS", no "PROJECTS" unless already present).
-   - The structure of the output must be a mirror of the original structure.
+    const prompt = `You are a senior professional resume writer.
 
-2. PRESERVE ALL ORIGINAL CONTENT — MANDATORY
-   - Copy EVERY bullet point, sentence, and line from the original resume into the output exactly as written.
-   - Do NOT remove, shorten, or replace any bullet point from the original.
-   - Do NOT change any job title, employer name, company, date, degree, certification, or location.
-   - Do NOT change or remove any skill listed in the original resume.
-   - The output must contain ALL the content from the original resume plus additions.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESUME PIPELINE — YOUR TASK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. READ the candidate's uploaded resume carefully. Understand every section, every job, every bullet.
+2. REPLICATE the exact format and structure of that resume in your output.
+3. TAILOR ONLY the following — nothing else:
+   a. Professional Summary  → rewrite to target this specific job (4 sentences max)
+   b. Skills section        → reorder so JD-matched skills appear first; append ≤3 plausible additions
+   c. Experience bullets    → keep all originals; add 1–2 new JD-targeted bullets per role
 
-3. ADD JD-RELEVANT CONTENT — ADDITIVE ONLY
-   - After copying original bullets for each role, you may ADD 1–2 new bullet points per role that highlight skills or responsibilities from the target JD that are genuinely relevant to that role.
-   - For skills/tools sections: you may ADD a few JD-relevant skills/technologies at the end IF they are plausible given the candidate's background — do NOT invent skills.
-   - In the PROFESSIONAL SUMMARY (or equivalent first section): you may rewrite the summary to 3-4 sentences that align the candidate's real background to the target role — this is the ONLY section where rewriting (not just adding) is allowed.
-   - Do NOT invent new employers, projects, certifications, metrics, or achievements not in the original resume.
-   - Do NOT fabricate any numbers, tools, or technologies that are not present in the original.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TARGET JOB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Role: ${jobTitle}
+Company: ${company}
+Skills from candidate already matching this JD: ${strongMatches.slice(0, 8).join(', ') || '(see JD)'}
+Skills in JD the candidate should highlight more: ${missingSkills.slice(0, 6).join(', ') || 'none'}
 
-4. NO CONTACT HEADER IN OUTPUT
-   - Do NOT output the candidate's name, phone, email, location, or any URL as a header block at the top.
-   - The resume display system renders the contact header separately.
-   - Begin the output DIRECTLY with the first section heading (e.g. PROFESSIONAL SUMMARY). No blank lines before it.
+Job Description:
+${jobDescription}
 
-5. OUTPUT FORMAT
-   - Plain text only. No markdown, **, code fences, tables, emojis, or decorative symbols.
-   - Every bullet starts with "- ". Use bullet points for Experience, Skills, Certifications, and Education entries.
-   - Clean readable lines. No PDF glyphs, control characters, or random symbols.
-   - The output should be at least as long as the original resume, ideally 800–1200 words.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CANDIDATE'S UPLOADED RESUME (source of truth)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Name: ${userData.fullName || 'Candidate'}
+LinkedIn: ${safeLinkedIn || 'N/A'}
 
-Candidate Profile:
-- Name: ${userData.fullName || 'Candidate'}
-- Email: ${userData.email || 'Not provided'}
-- Phone: ${userData.phone || 'Not provided'}${safeLinkedIn ? `\n- LinkedIn: ${safeLinkedIn}` : ''}
-- Target Role: ${userData.jobRole || 'Not provided'}
-- Skills: ${(userData.keySkills || []).join(', ') || 'Not provided'}
-- Experience: ${userData.experience || 'Not provided'}
-- Education: ${userData.education || 'Not provided'}
+${candidateResume || `Key Skills: ${(userData.keySkills || []).join(', ')}\nExperience: ${userData.experience || 'Not provided'}\nEducation: ${userData.education || 'Not provided'}`}
 
-Candidate Original Uploaded Resume:
-${candidateResume || 'Not provided — use profile data only'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMAT RULES — NON-NEGOTIABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Target Job:
-- Title: ${jobTitle}
-- Company: ${company}
-- Description:
-${jobDescription || 'Not provided'}
+STRUCTURE:
+${sectionList}
 
-Return the full tailored resume as plain text only. Start IMMEDIATELY with the first section heading — no name, no contact, no header lines before it. Do not include any explanations or labels before or after the resume.`;
+BULLETS:
+${bulletNote}
+
+HEADINGS:
+- Use ALL-CAPS for section headings (match the original resume's style exactly).
+- Do NOT use markdown (**bold**, ##heading, code fences). Plain text only.
+
+CONTENT PRESERVATION:
+- Copy every original job title, company name, date range, degree, and certification exactly — character for character.
+- Copy ALL original bullets verbatim first, THEN add 1–2 new JD-targeted bullets after them.
+- Do NOT shorten, paraphrase, or delete any original bullet or sentence.
+
+NO FABRICATION:
+- Do NOT invent employers, projects, certifications, degrees, metrics, or dates not in the original resume.
+- Do NOT use placeholders like "[Company]", "[Year]", or "[Add skill here]".
+- Skill additions to the skills section must be plausible given the candidate's actual background (e.g., if they know AWS, Azure is plausible; if they only do Java, do NOT add Python).
+
+SUMMARY REWRITE (4 sentences):
+  Sentence 1: Candidate's role title + years of experience + #1 matched skill for THIS job.
+  Sentence 2: 2–3 strongest matched skills (from the "Skills already matching" list).
+  Sentence 3: Name the target company (${company}) and role (${jobTitle}) explicitly.
+  Sentence 4: One quantified impact statement from the candidate's actual experience.
+
+OUTPUT LENGTH:
+- Output must be at least as long as the original resume.
+- Begin directly with the first section heading — do NOT include the candidate's name or contact info at the top.
+
+Begin the tailored resume now:`;
 
     const text = await this._generate(prompt);
     return text

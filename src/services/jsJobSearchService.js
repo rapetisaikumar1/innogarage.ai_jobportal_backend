@@ -619,38 +619,37 @@ const DOMAIN_KEYWORDS = {
 // ───── Profile-Based Relevance & Location Gates ─────
 
 /**
- * Hard relevance gate: a job is relevant only if it matches the user's profile
- * on at least one of:
- *   1) A meaningful role keyword (excluding generic words like "developer")
- *      appears in the job title or top of the JD.
- *   2) At least one strong skill match exists.
- *   3) Any of the user's key-skill aliases appears verbatim in the title.
+ * Hard relevance gate: a job is relevant only if it passes ALL of:
+ *   1) No business-role mismatch (technical user should not see sales/marketing roles)
+ *   2) Role-specific keyword (excluding generic words) appears in job title
+ *      OR at least 2 strong skill matches exist
+ *      OR a skill alias appears verbatim in the job title
  *
- * This is what stops random tech jobs from being shown for niche profiles
- * (e.g., AEP Developer + Adobe Experience Platform skills must see Adobe/AEP jobs).
+ * This strictly enforces profile fields: jobRole + keySkills must drive every result.
  */
 function isJobRelevantToProfile(job, student, match) {
   const title = (job.job_title || '').toLowerCase();
   const jd = (job.jd || '').toLowerCase();
-  const haystack = `${title} ${jd}`;
 
+  // 1) Business-role mismatch hard block
   if (hasBusinessRoleMismatch(job.job_title, student.jobRole)) return false;
 
-  // 1) Strong skill match (computed by computeMatchScore against title+JD)
-  if ((match.strongMatches || []).length >= 1) return true;
-
-  // 2) Role-specific keyword in title or JD (excluding generic words)
+  // 2) Role-specific keywords MUST appear in the job title
+  //    (JD-only match is not enough — title must be relevant)
   const roleKeywords = extractRoleKeywords(student.jobRole);
-  if (roleKeywords.length > 0 && roleKeywords.some(w => haystack.includes(w))) {
-    return true;
-  }
+  const titleHasRoleKeyword = roleKeywords.length > 0 && roleKeywords.some(w => title.includes(w));
 
-  // 3) Skill aliases in title (covers cases where computeMatchScore split differently)
+  if (titleHasRoleKeyword) return true;
+
+  // 3) Skill alias in title (e.g. 'React' in title for a React developer)
   const skills = normalizeProfileSkills(student.keySkills || []);
   for (const skill of skills) {
     const aliases = SKILL_ALIASES[skill] || [skill];
-    if (aliases.some(a => a && a.length >= 3 && haystack.includes(a))) return true;
+    if (aliases.some(a => a && a.length >= 3 && title.includes(a))) return true;
   }
+
+  // 4) Require 2+ strong skill matches (not just 1 — reduces false positives)
+  if ((match.strongMatches || []).length >= 2) return true;
 
   return false;
 }
@@ -1375,8 +1374,8 @@ async function searchJobs(student, days = 1) {
   // niche profiles (e.g., AEP Developer must see Adobe/AEP-related jobs only).
   const relevant = scored.filter(({ job, match }) => isJobRelevantToProfile(job, student, match));
 
-  const strictMatches = relevant.filter(({ match }) => match.score >= 60);
-  const supplementalMatches = relevant.filter(({ match }) => match.score >= 45 && match.score < 60);
+  const strictMatches = relevant.filter(({ match }) => match.score >= 65);
+  const supplementalMatches = relevant.filter(({ match }) => match.score >= 55 && match.score < 65);
   const topResults = (strictMatches.length >= 12 ? strictMatches : [...strictMatches, ...supplementalMatches])
     .slice(0, 30);
 
@@ -1401,4 +1400,142 @@ async function searchJobs(student, days = 1) {
   return results;
 }
 
-module.exports = { searchJobs, computeMatchScore, generateResumeWithAI, generateTemplateResume };
+/**
+ * Streaming version of searchJobs.
+ * Calls onJobFound(jobData) immediately for each qualifying job found (score >= 60, relevant, unique).
+ * Returns the array of all emitted jobs so the controller can save them to DB.
+ *
+ * Architecture:
+ *   Phase 1 — JSearch (major boards): primary query → secondary query, per date tier
+ *   Phase 2 — Remote boards (Remotive, RemoteOK): run in parallel after JSearch
+ *   Fallback — broader queries if nothing found
+ *
+ * Each job is scored and filtered inline as it arrives from the source API, then streamed immediately.
+ */
+async function searchJobsStreaming(student, days = 1, onJobFound, onStatus) {
+  const selectedDays = Math.max(1, parseInt(days, 10) || 1);
+  const location = student.location || '';
+  const skills = normalizeProfileSkills(student.keySkills || []);
+  const experience = student.experience || '';
+
+  const regions = resolveSearchRegions(location);
+  const experienceYears = parseExperienceYears(experience);
+  const expLevel = experienceYears >= 7 ? 'senior' : experienceYears >= 3 ? 'mid' : experienceYears > 0 ? 'junior' : '';
+
+  const rawRole = (student.jobRole || '').trim();
+  const normalizedRole = normalizeJobTitle(rawRole);
+  const searchQueries = buildSearchQueries(normalizedRole, skills, expLevel);
+
+  const DATE_TIERS = [...new Set([1, 3, 7, 30].filter(t => t <= selectedDays).concat(selectedDays))].sort((a, b) => a - b);
+  const primaryQuery = searchQueries[0];
+  const secondaryQuery = searchQueries.length > 1 ? searchQueries[1] : null;
+
+  const userSetLocation = !!(student.location && String(student.location).trim());
+  const allowedCodes = getAllowedCountryCodes(regions);
+  const allowedRegionTerms = buildAllowedRegionTerms(regions);
+
+  const filterByRegion = (jobs) => jobs.filter(j => jobMatchesPreferredLocation(j, allowedCodes, allowedRegionTerms, userSetLocation));
+  const filterByExperience = (jobs) => {
+    if (!expLevel) return jobs;
+    return jobs.filter(j => {
+      const title = (j.job_title || '').toLowerCase();
+      if (expLevel === 'junior' && /\b(senior|sr\.|lead|principal|staff|director|head of|vp\b|architect)\b/.test(title)) return false;
+      if (expLevel === 'mid' && /\b(principal|staff|director|head of|vp\b)\b/.test(title)) return false;
+      return true;
+    });
+  };
+
+  const seen = new Set();
+  const emittedJobs = [];
+
+  /** Score, gate, and emit a batch of raw jobs from a source */
+  /** Score, gate, and emit a batch of raw jobs. Async because onJobFound awaits DB write. */
+  const processAndEmit = async (rawJobs) => {
+    const filtered = filterByExperience(filterByRegion(rawJobs));
+    for (const job of filtered) {
+      if (!job.job_apply_link?.startsWith('http') || !job.job_title || !job.employer_name) continue;
+      const key = `${job.employer_name}|${job.job_title}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const match = computeMatchScore(job, student);
+      const src = (job.source || '').toLowerCase();
+      const sourceBonus = (src.includes('indeed') || src.includes('linkedin') || src.includes('dice') || src.includes('ziprecruiter') || src.includes('glassdoor') || src === 'jsearch') ? 8
+        : src === 'remotive' ? 3
+        : src === 'remoteok' ? 2 : 0;
+      const locationBonus = (allowedCodes.has((job.job_country || '').toUpperCase())) ? 5 : 0;
+      const adjustedScore = Math.min(100, match.score + sourceBonus + locationBonus);
+      const finalMatch = { ...match, score: adjustedScore };
+
+      // Hard relevance gate: must match role/skills
+      if (!isJobRelevantToProfile(job, student, finalMatch)) continue;
+      // Score threshold: only 60+ qualify
+      if (adjustedScore < 60) continue;
+
+      const jobData = {
+        ...job,
+        match_score: adjustedScore,
+        strong_matches: JSON.stringify(finalMatch.strongMatches),
+        partial_matches: JSON.stringify(finalMatch.partialMatches || []),
+        missing_skills: JSON.stringify(finalMatch.missingSkills),
+        match_summary: finalMatch.summary,
+        candidate_id: student.id,
+        candidate_name: student.fullName || '',
+        email: student.email || '',
+        timestamp: new Date().toISOString(),
+        pdf_link: '',
+        resume_text: '',
+      };
+
+      // Await the callback so the DB write completes before the next job is processed.
+      // The controller's onJobFound saves to DB and emits the SSE event with the real DB id.
+      if (typeof onJobFound === 'function') await onJobFound(jobData);
+      emittedJobs.push(jobData);
+    }
+  };
+
+  // ── Phase 1: JSearch (major job boards — Indeed, LinkedIn, Dice, ZipRecruiter) ──
+  if (typeof onStatus === 'function') onStatus('Searching major job boards…');
+  for (const searchDays of DATE_TIERS) {
+    const primaryResults = await searchJSearch(primaryQuery, regions, searchDays, experienceYears, 80);
+    await processAndEmit(primaryResults);
+
+    if (secondaryQuery) {
+      const secondaryResults = await searchJSearch(secondaryQuery, regions, searchDays, experienceYears, 60);
+      await processAndEmit(secondaryResults);
+    }
+
+    if (emittedJobs.length >= 10) break;
+  }
+
+  // ── Phase 2: Remote job boards (Remotive + RemoteOK, run in parallel) ──
+  if (typeof onStatus === 'function') onStatus('Searching remote job boards…');
+  const [remotiveJobs, remoteOKJobs] = await Promise.all([
+    searchRemotive(primaryQuery),
+    searchRemoteOK(primaryQuery),
+  ]);
+  await processAndEmit(remotiveJobs);
+  await processAndEmit(remoteOKJobs);
+
+  // ── Fallback: broader queries if nothing matched ──
+  if (emittedJobs.length === 0) {
+    if (typeof onStatus === 'function') onStatus('Trying broader search…');
+    const fallbackQueries = [
+      normalizedRole.split(' ').slice(0, 2).join(' '),
+      `${(skills[0] || student.keySkills?.[0] || 'software')} developer`,
+    ];
+    for (const fq of fallbackQueries) {
+      const [fb1, fb2, fb3] = await Promise.all([
+        searchJSearch(fq, regions, 7, experienceYears, 60),
+        searchRemoteOK(fq, 20),
+        searchRemotive(fq, 20),
+      ]);
+      await processAndEmit([...fb1, ...fb2, ...fb3]);
+      if (emittedJobs.length > 0) break;
+    }
+  }
+
+  return emittedJobs;
+}
+
+module.exports = { searchJobs, searchJobsStreaming, computeMatchScore, generateResumeWithAI, generateTemplateResume };
