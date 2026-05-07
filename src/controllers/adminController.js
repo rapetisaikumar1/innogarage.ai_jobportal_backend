@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jsJobSearchService = require('../services/jsJobSearchService');
 const aiService = require('../services/aiService');
+const { _invalidateMatchedJobsCache } = require('./jobController');
 
 const parseJsonField = (value, fallback = []) => {
   if (value == null) return fallback;
@@ -1055,6 +1056,9 @@ exports.triggerStudentJobSearch = async (req, res) => {
     const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
     const results = await jsJobSearchService.searchJobs(student, days);
     const savedJobs = await saveSearchResultsForStudent(studentId, results);
+
+    // Bust the matched-jobs cache so the student sees fresh results immediately
+    try { _invalidateMatchedJobsCache(student.id); } catch { /* ignore */ }
 
     res.json({
       message: savedJobs.length > 0

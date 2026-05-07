@@ -37,6 +37,8 @@ const googleSheetCache = {
 };
 
 const dashboardStatsCache = new Map();
+const matchedJobsCache = new Map(); // userId -> { data, expiry }
+const MATCHED_JOBS_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 const invalidateGoogleSheetCache = () => {
   googleSheetCache.jobs = [];
@@ -53,9 +55,15 @@ const invalidateDashboardStatsCache = (userId) => {
   dashboardStatsCache.clear();
 };
 
+const invalidateMatchedJobsCache = (userId) => {
+  if (userId) { matchedJobsCache.delete(userId); return; }
+  matchedJobsCache.clear();
+};
+
 const invalidateUserJobCaches = (userId) => {
   invalidateGoogleSheetCache();
   invalidateDashboardStatsCache(userId);
+  invalidateMatchedJobsCache(userId);
 };
 
 const parseJsonField = (value, fallback = []) => {
@@ -188,6 +196,7 @@ const getParsedResumeTextForUser = async (user) => {
 };
 // Export so admin controller can reuse without duplicating PDF-parse logic
 exports._getParsedResumeTextForUser = getParsedResumeTextForUser;
+exports._invalidateMatchedJobsCache = invalidateMatchedJobsCache;
 
 const mapSavedJobToListing = (job, user = {}) => ({
   id: job.id,
@@ -585,6 +594,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
     }
 
     invalidateDashboardStatsCache(userId);
+    invalidateMatchedJobsCache(userId);
 
     return res.json({
       message: savedJobs.length > 0
@@ -1328,24 +1338,46 @@ exports.getSavedJobs = async (req, res) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Not authenticated' });
 
-    const STRICT_MATCH_SCORE = 60;
-    const FALLBACK_MATCH_SCORE = 45;
-
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const skip = (page - 1) * limit;
+    const forceRefresh = req.query.refresh === '1';
 
-    const strictTotal = await prisma.savedJobResult.count({ where: { userId, matchScore: { gte: STRICT_MATCH_SCORE } } });
-    const minScore = strictTotal >= 10 ? STRICT_MATCH_SCORE : FALLBACK_MATCH_SCORE;
+    // Serve from cache on page 1 (the common case) unless forced refresh
+    if (!forceRefresh && page === 1) {
+      const cached = matchedJobsCache.get(userId);
+      if (cached && Date.now() < cached.expiry) {
+        return res.json(cached.data);
+      }
+    }
+
+    const STRICT_MATCH_SCORE = 60;
+    const FALLBACK_MATCH_SCORE = 45;
+
+    // Single query: fetch enough rows to determine threshold and deduplicate
     const allJobs = await prisma.savedJobResult.findMany({
-      where: { userId, matchScore: { gte: minScore } },
+      where: { userId, matchScore: { gte: FALLBACK_MATCH_SCORE } },
       orderBy: [{ matchScore: 'desc' }, { createdAt: 'desc' }],
-      take: Math.max(150, limit * 4),
+      take: 200,
+      select: {
+        id: true, userId: true, employerName: true, jobTitle: true,
+        jobCity: true, jobState: true, jobCountry: true, employmentType: true,
+        applyLink: true, employerLogo: true, source: true, postedAt: true,
+        jd: true, matchScore: true, strongMatches: true, missingSkills: true,
+        matchSummary: true, resumeText: true, originalResume: true, createdAt: true,
+      },
     });
+
+    // Determine threshold from fetched rows (no second DB round-trip)
+    const strictCount = allJobs.filter(j => (j.matchScore || 0) >= STRICT_MATCH_SCORE).length;
+    const minScore = strictCount >= 10 ? STRICT_MATCH_SCORE : FALLBACK_MATCH_SCORE;
+    const filtered = minScore === STRICT_MATCH_SCORE
+      ? allJobs.filter(j => (j.matchScore || 0) >= STRICT_MATCH_SCORE)
+      : allJobs;
 
     const deduped = [];
     const seenJobKeys = new Set();
-    for (const job of allJobs) {
+    for (const job of filtered) {
       const key = normalizeSavedJobDedupeKey(job) || job.applyLink || job.id;
       if (seenJobKeys.has(key)) continue;
       seenJobKeys.add(key);
@@ -1354,10 +1386,15 @@ exports.getSavedJobs = async (req, res) => {
 
     const jobs = deduped.slice(skip, skip + limit);
     const total = deduped.length;
-
     const mapped = jobs.map((job) => mapSavedJobToListing(job, req.user || {}));
+    const responseData = { jobs: mapped, total, page, limit, minScore };
 
-    res.json({ jobs: mapped, total, page, limit, minScore });
+    // Cache page 1 result per user for 5 minutes
+    if (page === 1) {
+      matchedJobsCache.set(userId, { data: responseData, expiry: Date.now() + MATCHED_JOBS_TTL_MS });
+    }
+
+    res.json(responseData);
   } catch (error) {
     res.status(500).json({ error: 'Failed to retrieve saved jobs' });
   }

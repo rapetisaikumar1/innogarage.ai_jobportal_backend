@@ -152,8 +152,10 @@ model SavedJobResult {
   missingSkills Json?
   matchSummary  String?
   resumeText    String?
+  originalResume String?
   createdAt     DateTime @default(now())
 
+  @@index([userId, matchScore, createdAt])
   @@map("saved_job_results")
 }
 

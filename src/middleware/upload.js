@@ -6,10 +6,10 @@ const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   const allowedTypes = {
-    resume: ['.pdf', '.doc', '.docx'],
+    resume: ['.pdf', '.doc', '.docx', '.rtf'],
     material: ['.pdf', '.doc', '.docx', '.mp4', '.avi', '.mov', '.pptx', '.ppt'],
     avatar: ['.jpg', '.jpeg', '.png', '.gif', '.webp'],
-    document: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf'],
+    document: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf', '.doc', '.docx', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx', '.txt'],
   };
 
   const ext = path.extname(file.originalname).toLowerCase();

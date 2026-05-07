@@ -153,7 +153,10 @@ exports.uploadDocument = async (req, res) => {
       return res.status(400).json({ message: 'No file uploaded' });
     }
 
-    const result = await uploadToCloudinary(req.file.buffer, { folder: `documents/${docType}`, resourceType: 'image' });
+    const imageTypes = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+    const ext = require('path').extname(req.file.originalname).toLowerCase();
+    const resourceType = imageTypes.includes(ext) ? 'image' : 'raw';
+    const result = await uploadToCloudinary(req.file.buffer, { folder: `documents/${docType}`, resourceType });
 
     const fieldMap = {
       passport: 'passportUrl',
@@ -172,7 +175,7 @@ exports.uploadDocument = async (req, res) => {
       },
     });
 
-    res.json(user);
+    res.json({ ...user, fileName: req.file.originalname, ext });
   } catch (error) {
     res.status(500).json({ message: 'Document upload failed', error: error.message });
   }
