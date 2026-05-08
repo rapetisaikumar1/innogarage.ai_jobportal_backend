@@ -210,6 +210,32 @@ exports.createNote = async (req, res) => {
   }
 };
 
+// Create note for a specific student (Admin/SuperAdmin)
+exports.createNoteForStudent = async (req, res) => {
+  try {
+    const { studentId, title, content, category } = req.body;
+    if (!studentId) return res.status(400).json({ message: 'studentId is required' });
+    if (!title) return res.status(400).json({ message: 'title is required' });
+
+    const student = await prisma.user.findUnique({ where: { id: studentId }, select: { id: true, role: true } });
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    const note = await prisma.trainingNote.create({
+      data: {
+        userId: studentId,
+        title,
+        content: content || '',
+        category: category || null,
+      },
+    });
+    res.status(201).json(note);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to create note for student', error: error.message });
+  }
+};
+
 // Update note
 exports.updateNote = async (req, res) => {
   try {

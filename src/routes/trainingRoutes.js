@@ -20,6 +20,7 @@ router.post('/materials/:materialId/unassign', authenticate, authorize('SUPER_AD
 // Notes
 router.get('/notes', authenticate, trainingController.getMyNotes);
 router.post('/notes', authenticate, trainingController.createNote);
+router.post('/notes/for-student', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), trainingController.createNoteForStudent);
 router.put('/notes/:id', authenticate, trainingController.updateNote);
 router.delete('/notes/:id', authenticate, trainingController.deleteNote);
 
