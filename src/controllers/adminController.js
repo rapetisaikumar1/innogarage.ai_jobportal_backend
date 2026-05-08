@@ -3,7 +3,14 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jsJobSearchService = require('../services/jsJobSearchService');
 const aiService = require('../services/aiService');
-const { _invalidateMatchedJobsCache } = require('./jobController');
+const {
+  _calculateResumeIntelligence,
+  _getParsedResumeTextForUser,
+  _getPlanUsageForUser,
+  _invalidateDashboardStatsCache,
+  _invalidateMatchedJobsCache,
+  _saveOneJobForUser,
+} = require('./jobController');
 
 const parseJsonField = (value, fallback = []) => {
   if (value == null) return fallback;
@@ -947,6 +954,7 @@ exports.getStudentApplications = async (req, res) => {
       prisma.jobApplication.findMany({
         where,
         include: {
+          appliedBy: { select: { id: true, role: true, fullName: true } },
           job: true,
           user: { select: { id: true, fullName: true, email: true, phone: true, avatarUrl: true } },
         },
@@ -996,6 +1004,152 @@ exports.getStudentMatchedJobs = async (req, res) => {
     res.json({ jobs: jobs.map((job) => mapSavedJobToListing(job, student)) });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch student job listings', error: error.message });
+  }
+};
+
+exports.getStudentJobUsage = async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const student = await prisma.user.findUnique({
+      where: { id: studentId },
+      select: {
+        id: true,
+        role: true,
+        email: true,
+        subscriptionPlan: true,
+        stripeSessionId: true,
+        jobSearchCount: true,
+        lastSearchReset: true,
+      },
+    });
+
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    res.json(await _getPlanUsageForUser(student));
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to get student usage', error: error.message });
+  }
+};
+
+exports.streamStudentJobSearch = async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (obj) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  };
+
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(':heartbeat\n\n');
+  }, 20000);
+
+  const finish = () => {
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
+  };
+
+  try {
+    const { studentId } = req.params;
+
+    _invalidateDashboardStatsCache(studentId);
+    _invalidateMatchedJobsCache(studentId);
+
+    const student = await prisma.user.findUnique({
+      where: { id: studentId },
+      select: {
+        id: true,
+        role: true,
+        fullName: true,
+        email: true,
+        keySkills: true,
+        resumeUrl: true,
+        parsedResumeText: true,
+        jobRole: true,
+        location: true,
+        experience: true,
+        education: true,
+        subscriptionPlan: true,
+        stripeSessionId: true,
+        jobSearchCount: true,
+        lastSearchReset: true,
+      },
+    });
+
+    if (!student || student.role !== 'STUDENT') {
+      send({ type: 'error', message: 'Student not found' });
+      return finish();
+    }
+
+    const usage = await _getPlanUsageForUser(student);
+    if (usage.used >= usage.max) {
+      send({
+        type: 'error',
+        message: `You've reached your ${usage.label} plan limit of ${usage.max} searches today. Upgrade for more!`,
+        limitReached: true,
+      });
+      return finish();
+    }
+
+    const days = Math.min(30, Math.max(1, parseInt(req.query.days, 10) || 1));
+    send({ type: 'status', message: 'Starting job search based on your profile…' });
+
+    let savedCount = 0;
+    const seenLinks = new Set();
+
+    const onJobFound = async (job) => {
+      const linkKey = (job.job_apply_link || '').toLowerCase();
+      if (linkKey && seenLinks.has(linkKey)) return;
+      if (linkKey) seenLinks.add(linkKey);
+
+      const dbRecord = await _saveOneJobForUser(student.id, job);
+      savedCount += dbRecord ? 1 : 0;
+
+      const jobWithId = dbRecord
+        ? { ...job, id: dbRecord.id, saved_at: dbRecord.createdAt }
+        : job;
+
+      send({ type: 'job', job: jobWithId });
+      _invalidateMatchedJobsCache(student.id);
+    };
+
+    const emittedJobs = await jsJobSearchService.searchJobsStreaming(
+      student,
+      days,
+      onJobFound,
+      (message) => send({ type: 'status', message })
+    );
+
+    try {
+      await prisma.user.update({
+        where: { id: student.id },
+        data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
+      });
+    } catch (error) {
+      console.error('streamStudentJobSearch count increment error:', error.message);
+    }
+
+    _invalidateDashboardStatsCache(student.id);
+    _invalidateMatchedJobsCache(student.id);
+
+    send({
+      type: 'done',
+      count: savedCount,
+      message: savedCount > 0
+        ? `Found ${savedCount} matching job${savedCount === 1 ? '' : 's'} for your profile!`
+        : emittedJobs.length > 0
+          ? 'Jobs found but could not be saved. Please refresh.'
+          : 'No matching jobs found for your profile and time window.',
+    });
+  } catch (error) {
+    console.error('streamStudentJobSearch error:', error.message || error);
+    send({ type: 'error', message: error.message || 'Job search failed. Please try again.' });
+  } finally {
+    finish();
   }
 };
 
@@ -1070,6 +1224,65 @@ exports.triggerStudentJobSearch = async (req, res) => {
   } catch (error) {
     console.error('Admin trigger job search error:', error.message);
     res.status(500).json({ message: 'Failed to trigger job search', error: error.message });
+  }
+};
+
+exports.calculateStudentResumeMatchScore = async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const student = await prisma.user.findUnique({ where: { id: studentId }, select: { id: true, role: true } });
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    const jd = req.body?.jd || '';
+    const resumeText = req.body?.resume_text || '';
+    const userSkills = Array.isArray(req.body?.skills) ? req.body.skills : [];
+
+    if (!jd || !resumeText) {
+      return res.status(400).json({ message: 'Job description and resume text are required.' });
+    }
+
+    res.json(_calculateResumeIntelligence({ jd, resumeText, userSkills, existingScore: req.body?.match_score }));
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to calculate resume match score', error: error.message || String(error) });
+  }
+};
+
+exports.saveStudentGeneratedResumeText = async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const student = await prisma.user.findUnique({
+      where: { id: studentId },
+      select: { id: true, role: true, fullName: true, email: true },
+    });
+
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    const { id, job_apply_link, resume_text } = req.body || {};
+    if (!resume_text || resume_text.trim().length < 800) {
+      return res.status(400).json({ message: 'Resume text is too short to save.' });
+    }
+
+    const where = id
+      ? { id, userId: studentId }
+      : { userId: studentId, applyLink: job_apply_link || undefined };
+
+    const existing = await prisma.savedJobResult.findFirst({ where });
+    if (!existing) {
+      return res.status(404).json({ message: 'Saved job was not found.' });
+    }
+
+    const savedJob = await prisma.savedJobResult.update({
+      where: { id: existing.id },
+      data: { resumeText: resume_text.trim() },
+    });
+
+    res.json({ message: 'Resume edits saved.', job: mapSavedJobToListing(savedJob, student) });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to save resume edits', error: error.message || String(error) });
   }
 };
 
@@ -1285,9 +1498,7 @@ exports.generateResumeForStudent = async (req, res) => {
       return res.json({ message: 'Existing ATS resume loaded.', job: mapJob(existing), provider: 'cached' });
     }
 
-    // Get resume text from DB or URL (reuse job controller's PDF-parse helper)
-    const jobCtrl = require('./jobController');
-    const parsedResumeText = await jobCtrl._getParsedResumeTextForUser(student);
+    const parsedResumeText = await _getParsedResumeTextForUser(student);
 
     if (!parsedResumeText || parsedResumeText.length < 800) {
       return res.status(400).json({ message: 'Student has no uploaded resume. Please ask them to upload their resume first.' });

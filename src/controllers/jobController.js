@@ -196,6 +196,16 @@ const getParsedResumeTextForUser = async (user) => {
 };
 // Export so admin controller can reuse without duplicating PDF-parse logic
 exports._getParsedResumeTextForUser = getParsedResumeTextForUser;
+exports._getPlanUsageForUser = async (user) => {
+  const plan = normalizePlan(await autoVerifyStripeSession(user));
+  const limit = getPlanLimit(plan);
+  const used = await resetSearchCountIfNeeded(user);
+
+  return { plan, used, max: limit.maxSearches, label: limit.label };
+};
+exports._calculateResumeIntelligence = calculateResumeIntelligence;
+exports._saveOneJobForUser = saveOneJobForUser;
+exports._invalidateDashboardStatsCache = invalidateDashboardStatsCache;
 exports._invalidateMatchedJobsCache = invalidateMatchedJobsCache;
 
 const mapSavedJobToListing = (job, user = {}) => ({

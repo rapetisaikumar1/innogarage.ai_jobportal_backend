@@ -32,12 +32,16 @@ router.get('/students/:studentId/dashboard-data', authenticate, authorize('ADMIN
 router.get('/students/:studentId/applications', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentApplications);
 router.get('/students/:studentId/matched-jobs', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentMatchedJobs);
 router.get('/students/:studentId/external-applied-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentExternalAppliedStatus);
+router.get('/students/:studentId/usage', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.getStudentJobUsage);
+router.get('/students/:studentId/search/stream', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.streamStudentJobSearch);
 
 // Admin act-on-behalf-of-student routes
 router.post('/students/:studentId/trigger-job-search', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.triggerStudentJobSearch);
 router.post('/students/:studentId/apply-job', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.applyJobForStudent);
 router.post('/students/:studentId/mark-external-applied', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.markExternalJobAppliedForStudent);
+router.post('/students/:studentId/match-score', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.calculateStudentResumeMatchScore);
 router.patch('/students/:studentId/application-status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.updateApplicationStatus);
 router.post('/students/:studentId/resume/generate', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.generateResumeForStudent);
+router.post('/students/:studentId/resume/save', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), adminController.saveStudentGeneratedResumeText);
 
 module.exports = router;
