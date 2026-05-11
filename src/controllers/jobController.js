@@ -1026,7 +1026,7 @@ exports.streamJobSearch = async (req, res) => {
   }
 };
 
-exports.triggerN8nWorkflow = async (req, res) => {
+exports.triggerJobSearch = async (req, res) => {
   try {
     const userId = req.user.id;
     invalidateUserJobCaches(userId);
@@ -1077,7 +1077,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
         data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
       });
     } catch (error) {
-      console.error('triggerN8nWorkflow count increment error:', error.message);
+      console.error('triggerJobSearch count increment error:', error.message);
     }
 
     invalidateDashboardStatsCache(userId);
@@ -1091,7 +1091,7 @@ exports.triggerN8nWorkflow = async (req, res) => {
       mode: 'profile',
     });
   } catch (error) {
-    console.error('triggerN8nWorkflow error:', error.message || error);
+    console.error('triggerJobSearch error:', error.message || error);
     res.status(500).json({ message: 'Failed to trigger job search', error: error.message || String(error) });
   }
 };

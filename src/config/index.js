@@ -26,10 +26,6 @@ module.exports = {
     callbackUrl: process.env.GOOGLE_CALLBACK_URL,
   },
 
-  n8n: {
-    webhookUrl: process.env.N8N_WEBHOOK_URL,
-  },
-
   stripe: {
     secretKey: process.env.STRIPE_SECRET_KEY,
     publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
