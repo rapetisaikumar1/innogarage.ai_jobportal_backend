@@ -16,13 +16,8 @@ enum Role {
 enum ApplicationStatus {
   APPLIED
   INTERVIEW_SCHEDULED
-  REJECTED
   OFFER_RECEIVED
-}
-
-enum ApplicationType {
-  EASY_APPLY
-  MANUAL_APPLY
+  REJECTED
 }
 
 enum BookingStatus {
@@ -71,10 +66,6 @@ model User {
   subscriptionEnd    DateTime?
   stripeSessionId    String?
 
-  // Usage tracking
-  jobSearchCount     Int       @default(0)
-  lastSearchReset    DateTime?
-
   // Mentor-specific
   mentorBio       String?
   assignedMentorId String?
@@ -82,8 +73,6 @@ model User {
   assignedStudents User[]   @relation("MentorStudents")
 
   // Relations
-  jobApplications   JobApplication[]
-  tailoredResumes   TailoredResume[]
   mentoringSlots    MentoringSlot[]    @relation("MentorSlots")
   bookings          MentorBooking[]    @relation("StudentBookings")
   sentMessages      ChatMessage[]      @relation("SentMessages")
@@ -92,7 +81,6 @@ model User {
   chatGroups        ChatGroup[]        @relation("GroupStudent")
   groupMemberships  ChatGroupMember[]  @relation("GroupMemberships")
   groupMessagesSent GroupMessage[]     @relation("GroupMessagesSent")
-  sheetApplications SheetJobApplication[]
   trainingNotes     TrainingNote[]
   successStories    SuccessStory[]
   shoutPosts        ShoutPost[]
@@ -100,10 +88,19 @@ model User {
   shoutLikes        ShoutLike[]
   supportQueries    SupportQuery[]   @relation("QueryCreator")
   assignedQueries   SupportQuery[]   @relation("QueryAssignee")
+  adminRequestsCreated  AdminRequest[] @relation("AdminRequestsCreated")
+  adminRequestsReviewed AdminRequest[] @relation("AdminRequestsReviewed")
   trainingAssignments TrainingAssignment[]
   uploadedMaterials   TrainingMaterial[] @relation("MaterialUploader")
   adminAssignments    StudentAdminAssignment[] @relation("StudentAssignments")
   adminOfStudents     StudentAdminAssignment[] @relation("AdminAssignments")
+
+  // Job pipeline
+  jobSearchRuns       JobSearchRun[]
+  jobMatches          JobMatch[]           @relation("UserJobMatches")
+  jobApplications     JobApplication[]     @relation("UserApplications")
+  adminJobApplications JobApplication[]    @relation("AdminApplied")
+  externalApplications ExternalJobApplication[] @relation("UserExternalApps")
 
   // Tokens
   verificationToken       String?
@@ -133,97 +130,17 @@ model StudentAdminAssignment {
   @@map("student_admin_assignments")
 }
 
-model SavedJobResult {
-  id            String   @id @default(uuid())
-  userId        String
-  employerName  String?
-  jobTitle      String?
-  jobCity       String?
-  jobState      String?
-  jobCountry    String?
-  employmentType String?
-  applyLink     String?
-  employerLogo  String?
-  source        String?
-  postedAt      String?
-  jd            String?
-  matchScore    Int?
-  strongMatches Json?
-  missingSkills Json?
-  matchSummary  String?
-  resumeText    String?
-  originalResume String?
-  createdAt     DateTime @default(now())
+model AvailableTechnology {
+  id             String   @id @default(uuid())
+  name           String
+  normalizedName String   @unique
+  category       String
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  @@index([userId, matchScore, createdAt])
-  @@map("saved_job_results")
-}
-
-model Job {
-  id              String          @id @default(uuid())
-  title           String
-  company         String
-  location        String?
-  description     String
-  source          String          // LinkedIn, Indeed, etc.
-  sourceUrl       String?
-  applicationType ApplicationType @default(MANUAL_APPLY)
-  salary          String?
-  datePosted      DateTime?
-  isActive        Boolean         @default(true)
-  externalId      String?         @unique
-
-  applications    JobApplication[]
-  tailoredResumes TailoredResume[]
-
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
-
-  @@index([isActive, applicationType])
-  @@index([datePosted])
-  @@map("jobs")
-}
-
-model JobApplication {
-  id              String            @id @default(uuid())
-  userId          String
-  jobId           String
-  status          ApplicationStatus @default(APPLIED)
-  appliedAt       DateTime          @default(now())
-  resumeUsed      String?
-  notes           String?
-  isAutoApplied   Boolean           @default(false)
-  appliedById     String?
-
-  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  job             Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
-
-  createdAt       DateTime          @default(now())
-  updatedAt       DateTime          @updatedAt
-
-  @@unique([userId, jobId])
-  @@index([userId, status])
-  @@index([appliedAt])
-  @@index([appliedById])
-  @@map("job_applications")
-}
-
-model TailoredResume {
-  id              String    @id @default(uuid())
-  userId          String
-  jobId           String
-  resumeUrl       String
-  matchScore      Float?
-  keywords        String[]
-
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  job             Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
-
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  @@unique([userId, jobId])
-  @@map("tailored_resumes")
+  @@index([category, sortOrder])
+  @@map("available_technologies")
 }
 
 model MentoringSlot {
@@ -374,7 +291,7 @@ model Notification {
   userId          String
   title           String
   message         String
-  type            String    // job_match, application, mentoring, message
+  type            String
   isRead          Boolean   @default(false)
   link            String?
 
@@ -385,29 +302,6 @@ model Notification {
   @@index([userId, createdAt])
   @@index([userId, isRead])
   @@map("notifications")
-}
-
-model SheetJobApplication {
-  id              String    @id @default(uuid())
-  userId          String
-  jobLink         String
-  employerName    String?
-  jobTitle        String?
-  status          String    @default("APPLIED") // APPLIED, MANUAL_REQUIRED, FAILED
-  appliedMethod   String    @default("BOT")     // BOT, MANUAL
-  appliedById     String?
-  matchScore      String?
-  pdfLink         String?
-  reportUrl       String?
-
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  createdAt       DateTime  @default(now())
-
-  @@unique([userId, jobLink])
-  @@index([userId, createdAt])
-  @@index([userId, appliedById])
-  @@map("sheet_job_applications")
 }
 
 model SuccessStory {
@@ -492,3 +386,132 @@ model SupportQuery {
 
   @@map("support_queries")
 }
+
+model AdminRequest {
+  id                 String   @id @default(uuid())
+  adminId            String
+  reviewedById       String?
+  title              String
+  studentFullName    String
+  registrationNumber String
+  technology         String
+  status             String   @default("REQUEST_SENT")
+  reviewedAt         DateTime?
+
+  admin              User     @relation("AdminRequestsCreated", fields: [adminId], references: [id], onDelete: Cascade)
+  reviewedBy         User?    @relation("AdminRequestsReviewed", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([adminId, createdAt])
+  @@index([status, createdAt])
+  @@map("admin_requests")
+}
+
+// ─── Job Pipeline ────────────────────────────────────────────────────────────
+
+model JobSearchRun {
+  id          String    @id @default(uuid())
+  userId      String
+  queries     String[]
+  jobsFound   Int       @default(0)
+  durationMs  Int?
+  status      String    @default("RUNNING")
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  matches     JobMatch[]
+
+  @@index([userId, createdAt])
+  @@map("job_search_runs")
+}
+
+model JobMatch {
+  id             String    @id @default(uuid())
+  userId         String
+  runId          String
+
+  externalId     String?
+  applyLink      String
+
+  title          String
+  company        String
+  location       String?
+  employmentType String?
+  description    String?
+  salary         String?
+  postedAt       DateTime?
+
+  matchScore     Int       @default(0)
+  matchSummary   String?
+  strongMatches  String?
+  skillGaps      String?
+
+  resumeText     String?
+  candidateName  String?
+
+  rawPayload     Json?
+  savedAt        DateTime  @default(now())
+
+  user           User         @relation("UserJobMatches", fields: [userId], references: [id], onDelete: Cascade)
+  run            JobSearchRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  application    JobApplication?
+  externalApplications ExternalJobApplication[]
+
+  @@unique([userId, applyLink])
+  @@index([userId, matchScore])
+  @@index([userId, savedAt])
+  @@map("job_matches")
+}
+
+model JobApplication {
+  id                String            @id @default(uuid())
+  userId            String
+  jobMatchId        String?           @unique
+  appliedById       String?
+
+  title             String
+  company           String
+  applyLink         String?
+  matchScore        String?
+
+  status            ApplicationStatus @default(APPLIED)
+  appliedAt         DateTime          @default(now())
+
+  interviewDate     DateTime?
+  interviewLocation String?
+  interviewNotes    String?
+  notes             String?
+
+  user              User       @relation("UserApplications", fields: [userId], references: [id], onDelete: Cascade)
+  jobMatch          JobMatch?  @relation(fields: [jobMatchId], references: [id], onDelete: SetNull)
+  appliedByUser     User?      @relation("AdminApplied", fields: [appliedById], references: [id], onDelete: SetNull)
+
+  @@index([userId, appliedAt])
+  @@index([status])
+  @@map("job_applications")
+}
+
+model ExternalJobApplication {
+  id           String            @id @default(uuid())
+  userId       String
+  jobMatchId   String?
+  appliedById  String?
+  jobLink      String
+  jobTitle     String?
+  employerName String?
+  matchScore   String?
+  status       ApplicationStatus @default(APPLIED)
+  appliedMethod String           @default("MANUAL")
+  createdAt    DateTime          @default(now())
+
+  user         User      @relation("UserExternalApps", fields: [userId], references: [id], onDelete: Cascade)
+  jobMatch     JobMatch? @relation(fields: [jobMatchId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, jobLink])
+  @@index([userId, createdAt])
+  @@map("external_job_applications")
+}
+

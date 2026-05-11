@@ -1,13 +1,39 @@
 const prisma = require('../config/database');
 
+const CHAT_CONTACTS_CACHE_TTL_MS = 15 * 1000;
+const chatContactsCache = new Map();
+
+const getCachedContacts = (userId) => {
+  const cached = chatContactsCache.get(userId);
+  if (!cached || Date.now() >= cached.expiresAt) {
+    chatContactsCache.delete(userId);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setCachedContacts = (userId, payload) => {
+  chatContactsCache.set(userId, {
+    payload,
+    expiresAt: Date.now() + CHAT_CONTACTS_CACHE_TTL_MS,
+  });
+};
+
+const clearContactsCache = (...userIds) => {
+  userIds.filter(Boolean).forEach((userId) => chatContactsCache.delete(userId));
+};
+
 const getAssignedAdminIdsForStudent = async (studentId) => {
-  const [assignments, student] = await Promise.all([
-    prisma.studentAdminAssignment.findMany({ where: { studentId }, select: { adminId: true } }),
-    prisma.user.findUnique({ where: { id: studentId }, select: { assignedMentorId: true } }),
-  ]);
+  const student = await prisma.user.findUnique({
+    where: { id: studentId },
+    select: {
+      assignedMentorId: true,
+      adminAssignments: { select: { adminId: true } },
+    },
+  });
 
   const adminIds = [...new Set([
-    ...assignments.map(a => a.adminId),
+    ...(student?.adminAssignments || []).map((assignment) => assignment.adminId),
     ...(student?.assignedMentorId ? [student.assignedMentorId] : []),
   ])];
 
@@ -20,12 +46,19 @@ const getAssignedAdminIdsForStudent = async (studentId) => {
 };
 
 const getStudentIdsForAdmin = async (adminId) => {
-  const [assignments, legacyStudents] = await Promise.all([
-    prisma.studentAdminAssignment.findMany({ where: { adminId }, select: { studentId: true } }),
-    prisma.user.findMany({ where: { role: 'STUDENT', isActive: true, assignedMentorId: adminId }, select: { id: true } }),
-  ]);
+  const students = await prisma.user.findMany({
+    where: {
+      role: 'STUDENT',
+      isActive: true,
+      OR: [
+        { assignedMentorId: adminId },
+        { adminAssignments: { some: { adminId } } },
+      ],
+    },
+    select: { id: true },
+  });
 
-  return [...new Set([...assignments.map(a => a.studentId), ...legacyStudents.map(s => s.id)])];
+  return students.map((student) => student.id);
 };
 
 // Get chat messages between two users
@@ -57,6 +90,8 @@ exports.getMessages = async (req, res) => {
       },
       data: { isRead: true },
     });
+
+    clearContactsCache(currentUserId, userId);
 
     res.json(messages);
   } catch (error) {
@@ -115,6 +150,8 @@ exports.sendMessage = async (req, res) => {
       }
     }
 
+    clearContactsCache(senderId, receiverId);
+
     res.status(201).json(chatMessage);
   } catch (error) {
     res.status(500).json({ message: 'Failed to send message', error: error.message });
@@ -125,6 +162,11 @@ exports.sendMessage = async (req, res) => {
 exports.getContacts = async (req, res) => {
   try {
     const userId = req.user.id;
+    const cachedContacts = getCachedContacts(userId);
+
+    if (cachedContacts) {
+      return res.json(cachedContacts);
+    }
 
     // Get unique users this user has chatted with
     const [sentTo, receivedFrom] = await Promise.all([
@@ -158,20 +200,16 @@ exports.getContacts = async (req, res) => {
         },
         select: { id: true },
       });
-      allStaff.forEach(s => {
-        if (!contactIds.includes(s.id)) contactIds.push(s.id);
+      allStaff.forEach((staffUser) => {
+        if (!contactIds.includes(staffUser.id)) contactIds.push(staffUser.id);
       });
     }
 
     // If admin, include assigned students + other admins/super admins
     if (req.user.role === 'ADMIN') {
       const assignedStudentIds = await getStudentIdsForAdmin(userId);
-      const allStudents = assignedStudentIds.length > 0 ? await prisma.user.findMany({
-        where: { id: { in: assignedStudentIds }, role: 'STUDENT', isActive: true },
-        select: { id: true },
-      }) : [];
-      allStudents.forEach(s => {
-        if (!contactIds.includes(s.id)) contactIds.push(s.id);
+      assignedStudentIds.forEach((studentId) => {
+        if (!contactIds.includes(studentId)) contactIds.push(studentId);
       });
 
       // Include other admins and super admins
@@ -179,8 +217,8 @@ exports.getContacts = async (req, res) => {
         where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] }, isActive: true, id: { not: userId } },
         select: { id: true },
       });
-      staff.forEach(s => {
-        if (!contactIds.includes(s.id)) contactIds.push(s.id);
+      staff.forEach((staffUser) => {
+        if (!contactIds.includes(staffUser.id)) contactIds.push(staffUser.id);
       });
     }
 
@@ -190,13 +228,18 @@ exports.getContacts = async (req, res) => {
         where: { role: { in: ['ADMIN', 'SUPER_ADMIN', 'STUDENT'] }, isActive: true, id: { not: userId } },
         select: { id: true },
       });
-      allUsers.forEach(u => {
-        if (!contactIds.includes(u.id)) contactIds.push(u.id);
+      allUsers.forEach((contactUser) => {
+        if (!contactIds.includes(contactUser.id)) contactIds.push(contactUser.id);
       });
     }
 
+    if (contactIds.length === 0) {
+      setCachedContacts(userId, []);
+      return res.json([]);
+    }
+
     const contacts = await prisma.user.findMany({
-      where: { id: { in: contactIds } },
+      where: { id: { in: contactIds }, isActive: true },
       select: {
         id: true,
         fullName: true,
@@ -204,7 +247,6 @@ exports.getContacts = async (req, res) => {
         avatarUrl: true,
         role: true,
         isActive: true,
-        department: true,
       },
     });
 
@@ -228,6 +270,8 @@ exports.getContacts = async (req, res) => {
       ...contact,
       unreadCount: unreadCountBySenderId.get(contact.id) || 0,
     }));
+
+    setCachedContacts(userId, contactsWithUnread);
 
     res.json(contactsWithUnread);
   } catch (error) {

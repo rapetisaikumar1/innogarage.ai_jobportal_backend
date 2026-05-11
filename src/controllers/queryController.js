@@ -1,5 +1,30 @@
 const prisma = require('../config/database');
 
+const QUERY_CACHE_TTL_MS = 15 * 1000;
+const queryListCache = new Map();
+const queryStatsCache = new Map();
+
+const getCachedValue = (cache, key) => {
+  const cached = cache.get(key);
+  if (!cached || Date.now() >= cached.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setCachedValue = (cache, key, payload) => {
+  cache.set(key, {
+    payload,
+    expiresAt: Date.now() + QUERY_CACHE_TTL_MS,
+  });
+};
+
+const clearQueryCaches = () => {
+  queryListCache.clear();
+  queryStatsCache.clear();
+};
+
 // Student: Create a support query
 const createQuery = async (req, res) => {
   try {
@@ -53,6 +78,8 @@ const createQuery = async (req, res) => {
       });
     }
 
+    clearQueryCaches();
+
     res.status(201).json(query);
   } catch (error) {
     console.error('Error creating query:', error);
@@ -63,6 +90,12 @@ const createQuery = async (req, res) => {
 // Student: Get own queries
 const getMyQueries = async (req, res) => {
   try {
+    const cacheKey = `student:${req.user.id}:mine`;
+    const cachedQueries = getCachedValue(queryListCache, cacheKey);
+    if (cachedQueries) {
+      return res.json(cachedQueries);
+    }
+
     const queries = await prisma.supportQuery.findMany({
       where: { userId: req.user.id },
       include: {
@@ -70,6 +103,8 @@ const getMyQueries = async (req, res) => {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    setCachedValue(queryListCache, cacheKey, queries);
     res.json(queries);
   } catch (error) {
     console.error('Error fetching queries:', error);
@@ -80,6 +115,12 @@ const getMyQueries = async (req, res) => {
 // Admin / Super Admin: Get queries (ADMIN sees assigned and unassigned, SUPER_ADMIN sees all)
 const getAllQueries = async (req, res) => {
   try {
+    const cacheKey = req.user.role === 'ADMIN' ? `admin:${req.user.id}:all` : 'super-admin:all';
+    const cachedQueries = getCachedValue(queryListCache, cacheKey);
+    if (cachedQueries) {
+      return res.json(cachedQueries);
+    }
+
     const where = req.user.role === 'ADMIN'
       ? { OR: [{ assignedToId: req.user.id }, { assignedToId: null }] }
       : {};
@@ -91,6 +132,8 @@ const getAllQueries = async (req, res) => {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    setCachedValue(queryListCache, cacheKey, queries);
     res.json(queries);
   } catch (error) {
     console.error('Error fetching all queries:', error);
@@ -156,6 +199,8 @@ const updateQuery = async (req, res) => {
         },
       });
     }
+
+    clearQueryCaches();
 
     res.json(updated);
   } catch (error) {
@@ -226,16 +271,36 @@ const getStaffList = async (req, res) => {
 // Admin / Super Admin: Get query stats by status
 const getQueryStats = async (req, res) => {
   try {
+    const cacheKey = req.user.role === 'ADMIN' ? `admin:${req.user.id}:stats` : 'super-admin:stats';
+    const cachedStats = getCachedValue(queryStatsCache, cacheKey);
+    if (cachedStats) {
+      return res.json(cachedStats);
+    }
+
     const baseWhere = req.user.role === 'ADMIN'
       ? { OR: [{ assignedToId: req.user.id }, { assignedToId: null }] }
       : {};
-    const [open, inProgress, closed, total] = await Promise.all([
-      prisma.supportQuery.count({ where: { ...baseWhere, status: 'OPEN' } }),
-      prisma.supportQuery.count({ where: { ...baseWhere, status: 'IN_PROGRESS' } }),
-      prisma.supportQuery.count({ where: { ...baseWhere, status: 'CLOSED' } }),
-      prisma.supportQuery.count({ where: baseWhere }),
-    ]);
-    res.json({ open, inProgress, closed, total });
+
+    const groupedStats = await prisma.supportQuery.groupBy({
+      by: ['status'],
+      where: baseWhere,
+      _count: { _all: true },
+    });
+
+    const countsByStatus = groupedStats.reduce((acc, item) => {
+      acc[item.status] = item._count._all;
+      return acc;
+    }, {});
+
+    const payload = {
+      open: countsByStatus.OPEN || 0,
+      inProgress: countsByStatus.IN_PROGRESS || 0,
+      closed: countsByStatus.CLOSED || 0,
+      total: groupedStats.reduce((sum, item) => sum + item._count._all, 0),
+    };
+
+    setCachedValue(queryStatsCache, cacheKey, payload);
+    res.json(payload);
   } catch (error) {
     console.error('Error fetching query stats:', error);
     res.status(500).json({ message: 'Failed to fetch query stats' });

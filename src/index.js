@@ -11,7 +11,6 @@ const errorHandler = require('./middleware/errorHandler');
 
 // Route imports
 const authRoutes = require('./routes/authRoutes');
-const jobRoutes = require('./routes/jobRoutes');
 const userRoutes = require('./routes/userRoutes');
 const mentoringRoutes = require('./routes/mentoringRoutes');
 const trainingRoutes = require('./routes/trainingRoutes');
@@ -23,6 +22,7 @@ const shoutboardRoutes = require('./routes/shoutboardRoutes');
 const queryRoutes = require('./routes/queryRoutes');
 const stripeRoutes = require('./routes/stripeRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const jobRoutes = require('./routes/jobRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -37,9 +37,17 @@ const allowedOrigins = [
   'http://127.0.0.1:5173',
 ].filter(Boolean);
 
+const isLocalDevOrigin = (origin = '') => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+const isVercelOrigin = (origin = '') => /^https:\/\/[a-zA-Z0-9-]+(\.vercel\.app)$/.test(origin);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  return allowedOrigins.includes(origin) || isLocalDevOrigin(origin) || isVercelOrigin(origin);
+};
+
 const corsOptions = {
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (isAllowedOrigin(origin)) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
@@ -51,7 +59,13 @@ const corsOptions = {
 // Socket.IO setup
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -70,9 +84,32 @@ app.use(cookieParser());
 
 // Files are served from Cloudinary - no local static serving needed
 
+const getHealthPayload = () => ({
+  status: 'OK',
+  service: 'Innogarage Platform Backend',
+  timestamp: new Date().toISOString(),
+  environment: config.nodeEnv,
+  cloudinary: {
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME ? 'SET' : 'MISSING',
+    api_key: process.env.CLOUDINARY_API_KEY ? 'SET' : 'MISSING',
+    api_secret: process.env.CLOUDINARY_API_SECRET ? 'SET' : 'MISSING',
+  },
+});
+
+app.get('/', (req, res) => {
+  res.json({
+    ...getHealthPayload(),
+    message: 'Backend API is running',
+    health: '/api/health',
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json(getHealthPayload());
+});
+
 // API Routes
 app.use('/api/auth', authRoutes);
-app.use('/api/jobs', jobRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/mentoring', mentoringRoutes);
 app.use('/api/training', trainingRoutes);
@@ -85,18 +122,11 @@ app.use('/api/queries', queryRoutes);
 // Stripe routes (checkout + webhook)
 app.use('/api/stripe', stripeRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/jobs', jobRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    cloudinary: {
-      cloud_name: process.env.CLOUDINARY_CLOUD_NAME ? 'SET' : 'MISSING',
-      api_key: process.env.CLOUDINARY_API_KEY ? 'SET' : 'MISSING',
-      api_secret: process.env.CLOUDINARY_API_SECRET ? 'SET' : 'MISSING',
-    },
-  });
+  res.json(getHealthPayload());
 });
 
 // Cloudinary test

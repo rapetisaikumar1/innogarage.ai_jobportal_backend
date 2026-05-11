@@ -49,8 +49,8 @@ const uploadToCloudinary = (fileBuffer, options = {}) => {
 };
 
 /**
- * Upload a PDF stream (from PDFKit) to Cloudinary
- * @param {stream.Readable} pdfStream - The PDF document stream
+ * Upload a readable file stream to Cloudinary.
+ * @param {stream.Readable} pdfStream - The readable document stream
  * @param {string} fileName - The file name
  * @returns {Promise<{url: string, publicId: string}>}
  */

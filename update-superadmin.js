@@ -17,15 +17,11 @@ async function main() {
   await prisma.shoutPost.deleteMany({});
   await prisma.supportQuery.deleteMany({});
   await prisma.successStory.deleteMany({});
-  await prisma.sheetJobApplication.deleteMany({});
   await prisma.notification.deleteMany({});
   await prisma.trainingNote.deleteMany({});
   await prisma.chatMessage.deleteMany({});
   await prisma.mentorBooking.deleteMany({});
   await prisma.mentoringSlot.deleteMany({});
-  await prisma.tailoredResume.deleteMany({});
-  await prisma.jobApplication.deleteMany({});
-  await prisma.job.deleteMany({});
   await prisma.trainingMaterial.deleteMany({});
 
   // Delete all non-super-admin users

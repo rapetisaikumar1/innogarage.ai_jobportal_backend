@@ -277,7 +277,7 @@ CREATE TABLE "notifications" (
 );
 
 -- CreateTable
-CREATE TABLE "sheet_job_applications" (
+CREATE TABLE "external_job_applications" (
     "id" TEXT NOT NULL,
     "userId" TEXT NOT NULL,
     "jobLink" TEXT NOT NULL,
@@ -291,7 +291,7 @@ CREATE TABLE "sheet_job_applications" (
     "reportUrl" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT "sheet_job_applications_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "external_job_applications_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -423,13 +423,13 @@ CREATE INDEX "notifications_userId_createdAt_idx" ON "notifications"("userId", "
 CREATE INDEX "notifications_userId_isRead_idx" ON "notifications"("userId", "isRead");
 
 -- CreateIndex
-CREATE INDEX "sheet_job_applications_userId_createdAt_idx" ON "sheet_job_applications"("userId", "createdAt");
+CREATE INDEX "external_job_applications_userId_createdAt_idx" ON "external_job_applications"("userId", "createdAt");
 
 -- CreateIndex
-CREATE INDEX "sheet_job_applications_userId_appliedById_idx" ON "sheet_job_applications"("userId", "appliedById");
+CREATE INDEX "external_job_applications_userId_appliedById_idx" ON "external_job_applications"("userId", "appliedById");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "sheet_job_applications_userId_jobLink_key" ON "sheet_job_applications"("userId", "jobLink");
+CREATE UNIQUE INDEX "external_job_applications_userId_jobLink_key" ON "external_job_applications"("userId", "jobLink");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "shout_likes_postId_userId_key" ON "shout_likes"("postId", "userId");
@@ -501,7 +501,7 @@ ALTER TABLE "training_notes" ADD CONSTRAINT "training_notes_userId_fkey" FOREIGN
 ALTER TABLE "notifications" ADD CONSTRAINT "notifications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "sheet_job_applications" ADD CONSTRAINT "sheet_job_applications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "external_job_applications" ADD CONSTRAINT "external_job_applications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "success_stories" ADD CONSTRAINT "success_stories_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;

@@ -14,8 +14,6 @@ async function resetDatabase() {
   try { deleted.notifications = await prisma.notification.deleteMany(); } catch(e) {}
   try { deleted.bookings = await prisma.booking.deleteMany(); } catch(e) {}
   try { deleted.mentorSlots = await prisma.mentorSlot.deleteMany(); } catch(e) {}
-  try { deleted.jobApplications = await prisma.jobApplication.deleteMany(); } catch(e) {}
-  try { deleted.jobs = await prisma.job.deleteMany(); } catch(e) {}
   try { deleted.trainingEnrollments = await prisma.trainingEnrollment.deleteMany(); } catch(e) {}
   try { deleted.trainingModules = await prisma.trainingModule.deleteMany(); } catch(e) {}
   try { deleted.trainingPrograms = await prisma.trainingProgram.deleteMany(); } catch(e) {}

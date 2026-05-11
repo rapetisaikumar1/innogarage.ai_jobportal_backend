@@ -1,5 +1,26 @@
 const prisma = require('../config/database');
 
+const SHOUTBOARD_CACHE_TTL_MS = 15 * 1000;
+const shoutboardPostsCache = new Map();
+
+const getCachedPosts = (userId) => {
+  const cached = shoutboardPostsCache.get(userId);
+  if (!cached || Date.now() >= cached.expiresAt) {
+    shoutboardPostsCache.delete(userId);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setCachedPosts = (userId, payload) => {
+  shoutboardPostsCache.set(userId, {
+    payload,
+    expiresAt: Date.now() + SHOUTBOARD_CACHE_TTL_MS,
+  });
+};
+
+const clearShoutboardCache = () => shoutboardPostsCache.clear();
+
 const userSelect = {
   id: true,
   fullName: true,
@@ -11,6 +32,11 @@ const userSelect = {
 // Get all posts with comments count and likes count
 const getPosts = async (req, res) => {
   try {
+    const cachedPosts = getCachedPosts(req.user.id);
+    if (cachedPosts) {
+      return res.json(cachedPosts);
+    }
+
     const posts = await prisma.shoutPost.findMany({
       include: {
         user: { select: userSelect },
@@ -28,6 +54,8 @@ const getPosts = async (req, res) => {
       _count: undefined,
       likes: undefined,
     }));
+
+    setCachedPosts(req.user.id, result);
 
     res.json(result);
   } catch (error) {
@@ -57,6 +85,8 @@ const createPost = async (req, res) => {
       },
     });
 
+    clearShoutboardCache();
+
     res.status(201).json({
       ...post,
       likesCount: 0,
@@ -82,6 +112,7 @@ const deletePost = async (req, res) => {
     }
 
     await prisma.shoutPost.delete({ where: { id } });
+    clearShoutboardCache();
     res.json({ message: 'Post deleted' });
   } catch (error) {
     console.error('Error deleting post:', error);
@@ -101,6 +132,7 @@ const toggleLike = async (req, res) => {
     if (existing) {
       await prisma.shoutLike.delete({ where: { id: existing.id } });
       const count = await prisma.shoutLike.count({ where: { postId: id } });
+      clearShoutboardCache();
       return res.json({ liked: false, likesCount: count });
     }
 
@@ -108,6 +140,7 @@ const toggleLike = async (req, res) => {
       data: { postId: id, userId: req.user.id },
     });
     const count = await prisma.shoutLike.count({ where: { postId: id } });
+    clearShoutboardCache();
     res.json({ liked: true, likesCount: count });
   } catch (error) {
     console.error('Error toggling like:', error);
@@ -168,6 +201,8 @@ const addComment = async (req, res) => {
       },
     });
 
+    clearShoutboardCache();
+
     res.status(201).json(comment);
   } catch (error) {
     console.error('Error adding comment:', error);
@@ -187,6 +222,7 @@ const deleteComment = async (req, res) => {
     }
 
     await prisma.shoutComment.delete({ where: { id: commentId } });
+    clearShoutboardCache();
     res.json({ message: 'Comment deleted' });
   } catch (error) {
     console.error('Error deleting comment:', error);

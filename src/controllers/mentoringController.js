@@ -1,6 +1,34 @@
 const prisma = require('../config/database');
 const { sendMentoringConfirmationEmail, sendBookingRequestEmail, sendBookingCancelledEmail } = require('../services/emailService');
 
+const MENTORING_CACHE_TTL_MS = 10 * 1000;
+const mentorSlotsCache = new Map();
+const mentorBookingsCache = new Map();
+const studentBookingsCache = new Map();
+
+const getCachedValue = (cache, key) => {
+  const entry = cache.get(key);
+  if (!entry || Date.now() >= entry.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.payload;
+};
+
+const setCachedValue = (cache, key, payload) => {
+  cache.set(key, { payload, expiresAt: Date.now() + MENTORING_CACHE_TTL_MS });
+};
+
+const clearMentoringCaches = ({ mentorId, studentId } = {}) => {
+  if (mentorId) {
+    mentorSlotsCache.delete(mentorId);
+    mentorBookingsCache.delete(mentorId);
+  }
+  if (studentId) {
+    studentBookingsCache.delete(studentId);
+  }
+};
+
 // Get available mentoring slots
 exports.getAvailableSlots = async (req, res) => {
   try {
@@ -44,6 +72,8 @@ exports.createSlots = async (req, res) => {
         })
       )
     );
+
+    clearMentoringCaches({ mentorId });
 
     res.status(201).json({ message: 'Slots created', slots: created });
   } catch (error) {
@@ -138,6 +168,8 @@ exports.bookSlot = async (req, res) => {
       }),
     ]);
 
+    clearMentoringCaches({ mentorId: slot.mentorId, studentId });
+
     res.status(201).json(booking);
   } catch (error) {
     res.status(500).json({ message: 'Booking failed', error: error.message });
@@ -209,6 +241,8 @@ exports.confirmBooking = async (req, res) => {
       }),
     ]);
 
+    clearMentoringCaches({ mentorId: booking.slot.mentor.id, studentId: booking.student.id });
+
     res.json(updated);
   } catch (error) {
     res.status(500).json({ message: 'Failed to confirm booking', error: error.message });
@@ -276,6 +310,8 @@ exports.cancelBooking = async (req, res) => {
       });
     }
 
+    clearMentoringCaches({ mentorId: booking.slot.mentorId, studentId: booking.student.id });
+
     res.json({ message: 'Booking cancelled' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to cancel booking', error: error.message });
@@ -285,6 +321,11 @@ exports.cancelBooking = async (req, res) => {
 // Get my bookings (Student)
 exports.getMyBookings = async (req, res) => {
   try {
+    const cached = getCachedValue(studentBookingsCache, req.user.id);
+    if (cached) {
+      return res.json(cached);
+    }
+
     const bookings = await prisma.mentorBooking.findMany({
       where: { studentId: req.user.id },
       include: {
@@ -297,6 +338,7 @@ exports.getMyBookings = async (req, res) => {
       orderBy: { createdAt: 'desc' },
     });
 
+    setCachedValue(studentBookingsCache, req.user.id, bookings);
     res.json(bookings);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch bookings', error: error.message });
@@ -306,6 +348,11 @@ exports.getMyBookings = async (req, res) => {
 // Get mentor's bookings (Mentor)
 exports.getMentorBookings = async (req, res) => {
   try {
+    const cached = getCachedValue(mentorBookingsCache, req.user.id);
+    if (cached) {
+      return res.json(cached);
+    }
+
     const slots = await prisma.mentoringSlot.findMany({
       where: { mentorId: req.user.id },
       include: {
@@ -318,6 +365,7 @@ exports.getMentorBookings = async (req, res) => {
       orderBy: { startTime: 'desc' },
     });
 
+    setCachedValue(mentorBookingsCache, req.user.id, slots);
     res.json(slots);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch bookings', error: error.message });
@@ -327,6 +375,11 @@ exports.getMentorBookings = async (req, res) => {
 // Get mentor's slots
 exports.getMentorSlots = async (req, res) => {
   try {
+    const cached = getCachedValue(mentorSlotsCache, req.user.id);
+    if (cached) {
+      return res.json(cached);
+    }
+
     const slots = await prisma.mentoringSlot.findMany({
       where: { mentorId: req.user.id },
       include: {
@@ -339,6 +392,7 @@ exports.getMentorSlots = async (req, res) => {
       orderBy: { startTime: 'asc' },
     });
 
+    setCachedValue(mentorSlotsCache, req.user.id, slots);
     res.json(slots);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch slots', error: error.message });
@@ -360,6 +414,7 @@ exports.deleteSlot = async (req, res) => {
     if (slot.isBooked) return res.status(400).json({ message: 'Cannot delete a booked slot' });
 
     await prisma.mentoringSlot.delete({ where: { id } });
+    clearMentoringCaches({ mentorId: req.user.id });
     res.json({ message: 'Slot deleted' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to delete slot', error: error.message });

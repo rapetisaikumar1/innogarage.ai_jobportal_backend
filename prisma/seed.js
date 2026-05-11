@@ -42,7 +42,7 @@ async function main() {
     },
     {
       title: 'LinkedIn Profile Optimization',
-      description: 'How to optimize your LinkedIn profile for job hunting',
+      description: 'How to optimize your LinkedIn profile for professional networking',
       type: 'document',
       content: 'Your LinkedIn profile is your digital resume. Learn how to optimize it...',
       category: 'Career Development',

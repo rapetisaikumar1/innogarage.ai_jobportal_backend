@@ -177,7 +177,7 @@ exports.getMyGroups = async (req, res) => {
         group: {
           include: {
             student: { select: { id: true, fullName: true, email: true, avatarUrl: true } },
-            members: { include: { user: { select: { id: true, fullName: true, role: true, avatarUrl: true, department: true } } } },
+            members: { include: { user: { select: { id: true, fullName: true, role: true, avatarUrl: true } } } },
           },
         },
       },
@@ -223,7 +223,7 @@ exports.getGroupMessages = async (req, res) => {
     const messages = await prisma.groupMessage.findMany({
       where: { groupId },
       include: {
-        sender: { select: { id: true, fullName: true, avatarUrl: true, role: true, department: true } },
+        sender: { select: { id: true, fullName: true, avatarUrl: true, role: true } },
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -256,7 +256,7 @@ exports.sendGroupMessage = async (req, res) => {
     const msg = await prisma.groupMessage.create({
       data: { groupId, senderId, message },
       include: {
-        sender: { select: { id: true, fullName: true, avatarUrl: true, role: true, department: true } },
+        sender: { select: { id: true, fullName: true, avatarUrl: true, role: true } },
       },
     });
 
@@ -332,7 +332,7 @@ exports.getGroupMembers = async (req, res) => {
     const members = await prisma.chatGroupMember.findMany({
       where: { groupId },
       include: {
-        user: { select: { id: true, fullName: true, email: true, avatarUrl: true, role: true, department: true } },
+        user: { select: { id: true, fullName: true, email: true, avatarUrl: true, role: true } },
       },
     });
 

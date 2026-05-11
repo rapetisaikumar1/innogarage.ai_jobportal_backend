@@ -605,7 +605,6 @@ exports.completeProfile = async (req, res) => {
         },
         select: {
           id: true,
-          department: true,
           createdAt: true,
           _count: {
             select: { assignedStudents: true },
@@ -614,19 +613,15 @@ exports.completeProfile = async (req, res) => {
       });
 
       if (mentors.length > 0) {
-        const mentorPool = mentors.some(m => m.department === 'MARKETING')
-          ? mentors.filter(m => m.department === 'MARKETING')
-          : mentors;
-
         // Sort by student count (ascending), then by createdAt (ascending)
-        mentorPool.sort((a, b) => {
+        mentors.sort((a, b) => {
           const countDiff = a._count.assignedStudents - b._count.assignedStudents;
           if (countDiff !== 0) return countDiff;
           return new Date(a.createdAt) - new Date(b.createdAt);
         });
 
         // Select the mentor with the least load
-        const selectedMentor = mentorPool[0];
+        const selectedMentor = mentors[0];
 
         // Assign the mentor to the student
         user = await prisma.user.update({
@@ -653,8 +648,8 @@ exports.completeProfile = async (req, res) => {
 
         await prisma.studentAdminAssignment.upsert({
           where: { studentId_adminId: { studentId: userId, adminId: selectedMentor.id } },
-          update: { department: selectedMentor.department || null },
-          create: { studentId: userId, adminId: selectedMentor.id, department: selectedMentor.department || null },
+          update: {},
+          create: { studentId: userId, adminId: selectedMentor.id },
         });
 
         console.log(`Auto-assigned mentor ${selectedMentor.id} to student ${userId} (mentor load: ${selectedMentor._count.assignedStudents} students)`);

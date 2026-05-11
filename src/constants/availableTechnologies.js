@@ -1,0 +1,57 @@
+const AVAILABLE_TECHNOLOGY_CATEGORIES = [
+  'Marketing Automation & Adobe Stack',
+  'Data & Analytics / CDP',
+  'Core Engineering & Development',
+  'Automation, Testing & Validation',
+  'Infrastructure & Operations',
+  'Enterprise Tools & Business Systems',
+  'Semiconductor & Hardware',
+  'Misc / Other',
+];
+
+const DEFAULT_AVAILABLE_TECHNOLOGIES = [
+  { name: 'AEP', category: 'Marketing Automation & Adobe Stack', sortOrder: 1 },
+  { name: 'AJO', category: 'Marketing Automation & Adobe Stack', sortOrder: 2 },
+  { name: 'Adobe Analytics', category: 'Marketing Automation & Adobe Stack', sortOrder: 3 },
+  { name: 'Adobe Campaign', category: 'Marketing Automation & Adobe Stack', sortOrder: 4 },
+  { name: 'Adobe Marketo', category: 'Marketing Automation & Adobe Stack', sortOrder: 5 },
+  { name: 'CRM', category: 'Marketing Automation & Adobe Stack', sortOrder: 6 },
+  { name: 'SFMC', category: 'Marketing Automation & Adobe Stack', sortOrder: 7 },
+  { name: 'Veeva CRM', category: 'Marketing Automation & Adobe Stack', sortOrder: 8 },
+  { name: 'AI', category: 'Data & Analytics / CDP', sortOrder: 1 },
+  { name: 'CDM', category: 'Data & Analytics / CDP', sortOrder: 2 },
+  { name: 'DG', category: 'Data & Analytics / CDP', sortOrder: 3 },
+  { name: 'EDI', category: 'Data & Analytics / CDP', sortOrder: 4 },
+  { name: 'EHR', category: 'Data & Analytics / CDP', sortOrder: 5 },
+  { name: 'KDB Developer', category: 'Data & Analytics / CDP', sortOrder: 6 },
+  { name: 'Palantir', category: 'Data & Analytics / CDP', sortOrder: 7 },
+  { name: 'CyberArk', category: 'Core Engineering & Development', sortOrder: 1 },
+  { name: 'Electrical Design Engineer', category: 'Core Engineering & Development', sortOrder: 2 },
+  { name: 'Electronics Engineer', category: 'Core Engineering & Development', sortOrder: 3 },
+  { name: 'Embedded Systems', category: 'Core Engineering & Development', sortOrder: 4 },
+  { name: 'Field Application Engineer', category: 'Core Engineering & Development', sortOrder: 5 },
+  { name: 'Frontend Engineer (FE)', category: 'Core Engineering & Development', sortOrder: 6 },
+  { name: 'AWF', category: 'Automation, Testing & Validation', sortOrder: 1 },
+  { name: 'Automation Engineer', category: 'Automation, Testing & Validation', sortOrder: 2 },
+  { name: 'CSV', category: 'Automation, Testing & Validation', sortOrder: 3 },
+  { name: 'Validation', category: 'Automation, Testing & Validation', sortOrder: 4 },
+  { name: 'BC', category: 'Infrastructure & Operations', sortOrder: 1 },
+  { name: 'Data Centre (DC)', category: 'Infrastructure & Operations', sortOrder: 2 },
+  { name: 'ED / EDE', category: 'Infrastructure & Operations', sortOrder: 3 },
+  { name: 'Network Engineer', category: 'Infrastructure & Operations', sortOrder: 4 },
+  { name: 'F&O', category: 'Enterprise Tools & Business Systems', sortOrder: 1 },
+  { name: 'FinOps Analyst', category: 'Enterprise Tools & Business Systems', sortOrder: 2 },
+  { name: 'Smartsheet', category: 'Enterprise Tools & Business Systems', sortOrder: 3 },
+  { name: 'UKG', category: 'Enterprise Tools & Business Systems', sortOrder: 4 },
+  { name: 'VLSI', category: 'Semiconductor & Hardware', sortOrder: 1 },
+  { name: 'AC', category: 'Misc / Other', sortOrder: 1 },
+  { name: 'BFS', category: 'Misc / Other', sortOrder: 2 },
+];
+
+const normalizeTechnologyName = (value = '') => value.trim().replace(/\s+/g, ' ').toLowerCase();
+
+module.exports = {
+  AVAILABLE_TECHNOLOGY_CATEGORIES,
+  DEFAULT_AVAILABLE_TECHNOLOGIES,
+  normalizeTechnologyName,
+};

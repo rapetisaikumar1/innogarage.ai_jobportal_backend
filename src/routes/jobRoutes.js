@@ -1,37 +1,62 @@
-const express = require('express');
-const router = express.Router();
-const jobController = require('../controllers/jobController');
-const { authenticate, authorize } = require('../middleware/auth');
+/**
+ * jobRoutes.js
+ *
+ * All routes are mounted under /api/jobs
+ */
 
-router.get('/', authenticate, jobController.getJobs);
-router.get('/matched', authenticate, jobController.getSavedJobs);
-router.get('/external-applied-status', authenticate, jobController.getSheetAppliedStatus);
-router.get('/sheet', authenticate, jobController.getGoogleSheetJobs);
-router.get('/sheet/applied-status', authenticate, jobController.getSheetAppliedStatus);
-router.post('/cache/clear', authenticate, jobController.clearJobCaches);
-router.get('/usage', authenticate, jobController.getUsage);
-router.get('/saved-jobs', authenticate, jobController.getSavedJobs);
-router.post('/external/mark-applied', authenticate, authorize('STUDENT'), jobController.markSheetJobApplied);
-router.post('/sheet/mark-applied', authenticate, authorize('STUDENT'), jobController.markSheetJobApplied);
-router.post('/search', authenticate, authorize('STUDENT'), jobController.triggerJobSearch);
-router.get('/search/stream', authenticate, authorize('STUDENT'), jobController.streamJobSearch);
-router.post('/auto-apply-all', authenticate, authorize('STUDENT'), jobController.autoApplyAllSheetJobs);
-router.post('/auto-apply', authenticate, authorize('STUDENT'), jobController.autoApplyToJob);
-router.post('/analyze-jd', authenticate, authorize('STUDENT'), jobController.analyzeJobDescription);
-router.post('/match-score', authenticate, authorize('STUDENT'), jobController.calculateResumeMatchScore);
-router.post('/generate-resume', authenticate, authorize('STUDENT'), jobController.generateSavedJobResume);
-router.post('/export-pdf', authenticate, authorize('STUDENT'), jobController.exportPdfInstructions);
-router.post('/resume/generate', authenticate, authorize('STUDENT'), jobController.generateSavedJobResume);
-router.post('/resume/save', authenticate, authorize('STUDENT'), jobController.saveGeneratedResumeText);
-router.get('/stats', authenticate, jobController.getDashboardStats);
-router.get('/applications/mine', authenticate, jobController.getMyApplications);
-router.get('/applications/all', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getAllApplications);
-router.patch('/applications/:id/status', authenticate, jobController.updateApplicationStatus);
-router.post('/scrape', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.scrapeJobs);
-router.post('/sample', authenticate, authorize('SUPER_ADMIN'), jobController.addSampleJobs);
-router.post('/easy-apply-all', authenticate, authorize('STUDENT'), jobController.easyApplyAll);
-router.get('/:id', authenticate, jobController.getJob);
-router.post('/:jobId/apply', authenticate, authorize('STUDENT'), jobController.applyForJob);
-router.get('/:jobId/tailored-resume', authenticate, jobController.getTailoredResume);
+const express    = require('express');
+const router     = express.Router();
+const { authenticate, authorize } = require('../middleware/auth');
+const ctrl = require('../controllers/jobController');
+
+// ── Student routes (any authenticated user) ───────────────────────────────────
+
+// Live job search — SSE stream
+router.get('/search/stream', authenticate, ctrl.streamJobSearch);
+
+// Saved matched jobs
+router.get('/matched', authenticate, ctrl.getMatchedJobs);
+
+// Dashboard stats
+router.get('/stats', authenticate, ctrl.getStats);
+
+// Daily search usage
+router.get('/usage', authenticate, ctrl.getUsage);
+
+// Mark a job as externally applied (self-apply)
+router.post('/external/mark-applied', authenticate, ctrl.markExternalApplied);
+
+// External applied list
+router.get('/external-applied-status', authenticate, ctrl.getExternalAppliedStatus);
+
+// On-demand JD vs resume match score
+router.post('/match-score', authenticate, ctrl.getMatchScore);
+
+// ATS-optimised resume generation
+router.post('/resume/generate', authenticate, ctrl.generateResume);
+
+// Save edited ATS resume
+router.post('/resume/save', authenticate, ctrl.saveResume);
+
+// Student's own formal applications
+router.get('/applications/mine', authenticate, ctrl.getMyApplications);
+
+// ── Admin-only routes ─────────────────────────────────────────────────────────
+
+// All applications (admin view)
+router.get(
+  '/applications/all',
+  authenticate,
+  authorize('ADMIN', 'SUPERADMIN'),
+  ctrl.getAllApplications,
+);
+
+// Update application status (admin)
+router.patch(
+  '/applications/:id/status',
+  authenticate,
+  authorize('ADMIN', 'SUPERADMIN'),
+  ctrl.updateApplicationStatus,
+);
 
 module.exports = router;

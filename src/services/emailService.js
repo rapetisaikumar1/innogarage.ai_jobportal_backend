@@ -1,5 +1,4 @@
 const nodemailer = require('nodemailer');
-const { google } = require('googleapis');
 const config = require('../config');
 
 let transporter = null;

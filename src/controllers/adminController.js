@@ -1,113 +1,10 @@
 const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const aiService = require('../services/aiService');
 const {
   AVAILABLE_TECHNOLOGY_CATEGORIES,
   normalizeTechnologyName,
 } = require('../constants/availableTechnologies');
-const {
-  _calculateResumeIntelligence,
-  _getParsedResumeTextForUser,
-  _getPlanUsageForUser,
-  _invalidateDashboardStatsCache,
-  _invalidateMatchedJobsCache,
-  _runProfileJobSearch,
-  _saveOneJobForUser,
-} = require('./jobController');
-
-const parseJsonField = (value, fallback = []) => {
-  if (value == null) return fallback;
-  if (Array.isArray(value) || typeof value === 'object') return value;
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-};
-
-const mapSavedJobToListing = (job, student = {}) => ({
-  id: job.id,
-  candidate_id: student.id || job.userId || '',
-  candidate_email: student.email || '',
-  candidate_name: student.fullName || '',
-  employer_name: job.employerName || '',
-  job_title: job.jobTitle || '',
-  job_city: job.jobCity || '',
-  job_state: job.jobState || '',
-  job_country: job.jobCountry || '',
-  job_employment_type: job.employmentType || '',
-  match_score: job.matchScore || 0,
-  job_apply_link: job.applyLink || '',
-  employer_logo: job.employerLogo || '',
-  source: job.source || '',
-  posted: job.postedAt || '',
-  timestamp: job.createdAt,
-  match_summary: job.matchSummary || '',
-  strong_matches: JSON.stringify(job.strongMatches || []),
-  partial_matches: '[]',
-  missing_skills: JSON.stringify(job.missingSkills || []),
-  pdf_link: '',
-  jd: job.jd || '',
-  // Include persisted resume text so the portal shows "Resume" instead of "Gen Resume"
-  resume_text: job.resumeText || '',
-});
-
-const saveSearchResultsForStudent = async (studentId, results) => {
-  const seenLinks = new Set();
-  const topResults = (results || [])
-    .filter((job) => job.job_apply_link && job.job_apply_link.startsWith('http'))
-    .filter((job) => {
-      const key = job.job_apply_link.toLowerCase();
-      if (seenLinks.has(key)) return false;
-      seenLinks.add(key);
-      return true;
-    })
-    .sort((a, b) => (parseInt(b.match_score, 10) || 0) - (parseInt(a.match_score, 10) || 0))
-    .slice(0, 30);
-
-  const saved = [];
-
-  for (const result of topResults) {
-    const data = {
-      userId: studentId,
-      employerName: result.employer_name || null,
-      jobTitle: result.job_title || null,
-      jobCity: result.job_city || null,
-      jobState: result.job_state || null,
-      jobCountry: result.job_country || null,
-      employmentType: result.job_employment_type || null,
-      applyLink: result.job_apply_link || null,
-      employerLogo: result.employer_logo || null,
-      source: result.source || result.job_publisher || null,
-      postedAt: result.posted || result.timestamp || null,
-      jd: result.jd || null,
-      matchScore: parseInt(result.match_score, 10) || 0,
-      strongMatches: parseJsonField(result.strong_matches),
-      missingSkills: parseJsonField(result.missing_skills),
-      matchSummary: result.match_summary || null,
-      resumeText: null,
-    };
-
-    const existing = await prisma.savedJobResult.findFirst({
-      where: { userId: studentId, applyLink: data.applyLink },
-      select: { id: true, resumeText: true },
-    });
-
-    if (existing?.resumeText) {
-      data.resumeText = existing.resumeText;
-    }
-
-    const savedJob = existing
-      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data })
-      : await prisma.savedJobResult.create({ data });
-
-    saved.push(savedJob);
-  }
-
-  return saved;
-};
 
 const AVAILABLE_TECH_CATEGORY_ORDER = new Map(
   AVAILABLE_TECHNOLOGY_CATEGORIES.map((category, index) => [category, index])
@@ -479,7 +376,7 @@ exports.getStudents = async (req, res) => {
               },
               createdAt: true,
               _count: {
-                select: { jobApplications: true, bookings: true, sheetApplications: true },
+                select: { bookings: true },
               },
             },
         orderBy: { createdAt: 'desc' },
@@ -540,15 +437,8 @@ exports.getStudentDetail = async (req, res) => {
         },
         createdAt: true,
         updatedAt: true,
-        jobApplications: {
-          include: { job: { select: { id: true, title: true, company: true, location: true, source: true } } },
-          orderBy: { appliedAt: 'desc' },
-        },
         bookings: {
           include: { slot: { include: { mentor: { select: { id: true, fullName: true, email: true } } } } },
-          orderBy: { createdAt: 'desc' },
-        },
-        sheetApplications: {
           orderBy: { createdAt: 'desc' },
         },
         trainingNotes: {
@@ -557,7 +447,7 @@ exports.getStudentDetail = async (req, res) => {
           take: 10,
         },
         _count: {
-          select: { jobApplications: true, bookings: true, sheetApplications: true, trainingNotes: true, tailoredResumes: true },
+          select: { bookings: true, trainingNotes: true },
         },
       },
     });
@@ -718,10 +608,6 @@ exports.getStudentByRegNumber = async (req, res) => {
           select: { id: true, fullName: true, email: true },
         },
         createdAt: true,
-        jobApplications: {
-          include: { job: true },
-          orderBy: { appliedAt: 'desc' },
-        },
       },
     });
 
@@ -970,10 +856,6 @@ exports.getAnalytics = async (req, res) => {
     const [
       totalStudents,
       totalAdmins,
-      totalInternalJobs,
-      totalMatchedJobs,
-      totalInternalApplications,
-      totalSheetApplications,
       activeStudents,
       totalBookings,
       studentsWithoutMentor,
@@ -982,10 +864,6 @@ exports.getAnalytics = async (req, res) => {
     ] = await Promise.all([
       prisma.user.count({ where: { role: 'STUDENT' } }),
       prisma.user.count({ where: { role: 'ADMIN' } }),
-      prisma.job.count({ where: { isActive: true } }),
-      prisma.savedJobResult.count(),
-      prisma.jobApplication.count(),
-      prisma.sheetJobApplication.count(),
       prisma.user.count({ where: { role: 'STUDENT', isActive: true } }),
       prisma.mentorBooking.count(),
       prisma.user.count({ where: { role: 'STUDENT', assignedMentorId: null, adminAssignments: { none: {} } } }),
@@ -993,22 +871,7 @@ exports.getAnalytics = async (req, res) => {
       prisma.trainingMaterial.count(),
     ]);
 
-    // Parallel: recent apps, combined status breakdown, technology breakdown
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const [recentApplications, internalApplicationsByStatus, sheetApplicationsByStatus, studentsWithRole, recentStudents] = await Promise.all([
-      prisma.jobApplication.groupBy({
-        by: ['appliedAt'],
-        where: { appliedAt: { gte: sevenDaysAgo } },
-        _count: { _all: true },
-      }),
-      prisma.jobApplication.groupBy({
-        by: ['status'],
-        _count: { _all: true },
-      }),
-      prisma.sheetJobApplication.groupBy({
-        by: ['status'],
-        _count: { _all: true },
-      }),
+    const [studentsWithRole, recentStudents] = await Promise.all([
       prisma.user.findMany({
         where: { role: 'STUDENT', jobRole: { not: null } },
         select: { jobRole: true },
@@ -1029,16 +892,6 @@ exports.getAnalytics = async (req, res) => {
       }),
     ]);
 
-    // Application status breakdown
-    const statusBreakdown = {};
-    const addStatusCount = (status, count) => {
-      if (!status) return;
-      statusBreakdown[status] = (statusBreakdown[status] || 0) + (count || 0);
-    };
-    internalApplicationsByStatus.forEach(item => addStatusCount(item.status, item._count?._all || 0));
-    sheetApplicationsByStatus.forEach(item => addStatusCount(item.status, item._count?._all || 0));
-
-    // Technology/Role-wise candidate breakdown
     const technologyBreakdown = {};
     studentsWithRole.forEach(s => {
       const role = (s.jobRole || '').trim();
@@ -1047,33 +900,16 @@ exports.getAnalytics = async (req, res) => {
       }
     });
 
-    const totalJobs = totalInternalJobs + totalMatchedJobs;
-    const totalApplications = totalInternalApplications + totalSheetApplications;
-    const interviewsScheduled = statusBreakdown.INTERVIEW_SCHEDULED || 0;
-    const offersReceived = statusBreakdown.OFFER_RECEIVED || 0;
-    const rejectedApplications = statusBreakdown.REJECTED || 0;
-
     const payload = {
       totalStudents,
       totalAdmins,
       totalMentors: totalAdmins,
-      totalJobs,
-      totalInternalJobs,
-      totalMatchedJobs,
-      totalApplications,
-      totalInternalApplications,
-      totalSheetApplications,
       activeStudents,
-      interviewsScheduled,
-      offersReceived,
       totalBookings,
-      rejectedApplications,
       studentsWithoutMentor,
       completedBookings,
       totalMaterials,
-      recentApplications,
       recentStudents,
-      applicationsByStatus: statusBreakdown,
       technologyBreakdown,
     };
 
@@ -1110,9 +946,6 @@ exports.getAssignedStudents = async (req, res) => {
         isActive: true,
         status: true,
         createdAt: true,
-        _count: {
-          select: { jobApplications: true, sheetApplications: true },
-        },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -1120,363 +953,6 @@ exports.getAssignedStudents = async (req, res) => {
     res.json(students);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch students', error: error.message });
-  }
-};
-
-// Get student application progress (Mentor)
-exports.getStudentProgress = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        assignedMentorId: true,
-      },
-    });
-
-    if (!student) {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    // Only allow assigned mentor/admin or super admin
-    if (req.user.role === 'ADMIN') {
-      const isAssigned = await prisma.studentAdminAssignment.findUnique({
-        where: { studentId_adminId: { studentId, adminId: req.user.id } },
-      });
-      if (!isAssigned && student.assignedMentorId !== req.user.id) {
-        return res.status(403).json({ message: 'Not authorized to view this student' });
-      }
-    }
-
-    const applications = await prisma.jobApplication.findMany({
-      where: { userId: studentId },
-      include: { job: true },
-      orderBy: { appliedAt: 'desc' },
-    });
-
-    const stats = {
-      total: applications.length,
-      applied: applications.filter(a => a.status === 'APPLIED').length,
-      interviewScheduled: applications.filter(a => a.status === 'INTERVIEW_SCHEDULED').length,
-      rejected: applications.filter(a => a.status === 'REJECTED').length,
-      offerReceived: applications.filter(a => a.status === 'OFFER_RECEIVED').length,
-    };
-
-    res.json({ student, applications, stats });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch progress', error: error.message });
-  }
-};
-
-// ---- Admin View Student Endpoints ----
-
-// Get student dashboard data (stats + recent apps + recent jobs)
-exports.getStudentDashboardData = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: { id: true, fullName: true, email: true, role: true },
-    });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const [totalApplied, interviewScheduled, rejected, offerReceived, totalMatchedJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
-      prisma.jobApplication.count({ where: { userId: studentId, status: 'APPLIED' } }),
-      prisma.jobApplication.count({ where: { userId: studentId, status: 'INTERVIEW_SCHEDULED' } }),
-      prisma.jobApplication.count({ where: { userId: studentId, status: 'REJECTED' } }),
-      prisma.jobApplication.count({ where: { userId: studentId, status: 'OFFER_RECEIVED' } }),
-      // Count the student's visible AI-matched jobs, not the internal Job table
-      prisma.savedJobResult.count({ where: { userId: studentId, matchScore: { gte: 60 } } }),
-      prisma.jobApplication.count({ where: { userId: studentId, appliedById: { not: null } } }),
-      prisma.sheetJobApplication.count({ where: { userId: studentId, appliedById: { not: null } } }),
-      prisma.sheetJobApplication.count({ where: { userId: studentId } }),
-    ]);
-
-    const allDbApplied = totalApplied + interviewScheduled + rejected + offerReceived;
-    const adminApplyCount = dbAdminApplied + sheetAdminApplied;
-    const candidateApplyCount = (allDbApplied - dbAdminApplied) + (sheetTotalApplied - sheetAdminApplied);
-
-    const recentApplications = await prisma.jobApplication.findMany({
-      where: { userId: studentId },
-      include: {
-        job: true,
-        user: { select: { id: true, fullName: true, email: true } },
-      },
-      orderBy: { appliedAt: 'desc' },
-      take: 5,
-    });
-
-    const sheetApplications = await prisma.sheetJobApplication.findMany({
-      where: { userId: studentId },
-      select: { jobLink: true, status: true, appliedMethod: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-    }).catch(() => []);
-
-    res.json({
-      stats: {
-        totalJobs: totalMatchedJobs,
-        totalSheetJobs: totalMatchedJobs,
-        totalApplied: allDbApplied,
-        interviewScheduled,
-        rejected,
-        offerReceived,
-        sheetAppliedCount: sheetTotalApplied,
-        adminApplyCount,
-        candidateApplyCount,
-      },
-      recentApplications,
-      sheetApplications,
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch student dashboard data', error: error.message });
-  }
-};
-
-// Get student applications (DB + sheet)
-exports.getStudentApplications = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const { status, page = 1, limit = 50 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: { id: true, fullName: true, role: true },
-    });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const where = { userId: studentId };
-    if (status) where.status = status;
-
-    const [applications, total] = await Promise.all([
-      prisma.jobApplication.findMany({
-        where,
-        include: {
-          appliedBy: { select: { id: true, role: true, fullName: true } },
-          job: true,
-          user: { select: { id: true, fullName: true, email: true, phone: true, avatarUrl: true } },
-        },
-        orderBy: { appliedAt: 'desc' },
-        skip,
-        take: parseInt(limit),
-      }),
-      prisma.jobApplication.count({ where }),
-    ]);
-
-    const sheetApplications = await prisma.sheetJobApplication.findMany({
-      where: { userId: studentId },
-      select: { jobLink: true, status: true, appliedMethod: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-    }).catch(() => []);
-
-    res.json({
-      applications,
-      sheetApplications,
-      pagination: { page: parseInt(page), limit: parseInt(limit), total, totalPages: Math.ceil(total / parseInt(limit)) },
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch student applications', error: error.message });
-  }
-};
-
-// Get a student's saved matched jobs.
-exports.getStudentMatchedJobs = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
-    const skip = (page - 1) * limit;
-    const MIN_MATCH_SCORE = 60;
-
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: { id: true, email: true, fullName: true, role: true },
-    });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const allJobs = await prisma.savedJobResult.findMany({
-      where: { userId: studentId, matchScore: { gte: MIN_MATCH_SCORE } },
-      orderBy: [{ createdAt: 'desc' }],
-      take: 200,
-    });
-
-    const seenJobKeys = new Set();
-    const deduped = [];
-    for (const job of allJobs) {
-      const key = [job.employerName, job.jobTitle, job.jobCountry]
-        .map((value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim())
-        .join('|') || job.applyLink || job.id;
-      if (seenJobKeys.has(key)) continue;
-      seenJobKeys.add(key);
-      deduped.push(job);
-    }
-
-    const jobs = deduped.slice(skip, skip + limit);
-
-    res.json({
-      jobs: jobs.map((job) => mapSavedJobToListing(job, student)),
-      total: deduped.length,
-      page,
-      limit,
-      minScore: MIN_MATCH_SCORE,
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch student job listings', error: error.message });
-  }
-};
-
-exports.getStudentJobUsage = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: {
-        id: true,
-        role: true,
-        email: true,
-        subscriptionPlan: true,
-        stripeSessionId: true,
-        jobSearchCount: true,
-        lastSearchReset: true,
-      },
-    });
-
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    res.json(await _getPlanUsageForUser(student));
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to get student usage', error: error.message });
-  }
-};
-
-exports.streamStudentJobSearch = async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  const send = (obj) => {
-    if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`);
-  };
-
-  const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write(':heartbeat\n\n');
-  }, 20000);
-
-  const finish = () => {
-    clearInterval(heartbeat);
-    if (!res.writableEnded) res.end();
-  };
-
-  try {
-    const { studentId } = req.params;
-
-    _invalidateDashboardStatsCache(studentId);
-    _invalidateMatchedJobsCache(studentId);
-
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: {
-        id: true,
-        role: true,
-        fullName: true,
-        email: true,
-        keySkills: true,
-        resumeUrl: true,
-        parsedResumeText: true,
-        jobRole: true,
-        location: true,
-        experience: true,
-        education: true,
-        subscriptionPlan: true,
-        stripeSessionId: true,
-        jobSearchCount: true,
-        lastSearchReset: true,
-      },
-    });
-
-    if (!student || student.role !== 'STUDENT') {
-      send({ type: 'error', message: 'Student not found' });
-      return finish();
-    }
-
-    const usage = await _getPlanUsageForUser(student);
-    if (usage.used >= usage.max) {
-      send({
-        type: 'error',
-        message: `You've reached your ${usage.label} plan limit of ${usage.max} searches today. Upgrade for more!`,
-        limitReached: true,
-      });
-      return finish();
-    }
-
-    const days = Math.min(30, Math.max(1, parseInt(req.query.days, 10) || 1));
-    send({ type: 'status', message: 'Starting job search based on your profile…' });
-
-    let savedCount = 0;
-    const seenLinks = new Set();
-
-    const onJobFound = async (job) => {
-      const linkKey = (job.job_apply_link || '').toLowerCase();
-      if (linkKey && seenLinks.has(linkKey)) return;
-      if (linkKey) seenLinks.add(linkKey);
-
-      const dbRecord = await _saveOneJobForUser(student.id, job);
-      savedCount += dbRecord ? 1 : 0;
-
-      const jobWithId = dbRecord
-        ? { ...job, id: dbRecord.id, saved_at: dbRecord.createdAt }
-        : job;
-
-      send({ type: 'job', job: jobWithId });
-      _invalidateMatchedJobsCache(student.id);
-    };
-
-    const emittedJobs = await _runProfileJobSearch(student, days, {
-      onJobFound,
-      onStatus: (message) => send({ type: 'status', message }),
-    });
-
-    try {
-      await prisma.user.update({
-        where: { id: student.id },
-        data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
-      });
-    } catch (error) {
-      console.error('streamStudentJobSearch count increment error:', error.message);
-    }
-
-    _invalidateDashboardStatsCache(student.id);
-    _invalidateMatchedJobsCache(student.id);
-
-    send({
-      type: 'done',
-      count: savedCount,
-      message: savedCount > 0
-        ? `Found ${savedCount} matching job${savedCount === 1 ? '' : 's'} for your profile!`
-        : emittedJobs.length > 0
-          ? 'Jobs found but could not be saved. Please refresh.'
-          : 'No matching jobs found for your profile and time window.',
-    });
-  } catch (error) {
-    console.error('streamStudentJobSearch error:', error.message || error);
-    send({ type: 'error', message: error.message || 'Job search failed. Please try again.' });
-  } finally {
-    finish();
   }
 };
 
@@ -1519,240 +995,6 @@ exports.unassignAdmin = async (req, res) => {
   }
 };
 
-// ---- Admin Apply on Behalf of Student ----
-
-// Trigger code-based job search on behalf of a student.
-exports.triggerStudentJobSearch = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: {
-        id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, parsedResumeText: true, jobRole: true, location: true, role: true, experience: true, education: true,
-        subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
-      },
-    });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
-  const results = await _runProfileJobSearch(student, days);
-    const savedJobs = await saveSearchResultsForStudent(studentId, results);
-
-    // Bust the matched-jobs cache so the student sees fresh results immediately
-    try { _invalidateMatchedJobsCache(student.id); } catch { /* ignore */ }
-
-    res.json({
-      message: savedJobs.length > 0
-        ? `Found ${savedJobs.length} matching jobs for ${student.fullName}.`
-        : 'No 60%+ matches were found for this profile in that time window.',
-      jobs: savedJobs.map((job) => mapSavedJobToListing(job, student)),
-      mode: 'profile',
-    });
-  } catch (error) {
-    console.error('Admin trigger job search error:', error.message);
-    res.status(500).json({ message: 'Failed to trigger job search', error: error.message });
-  }
-};
-
-exports.calculateStudentResumeMatchScore = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const student = await prisma.user.findUnique({ where: { id: studentId }, select: { id: true, role: true } });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const jd = req.body?.jd || '';
-    const resumeText = req.body?.resume_text || '';
-    const userSkills = Array.isArray(req.body?.skills) ? req.body.skills : [];
-
-    if (!jd || !resumeText) {
-      return res.status(400).json({ message: 'Job description and resume text are required.' });
-    }
-
-    res.json(_calculateResumeIntelligence({ jd, resumeText, userSkills, existingScore: req.body?.match_score }));
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to calculate resume match score', error: error.message || String(error) });
-  }
-};
-
-exports.saveStudentGeneratedResumeText = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: { id: true, role: true, fullName: true, email: true },
-    });
-
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const { id, job_apply_link, resume_text } = req.body || {};
-    if (!resume_text || resume_text.trim().length < 800) {
-      return res.status(400).json({ message: 'Resume text is too short to save.' });
-    }
-
-    const where = id
-      ? { id, userId: studentId }
-      : { userId: studentId, applyLink: job_apply_link || undefined };
-
-    const existing = await prisma.savedJobResult.findFirst({ where });
-    if (!existing) {
-      return res.status(404).json({ message: 'Saved job was not found.' });
-    }
-
-    const savedJob = await prisma.savedJobResult.update({
-      where: { id: existing.id },
-      data: { resumeText: resume_text.trim() },
-    });
-
-    res.json({ message: 'Resume edits saved.', job: mapSavedJobToListing(savedJob, student) });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to save resume edits', error: error.message || String(error) });
-  }
-};
-
-// Apply for a DB job on behalf of a student
-exports.applyJobForStudent = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const { jobId } = req.body;
-
-    const student = await prisma.user.findUnique({ where: { id: studentId } });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const job = await prisma.job.findUnique({ where: { id: jobId } });
-    if (!job) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-
-    const existing = await prisma.jobApplication.findUnique({
-      where: { userId_jobId: { userId: studentId, jobId } },
-    });
-    if (existing) {
-      return res.status(409).json({ message: 'Student already applied for this job' });
-    }
-
-    const application = await prisma.jobApplication.create({
-      data: {
-        userId: studentId,
-        jobId,
-        status: 'APPLIED',
-        isAutoApplied: false,
-        appliedById: req.user.id,
-        resumeUsed: student.resumeUrl,
-        notes: `Applied by admin ${req.user.fullName} on behalf of student`,
-      },
-      include: { job: true },
-    });
-
-    // Notification for the student
-    await prisma.notification.create({
-      data: {
-        userId: studentId,
-        title: 'Job Application Update',
-        message: 'A job has been applied on your behalf',
-        type: 'JOB_APPLIED_BY_ADMIN',
-        link: '/dashboard/applications',
-      },
-    });
-
-    res.status(201).json({ message: 'Application submitted on behalf of student', application });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to apply for job', error: error.message });
-  }
-};
-
-// Mark an external saved job as applied on behalf of student
-// Update application status (interview/offer/rejection)
-exports.updateApplicationStatus = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const { applicationId, status, source } = req.body;
-
-    const validStatuses = ['APPLIED', 'INTERVIEW_SCHEDULED', 'REJECTED', 'OFFER_RECEIVED'];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ message: 'Invalid status' });
-    }
-
-    const student = await prisma.user.findUnique({ where: { id: studentId }, select: { id: true, role: true } });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    if (source === 'sheet') {
-      // Update external job application status
-      const app = await prisma.sheetJobApplication.findFirst({
-        where: { userId: studentId, jobLink: applicationId },
-      });
-      if (!app) return res.status(404).json({ message: 'Sheet application not found' });
-      const updated = await prisma.sheetJobApplication.update({
-        where: { id: app.id },
-        data: { status },
-      });
-      return res.json({ message: 'Status updated', application: updated });
-    } else {
-      // Update DB job application status
-      const app = await prisma.jobApplication.findFirst({
-        where: { id: applicationId, userId: studentId },
-      });
-      if (!app) return res.status(404).json({ message: 'Application not found' });
-      const updated = await prisma.jobApplication.update({
-        where: { id: applicationId },
-        data: { status },
-      });
-      return res.json({ message: 'Status updated', application: updated });
-    }
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to update status', error: error.message });
-  }
-};
-
-exports.markExternalJobAppliedForStudent = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const { jobLink, employerName, matchScore, jobTitle } = req.body;
-
-    if (!jobLink) return res.status(400).json({ message: 'jobLink is required' });
-
-    const student = await prisma.user.findUnique({ where: { id: studentId }, select: { id: true, role: true } });
-    if (!student || student.role !== 'STUDENT') {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const application = await prisma.sheetJobApplication.upsert({
-      where: { userId_jobLink: { userId: studentId, jobLink } },
-      update: { status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore: matchScore != null ? String(matchScore) : null, jobTitle },
-      create: { userId: studentId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', appliedById: req.user.id, employerName, matchScore: matchScore != null ? String(matchScore) : null, jobTitle },
-    });
-
-    res.json({ message: 'Marked as applied for student', application });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to mark applied', error: error.message });
-  }
-};
-
-// Get applied status for a student's external saved jobs
-exports.getStudentExternalAppliedStatus = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const applications = await prisma.sheetJobApplication.findMany({
-      where: { userId: studentId },
-      select: { jobLink: true, status: true, appliedMethod: true, appliedById: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-    });
-    res.json({ applications });
-  } catch (error) {
-    res.json({ applications: [] });
-  }
-};
-
 // Get all assigned admins for a student
 exports.getStudentAdmins = async (req, res) => {
   try {
@@ -1774,134 +1016,3 @@ exports.getStudentAdmins = async (req, res) => {
   }
 };
 
-// Generate a tailored ATS resume for a student (admin acting on behalf)
-exports.generateResumeForStudent = async (req, res) => {
-  try {
-    const { studentId } = req.params;
-    const { forceRegenerate, ...jobData } = req.body || {};
-
-    const student = await prisma.user.findUnique({
-      where: { id: studentId },
-      select: {
-        id: true, fullName: true, email: true, phone: true,
-        linkedinProfile: true, keySkills: true, jobRole: true,
-        location: true, education: true, experience: true,
-        resumeUrl: true, parsedResumeText: true,
-      },
-    });
-    if (!student || !['STUDENT'].includes((await prisma.user.findUnique({ where: { id: studentId }, select: { role: true } }))?.role)) {
-      return res.status(404).json({ message: 'Student not found' });
-    }
-
-    const jobApplyLink = jobData.job_apply_link;
-
-    const existing = jobApplyLink
-      ? await prisma.savedJobResult.findFirst({ where: { userId: studentId, applyLink: jobApplyLink } })
-      : null;
-
-    const isReusable = (text) => {
-      if (!text || text.length < 1200) return false;
-      return /PROFESSIONAL\s+SUMMARY/i.test(text) && /(?:PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE)/i.test(text);
-    };
-
-    if (existing && isReusable(existing.resumeText) && !forceRegenerate) {
-      const mapJob = (j) => ({
-        id: j.id,
-        job_apply_link: j.applyLink,
-        employer_name: j.employerName,
-        job_title: j.jobTitle,
-        job_city: j.jobCity,
-        job_state: j.jobState,
-        job_country: j.jobCountry,
-        job_employment_type: j.employmentType,
-        employer_logo: j.employerLogo,
-        source: j.source,
-        posted: j.postedAt,
-        jd: j.jd,
-        match_score: j.matchScore,
-        strong_matches: j.strongMatches,
-        missing_skills: j.missingSkills,
-        match_summary: j.matchSummary,
-        resume_text: j.resumeText,
-        candidate_name: student.fullName,
-      });
-      return res.json({ message: 'Existing ATS resume loaded.', job: mapJob(existing), provider: 'cached' });
-    }
-
-    const parsedResumeText = await _getParsedResumeTextForUser(student);
-
-    if (!parsedResumeText || parsedResumeText.length < 800) {
-      return res.status(400).json({ message: 'Student has no uploaded resume. Please ask them to upload their resume first.' });
-    }
-
-    const fullJobData = {
-      job_apply_link: jobApplyLink || existing?.applyLink || null,
-      employer_name: jobData.employer_name || existing?.employerName || '',
-      job_title: jobData.job_title || existing?.jobTitle || '',
-      job_city: jobData.job_city || existing?.jobCity || '',
-      job_state: jobData.job_state || existing?.jobState || '',
-      job_country: jobData.job_country || existing?.jobCountry || '',
-      job_employment_type: jobData.job_employment_type || existing?.employmentType || '',
-      jd: jobData.jd || existing?.jd || '',
-      match_score: parseInt(jobData.match_score, 10) || existing?.matchScore || 0,
-      strong_matches: jobData.strong_matches ?? existing?.strongMatches ?? [],
-      missing_skills: jobData.missing_skills ?? existing?.missingSkills ?? [],
-      match_summary: jobData.match_summary || existing?.matchSummary || '',
-    };
-
-    if (!fullJobData.jd) {
-      return res.status(400).json({ message: 'Job description is required to generate a resume.' });
-    }
-
-    const generatedResume = await aiService.generateATSResumeText({ ...student, parsedResumeText }, fullJobData);
-    const resumeText = typeof generatedResume === 'string' ? generatedResume : generatedResume?.text;
-    if (!resumeText || !resumeText.trim()) {
-      return res.status(500).json({ message: 'Failed to generate ATS resume.' });
-    }
-
-    const savedData = {
-      userId: studentId,
-      employerName: fullJobData.employer_name || null,
-      jobTitle: fullJobData.job_title || null,
-      jobCity: fullJobData.job_city || null,
-      jobState: fullJobData.job_state || null,
-      jobCountry: fullJobData.job_country || null,
-      applyLink: fullJobData.job_apply_link || null,
-      jd: fullJobData.jd || null,
-      matchScore: fullJobData.match_score || 0,
-      strongMatches: Array.isArray(fullJobData.strong_matches) ? JSON.stringify(fullJobData.strong_matches) : (fullJobData.strong_matches || null),
-      missingSkills: Array.isArray(fullJobData.missing_skills) ? JSON.stringify(fullJobData.missing_skills) : (fullJobData.missing_skills || null),
-      matchSummary: fullJobData.match_summary || null,
-      resumeText,
-    };
-
-    const savedJob = existing
-      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data: savedData })
-      : await prisma.savedJobResult.create({ data: savedData });
-
-    const mapJob = (j) => ({
-      id: j.id,
-      job_apply_link: j.applyLink,
-      employer_name: j.employerName,
-      job_title: j.jobTitle,
-      job_city: j.jobCity,
-      job_state: j.jobState,
-      job_country: j.jobCountry,
-      job_employment_type: j.employmentType,
-      employer_logo: j.employerLogo,
-      source: j.source,
-      posted: j.postedAt,
-      jd: j.jd,
-      match_score: j.matchScore,
-      strong_matches: j.strongMatches,
-      missing_skills: j.missingSkills,
-      match_summary: j.matchSummary,
-      resume_text: j.resumeText,
-      candidate_name: student.fullName,
-    });
-
-    res.json({ message: 'ATS resume generated successfully.', job: mapJob(savedJob) });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to generate resume', error: error.message });
-  }
-};

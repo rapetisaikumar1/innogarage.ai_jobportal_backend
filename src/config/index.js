@@ -1,8 +1,22 @@
 require('dotenv').config();
 
+const isRailway = Boolean(
+  process.env.RAILWAY_ENVIRONMENT_NAME ||
+  process.env.RAILWAY_PROJECT_ID ||
+  process.env.RAILWAY_SERVICE_ID ||
+  process.env.RAILWAY_PUBLIC_DOMAIN
+);
+
+const requestedNodeEnv = process.env.NODE_ENV;
+const nodeEnv = isRailway
+  ? (!requestedNodeEnv || requestedNodeEnv === 'development' ? 'production' : requestedNodeEnv)
+  : (requestedNodeEnv || 'development');
+
 module.exports = {
   port: process.env.PORT || 5000,
-  nodeEnv: process.env.NODE_ENV || 'development',
+  nodeEnv,
+  isRailway,
+  isProduction: nodeEnv === 'production',
   
   jwt: {
     secret: process.env.JWT_SECRET,

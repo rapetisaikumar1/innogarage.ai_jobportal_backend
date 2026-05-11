@@ -1,2075 +1,499 @@
-const prisma = require('../config/database');
-const resumeService = require('../services/resumeService');
-const aiService = require('../services/aiService');
-const { PDFParse } = require('pdf-parse');
-const axios = require('axios');
-
-const crypto = require('crypto');
-const dns = require('dns');
-const https = require('https');
-const config = require('../config');
-
-// Google Sheet config
-const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
-const GOOGLE_SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${GOOGLE_SHEET_ID}/export?format=csv&gid=0`;
-const GOOGLE_SHEET_CACHE_TTL_MS = 2 * 60 * 1000;
-const GOOGLE_SHEET_TIMEOUT_MS = 15000;
-const DASHBOARD_STATS_CACHE_TTL_MS = 30 * 1000;
-
-const googleSheetCache = {
-  jobs: [],
-  expiry: 0,
-  pendingPromise: null,
-};
-
-const dashboardStatsCache = new Map();
-const matchedJobsCache = new Map(); // userId -> { data, expiry }
-const MATCHED_JOBS_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-const invalidateGoogleSheetCache = () => {
-  googleSheetCache.jobs = [];
-  googleSheetCache.expiry = 0;
-  googleSheetCache.pendingPromise = null;
-};
-
-const invalidateDashboardStatsCache = (userId) => {
-  if (userId) {
-    dashboardStatsCache.delete(userId);
-    return;
-  }
-
-  dashboardStatsCache.clear();
-};
-
-const invalidateMatchedJobsCache = (userId) => {
-  if (userId) { matchedJobsCache.delete(userId); return; }
-  matchedJobsCache.clear();
-};
-
-const invalidateUserJobCaches = (userId) => {
-  invalidateGoogleSheetCache();
-  invalidateDashboardStatsCache(userId);
-  invalidateMatchedJobsCache(userId);
-};
-
-const parseJsonField = (value, fallback = []) => {
-  if (value == null) return fallback;
-  if (Array.isArray(value) || typeof value === 'object') return value;
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-};
-
-const RESUME_STOP_WORDS = new Set([
-  'about', 'above', 'across', 'after', 'again', 'against', 'also', 'among', 'and', 'any', 'are', 'as', 'at', 'be', 'been',
-  'being', 'but', 'by', 'can', 'company', 'could', 'day', 'description', 'do', 'does', 'during', 'each', 'for', 'from',
-  'has', 'have', 'having', 'here', 'how', 'in', 'into', 'is', 'it', 'its', 'job', 'more', 'must', 'not', 'of', 'on', 'or',
-  'our', 'position', 'required', 'requirements', 'role', 'should', 'team', 'than', 'that', 'the', 'their', 'this', 'to',
-  'use', 'using', 'we', 'will', 'with', 'work', 'you', 'your'
-]);
-
-const RESUME_SKILL_TERMS = [
-  'Adobe Experience Platform', 'AEP', 'Adobe Journey Optimizer', 'AJO', 'Real-Time CDP', 'RT-CDP', 'Customer Journey Analytics',
-  'CJA', 'Adobe Analytics', 'Adobe Target', 'Adobe Launch', 'Data Collection', 'Adobe Campaign', 'XDM', 'Identity Resolution',
-  'SQL', 'JavaScript', 'Python', 'React', 'Node.js', 'AWS', 'Azure', 'Git', 'Jenkins', 'Azure DevOps', 'Jira', 'Agile',
-  'REST API', 'APIs', 'Data Governance', 'GDPR', 'CCPA', 'Tag Management', 'ETL', 'CI/CD', 'Dashboarding', 'Tableau',
-  'A/B Testing', 'Segmentation', 'Attribution', 'Journey Orchestration', 'Marketing Automation', 'Stakeholder Management',
-  'Program Governance', 'Delivery Leadership', 'Risk Management', 'Quarterly Business Review', 'QBR'
-];
-
-const ACTION_VERBS = [
-  'Architected', 'Delivered', 'Optimized', 'Led', 'Implemented', 'Designed', 'Automated', 'Integrated', 'Analyzed', 'Improved',
-  'Accelerated', 'Standardized', 'Orchestrated', 'Resolved', 'Launched', 'Enhanced', 'Governed', 'Collaborated', 'Streamlined'
-];
-
-const normalizeResumeToken = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9+#.\s-]/g, ' ').replace(/\s+/g, ' ').trim();
-
-const extractResumeKeywords = (text, extraSkills = [], limit = 36) => {
-  const source = normalizeResumeToken(text);
-  const foundTerms = [];
-
-  for (const term of RESUME_SKILL_TERMS.concat(extraSkills || [])) {
-    const cleanTerm = String(term || '').trim();
-    if (!cleanTerm) continue;
-    const escaped = cleanTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (new RegExp(`\\b${escaped}\\b`, 'i').test(text || source)) foundTerms.push(cleanTerm);
-  }
-
-  const counts = new Map();
-  source.split(/\s+/).forEach((word) => {
-    if (!word || word.length < 3 || RESUME_STOP_WORDS.has(word) || /^\d+$/.test(word)) return;
-    counts.set(word, (counts.get(word) || 0) + 1);
-  });
-
-  const rankedWords = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([word]) => word.replace(/\b\w/g, (char) => char.toUpperCase()));
-
-  return [...new Set([...foundTerms, ...rankedWords])].slice(0, limit);
-};
-
-const calculateResumeIntelligence = ({ jd = '', resumeText = '', userSkills = [], existingScore = 0 }) => {
-  const jdKeywords = extractResumeKeywords(jd, userSkills, 42);
-  const resumeNormalized = normalizeResumeToken(resumeText);
-  const matchedKeywords = jdKeywords.filter((keyword) => resumeNormalized.includes(normalizeResumeToken(keyword)));
-  const missingKeywords = jdKeywords.filter((keyword) => !matchedKeywords.includes(keyword)).slice(0, 12);
-  const coverage = jdKeywords.length ? Math.round((matchedKeywords.length / jdKeywords.length) * 100) : 0;
-  const score = Math.max(parseInt(existingScore, 10) || 0, Math.min(98, Math.round((coverage * 0.7) + (matchedKeywords.length >= 12 ? 20 : matchedKeywords.length * 1.5))));
-
-  return {
-    score,
-    coverage,
-    jdKeywords,
-    matchedKeywords: matchedKeywords.slice(0, 18),
-    missingKeywords,
-    actionVerbs: ACTION_VERBS.slice(0, 10),
-    suggestions: [
-      missingKeywords.length ? `Naturally include ${missingKeywords.slice(0, 4).join(', ')} where they match real experience.` : 'Keyword coverage is strong for this JD.',
-      'Start experience bullets with direct action verbs and keep them impact-focused.',
-      'Keep the resume single-column with standard headings for ATS parsing.',
-      'Use the JD title in the resume header and align the summary to the selected role.',
-    ],
-  };
-};
-
-const isReusableGeneratedResume = (text) => {
-  if (!text || typeof text !== 'string') return false;
-  const clean = text.trim();
-  if (clean.length < 1200) return false;
-  // Skills section name varies by user's resume format — only require SUMMARY + EXPERIENCE
-  return /PROFESSIONAL\s+SUMMARY/i.test(clean)
-    && /(?:PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE)/i.test(clean);
-};
-
-const parseResumePdfBuffer = async (buffer) => {
-  const parser = new PDFParse({ data: buffer });
-  try {
-    const parsed = await parser.getText();
-    return (parsed.text || '').trim();
-  } finally {
-    await parser.destroy();
-  }
-};
-
-const getParsedResumeTextForUser = async (user) => {
-  const existingText = (user.parsedResumeText || '').trim();
-  if (existingText.length >= 800) return existingText;
-
-  if (!user.resumeUrl) return existingText;
-
-  try {
-    const response = await axios.get(user.resumeUrl, {
-      responseType: 'arraybuffer',
-      timeout: 20000,
-      maxContentLength: 15 * 1024 * 1024,
-    });
-    const parsedText = await parseResumePdfBuffer(Buffer.from(response.data));
-    if (parsedText.length >= 800) {
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { parsedResumeText: parsedText.substring(0, 20000) },
-      });
-      return parsedText.substring(0, 20000);
-    }
-  } catch (error) {
-    console.error('Uploaded resume parse error:', error.message || error);
-  }
-
-  return existingText;
-};
-// Export so admin controller can reuse without duplicating PDF-parse logic
-exports._getParsedResumeTextForUser = getParsedResumeTextForUser;
-exports._getPlanUsageForUser = async (user) => {
-  const plan = normalizePlan(await autoVerifyStripeSession(user));
-  const limit = getPlanLimit(plan);
-  const used = await resetSearchCountIfNeeded(user);
-
-  return { plan, used, max: limit.maxSearches, label: limit.label };
-};
-exports._calculateResumeIntelligence = calculateResumeIntelligence;
-exports._invalidateDashboardStatsCache = invalidateDashboardStatsCache;
-exports._invalidateMatchedJobsCache = invalidateMatchedJobsCache;
-
-const mapSavedJobToListing = (job, user = {}) => ({
-  id: job.id,
-  employer_name: job.employerName,
-  job_title: job.jobTitle,
-  job_city: job.jobCity,
-  job_state: job.jobState,
-  job_country: job.jobCountry,
-  job_employment_type: job.employmentType,
-  job_apply_link: job.applyLink?.startsWith('http') ? job.applyLink : null,
-  employer_logo: job.employerLogo,
-  source: job.source,
-  posted: job.postedAt,
-  jd: job.jd,
-  match_score: job.matchScore,
-  strong_matches: JSON.stringify(job.strongMatches),
-  missing_skills: JSON.stringify(job.missingSkills),
-  match_summary: job.matchSummary,
-  resume_text: job.resumeText,
-  original_resume: job.originalResume,
-  job_min_salary: job.salaryMin,
-  job_max_salary: job.salaryMax,
-  job_salary_currency: job.salaryCurrency,
-  saved_at: job.createdAt,
-  candidate_id: user.id || job.userId || '',
-  candidate_name: user.fullName || '',
-  email: user.email || '',
-});
-
-const normalizeSavedJobDedupeKey = (job) => [job.employerName, job.jobTitle, job.jobCountry]
-  .map(value => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim())
-  .join('|');
-
 /**
- * Persist a SINGLE job result for a user immediately (used by the streaming pipeline).
- * Returns the saved/updated DB record, or null if it could not be saved.
+ * jobController.js
+ *
+ * Thin controller — all heavy lifting is in jobPipelineService and supporting services.
+ * Handles:
+ *  - SSE live search stream
+ *  - Matched jobs (saved from last run)
+ *  - Stats and usage
+ *  - External apply tracking (student marks themselves applied)
+ *  - Application listing (student view)
+ *  - On-demand match-score
+ *  - ATS resume generate + save
+ *  - Admin: all-applications view, status patch
  */
-const saveOneJobForUser = async (userId, result) => {
-  if (!result?.job_apply_link?.startsWith('http')) return null;
-  try {
-    const data = {
-      userId,
-      employerName: result.employer_name || null,
-      jobTitle: result.job_title || null,
-      jobCity: result.job_city || null,
-      jobState: result.job_state || null,
-      jobCountry: result.job_country || null,
-      employmentType: result.job_employment_type || null,
-      applyLink: result.job_apply_link,
-      employerLogo: result.employer_logo || null,
-      source: result.source || result.job_publisher || null,
-      postedAt: result.posted || result.timestamp || null,
-      jd: result.jd || null,
-      matchScore: parseInt(result.match_score, 10) || 0,
-      strongMatches: parseJsonField(result.strong_matches),
-      missingSkills: parseJsonField(result.missing_skills),
-      matchSummary: result.match_summary || null,
-      resumeText: result.resume_text || null,
-    };
 
-    const existing = await prisma.savedJobResult.findFirst({
-      where: {
-        userId,
-        OR: [
-          { applyLink: data.applyLink },
-          { employerName: data.employerName, jobTitle: data.jobTitle, jobCountry: data.jobCountry },
-        ],
-      },
-      select: { id: true, resumeText: true },
-    });
+const prisma = require('../config/database');
+const { runJobSearchPipeline, getUsageInfo } = require('../services/jobPipelineService');
+const { scoreJob } = require('../services/jobScoringService');
+const { buildSearchIntent } = require('../services/geminiIntentService');
 
-    // Preserve existing resume text if the new record doesn't have one
-    if (!data.resumeText && existing?.resumeText) {
-      data.resumeText = existing.resumeText;
-    }
-
-    return existing
-      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data })
-      : await prisma.savedJobResult.create({ data });
-  } catch (err) {
-    console.error('saveOneJobForUser error:', err.message);
-    return null;
-  }
-};
-
-exports._saveOneJobForUser = saveOneJobForUser;
-
-const saveSearchResultsForUser = async (userId, results) => {
-  const seenLinks = new Set();
-  const topResults = (results || [])
-    .filter((job) => job.job_apply_link && job.job_apply_link.startsWith('http'))
-    .filter((job) => {
-      const key = job.job_apply_link.toLowerCase();
-      if (seenLinks.has(key)) return false;
-      seenLinks.add(key);
-      return true;
-    })
-    .sort((a, b) => (parseInt(b.match_score, 10) || 0) - (parseInt(a.match_score, 10) || 0))
-    .slice(0, 30);
-
-  const saved = [];
-  for (const result of topResults) {
-    const savedJob = await saveOneJobForUser(userId, result);
-    if (savedJob) saved.push(savedJob);
-  }
-
-  return saved;
-};
-
-// Parse CSV text into array of objects
-function parseCSV(text) {
-  const lines = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '"') {
-      if (inQuotes && text[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (ch === ',' && !inQuotes) {
-      lines.push(current);
-      current = '';
-    } else if ((ch === '\n' || ch === '\r') && !inQuotes) {
-      if (current || lines.length) {
-        lines.push(current);
-        current = '';
-      }
-      if (lines.length) {
-        // yield the row
-        if (!parseCSV._rows) parseCSV._rows = [];
-        parseCSV._rows.push([...lines]);
-        lines.length = 0;
-      }
-    } else {
-      current += ch;
-    }
-  }
-  // last field / row
-  if (current || lines.length) {
-    lines.push(current);
-    if (!parseCSV._rows) parseCSV._rows = [];
-    parseCSV._rows.push([...lines]);
-  }
-  const rows = parseCSV._rows || [];
-  parseCSV._rows = null;
-  return rows;
-}
-
-const mapGoogleSheetRowsToJobs = (rows) => {
-  if (rows.length < 2) return [];
-
-  const headers = rows[0].map((header) => header.trim().toLowerCase());
-
-  return rows.slice(1).map((row, idx) => {
-    const obj = {};
-    headers.forEach((header, i) => {
-      obj[header] = (row[i] || '').trim();
-    });
-
-    return {
-      id: idx + 1,
-      candidate_id: obj['candidate_id'] || obj['candidate id'] || '',
-      candidate_email: obj['email'] || obj['candidate_email'] || obj['candidate email'] || '',
-      employer_name: obj['employer_name'] || obj['employer name'] || '',
-      job_title: obj['job_title'] || obj['job title'] || '',
-      job_city: obj['job_city'] || obj['job city'] || obj['location'] || '',
-      job_state: obj['job_state'] || obj['job state'] || '',
-      job_country: obj['job_country'] || obj['job country'] || '',
-      job_employment_type: obj['job_employment_type'] || obj['job employment type'] || obj['employment_type'] || '',
-      match_score: obj['match_score'] || obj['match score'] || '',
-      job_apply_link: obj['job_apply_link'] || obj['job apply link'] || '',
-      timestamp: obj['timestamp'] || '',
-      candidate_name: obj['candidate_name'] || obj['candidate name'] || '',
-      match_summary: obj['match_summary'] || obj['match summary'] || '',
-      strong_matches: obj['strong_matches'] || obj['strong matches'] || '',
-      partial_matches: obj['partial_matches'] || obj['partial matches'] || '',
-      missing_skills: obj['missing_skills'] || obj['missing skills'] || '',
-      pdf_link: obj['pdf_link'] || obj['pdf link'] || '',
-      jd: obj['jd'] || obj['job_description'] || obj['job description'] || '',
-      resume_text: obj['resume_text'] || obj['resume text'] || obj['resume'] || obj['tailored_resume'] || obj['tailored resume'] || '',
-    };
-  }).filter((job) => job.employer_name);
-};
-
-const filterJobsForUser = (jobs, userId, userEmail) => jobs.filter((job) => (
-  job.candidate_id === userId || job.candidate_email === userEmail
-));
-
-const fetchGoogleSheetJobsFresh = async () => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GOOGLE_SHEET_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(GOOGLE_SHEET_CSV_URL, {
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      throw new Error('Failed to fetch Google Sheet');
-    }
-
-    const csvText = await response.text();
-    const jobs = mapGoogleSheetRowsToJobs(parseCSV(csvText));
-
-    googleSheetCache.jobs = jobs;
-    googleSheetCache.expiry = Date.now() + GOOGLE_SHEET_CACHE_TTL_MS;
-
-    return jobs;
-  } catch (error) {
-    if (googleSheetCache.jobs.length > 0) {
-      return googleSheetCache.jobs;
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-};
-
-const getGoogleSheetJobsCached = async ({ forceRefresh = false } = {}) => {
-  const hasFreshCache = googleSheetCache.jobs.length > 0 && Date.now() < googleSheetCache.expiry;
-
-  if (!forceRefresh && hasFreshCache) {
-    return googleSheetCache.jobs;
-  }
-
-  if (!forceRefresh && googleSheetCache.pendingPromise) {
-    return googleSheetCache.pendingPromise;
-  }
-
-  googleSheetCache.pendingPromise = fetchGoogleSheetJobsFresh()
-    .finally(() => {
-      googleSheetCache.pendingPromise = null;
-    });
-
-  return googleSheetCache.pendingPromise;
-};
-
-// Fetch Google Sheet data — filtered per logged-in user
-exports.getGoogleSheetJobs = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const userEmail = req.user.email;
-
-    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
-    const allJobs = await getGoogleSheetJobsCached({ forceRefresh });
-    const jobs = filterJobsForUser(allJobs, userId, userEmail);
-
-    res.json({ jobs });
-  } catch (error) {
-    console.error('Google Sheet fetch error:', error);
-    res.status(500).json({ message: 'Failed to fetch jobs from Google Sheet', error: error.message });
-  }
-};
-
-// Build multipart/form-data body manually.
-// Text fields must NOT have Content-Type headers (busboy requirement).
-function buildMultipartBody(textFields, fileFields) {
-  const boundary = '----FormBoundary' + crypto.randomBytes(8).toString('hex');
-  const CRLF = '\r\n';
-  const parts = [];
-
-  for (const [name, value] of Object.entries(textFields)) {
-    parts.push(Buffer.from(
-      `--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`
-    ));
-  }
-
-  for (const file of fileFields) {
-    parts.push(Buffer.from(
-      `--${boundary}${CRLF}Content-Disposition: form-data; name="${file.name}"; filename="${file.filename}"${CRLF}Content-Type: ${file.contentType}${CRLF}${CRLF}`
-    ));
-    parts.push(file.data);
-    parts.push(Buffer.from(CRLF));
-  }
-
-  parts.push(Buffer.from(`--${boundary}--${CRLF}`));
-  return { body: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
-}
-
-// Plan limits for job searches
-const PLAN_LIMITS = {
-  free: { maxSearches: 5, label: 'Free' },
-  basic: { maxSearches: 35, label: 'Basic' },
-  pro: { maxSearches: 200, label: 'Pro' },
-  ultra: { maxSearches: 999999, label: 'Ultra' },
-};
-
-const normalizePlan = (plan) => String(plan || 'free').toLowerCase();
-const getPlanLimit = (plan) => PLAN_LIMITS[normalizePlan(plan)] || PLAN_LIMITS.free;
-
-const PROFILE_JOB_MIN_SCORE = 60;
-const PROFILE_SOURCE_RESULT_LIMIT = 18;
-
-const dedupeNormalizedValues = (values = []) => {
-  const seen = new Set();
-  return values.filter((value) => {
-    const normalized = normalizeResumeToken(value);
-    if (!normalized || seen.has(normalized)) return false;
-    seen.add(normalized);
-    return true;
-  });
-};
-
-const extractMeaningfulTokens = (value, limit = 8) => dedupeNormalizedValues(
-  normalizeResumeToken(value)
-    .split(/\s+/)
-    .filter((token) => token.length > 2 && !RESUME_STOP_WORDS.has(token))
-).slice(0, limit);
-
-const buildSearchTerms = (values = [], { limit = 18, tokenLimit = 4 } = {}) => {
-  const terms = [];
-  for (const value of values) {
-    const trimmed = String(value || '').trim();
-    if (!trimmed) continue;
-    const normalized = normalizeResumeToken(trimmed);
-    if (normalized) terms.push(normalized);
-    extractMeaningfulTokens(trimmed, tokenLimit).forEach((token) => terms.push(token));
-  }
-  return dedupeNormalizedValues(terms).slice(0, limit);
-};
-
-const parseExperienceYears = (value = '') => {
-  const matches = [...String(value || '').matchAll(/(\d+)\s*\+?\s*(?:years?|yrs?)/gi)];
-  if (matches.length === 0) {
-    const fallback = String(value || '').match(/(\d+)/);
-    return fallback ? parseInt(fallback[1], 10) : 0;
-  }
-  return matches.reduce((maxYears, match) => Math.max(maxYears, parseInt(match[1], 10) || 0), 0);
-};
-
-const extractRequiredYears = (value = '') => {
-  const text = String(value || '');
-  const patterns = [
-    /(\d+)\s*\+?\s*(?:years?|yrs?)\s*(?:of\s+)?experience/gi,
-    /experience\s*[:\-]?\s*(\d+)\s*\+?\s*(?:years?|yrs?)/gi,
-    /minimum\s+of\s+(\d+)\s*\+?\s*(?:years?|yrs?)/gi,
-    /at\s+least\s+(\d+)\s*\+?\s*(?:years?|yrs?)/gi,
-  ];
-  for (const pattern of patterns) {
-    const match = pattern.exec(text);
-    if (match) return parseInt(match[1], 10) || 0;
-  }
-  return 0;
-};
-
-const parsePostedDate = (value) => {
-  if (!value) return null;
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : value;
-  }
-  if (typeof value === 'number') {
-    const date = new Date(value > 9999999999 ? value : value * 1000);
-    return Number.isNaN(date.getTime()) ? null : date;
-  }
-  const trimmed = String(value).trim();
-  if (!trimmed) return null;
-  if (/^\d+$/.test(trimmed)) {
-    const asNumber = Number(trimmed);
-    const date = new Date(trimmed.length > 10 ? asNumber : asNumber * 1000);
-    return Number.isNaN(date.getTime()) ? null : date;
-  }
-  const date = new Date(trimmed);
-  return Number.isNaN(date.getTime()) ? null : date;
-};
-
-const toPostedValue = (value) => {
-  const date = parsePostedDate(value);
-  return date ? date.toISOString() : '';
-};
-
-const isJobWithinDays = (job, days) => {
-  const postedDate = parsePostedDate(job.raw_posted_at || job.posted);
-  if (!postedDate) return false;
-  return postedDate.getTime() >= (Date.now() - (days * 24 * 60 * 60 * 1000));
-};
-
-const buildResumeSummary = (value = '') => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 320);
-
-const normalizeProfileSearchContext = async (user) => {
-  const parsedResumeText = await getParsedResumeTextForUser(user);
-  const resumeSummary = buildResumeSummary(parsedResumeText);
-  const resumeKeywords = extractResumeKeywords(parsedResumeText, user.keySkills || [], 18);
-  const roleTerms = buildSearchTerms([user.jobRole || ''], { limit: 8, tokenLimit: 5 });
-  const skillTerms = buildSearchTerms([...(user.keySkills || []), ...resumeKeywords], { limit: 24, tokenLimit: 4 });
-  const locationTerms = buildSearchTerms([user.location || ''], { limit: 8, tokenLimit: 3 });
-
-  if (roleTerms.length === 0 && skillTerms.length === 0 && !resumeSummary) {
-    throw new Error('Complete your job role, skills, or resume before finding jobs.');
-  }
-
-  return {
-    user,
-    parsedResumeText,
-    resumeSummary,
-    resumeKeywords,
-    roleTerms,
-    skillTerms,
-    locationTerms,
-    experienceYears: parseExperienceYears(user.experience),
-  };
-};
-
-const prettifyMatch = (value) => String(value || '')
-  .split(/\s+/)
-  .filter(Boolean)
-  .map((part) => (part.length <= 3 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1)))
-  .join(' ');
-
-const getMatchedTerms = (terms = [], haystack = '', limit = 6) => {
-  const seen = new Set();
-  const matches = [];
-  for (const term of terms) {
-    if (!haystack.includes(term) || seen.has(term)) continue;
-    seen.add(term);
-    matches.push(prettifyMatch(term));
-    if (matches.length >= limit) break;
-  }
-  return matches;
-};
-
-const normalizeInternalJob = (job) => ({
-  employer_name: job.company || '',
-  job_title: job.title || '',
-  job_city: job.location || '',
-  job_state: '',
-  job_country: '',
-  job_employment_type: job.applicationType || '',
-  job_apply_link: job.sourceUrl || '',
-  employer_logo: '',
-  source: job.source || 'Portal',
-  posted: toPostedValue(job.datePosted || job.createdAt),
-  raw_posted_at: job.datePosted || job.createdAt,
-  jd: job.description || '',
-});
-
-const normalizeSheetPipelineJob = (job) => ({
-  employer_name: job.employer_name || '',
-  job_title: job.job_title || '',
-  job_city: job.job_city || '',
-  job_state: job.job_state || '',
-  job_country: job.job_country || '',
-  job_employment_type: job.job_employment_type || '',
-  job_apply_link: job.job_apply_link || '',
-  employer_logo: job.employer_logo || '',
-  source: job.source || 'Curated',
-  posted: toPostedValue(job.posted || job.timestamp),
-  raw_posted_at: job.posted || job.timestamp,
-  jd: job.jd || '',
-});
-
-const scoreJobForProfile = (job, profile) => {
-  if (!job.job_apply_link || !job.job_apply_link.startsWith('http')) return null;
-
-  const titleText = normalizeResumeToken(job.job_title || '');
-  const locationText = normalizeResumeToken([job.job_city, job.job_state, job.job_country].filter(Boolean).join(' '));
-  const fullText = normalizeResumeToken([
-    job.job_title,
-    job.employer_name,
-    job.job_city,
-    job.job_state,
-    job.job_country,
-    job.job_employment_type,
-    job.jd,
-  ].filter(Boolean).join(' '));
-
-  const roleMatches = getMatchedTerms(profile.roleTerms, `${titleText} ${fullText}`, 5);
-  const skillMatches = getMatchedTerms(profile.skillTerms, fullText, 8);
-  const intelligence = calculateResumeIntelligence({
-    jd: job.jd || job.job_title || '',
-    resumeText: profile.parsedResumeText || profile.resumeSummary || '',
-    userSkills: profile.user.keySkills || [],
-    existingScore: 0,
-  });
-  const keywordMatches = (intelligence.matchedKeywords || []).slice(0, 6);
-  const remoteFriendly = /\b(remote|anywhere|work\s+from\s+home|wfh|hybrid)\b/i.test(`${job.job_employment_type || ''} ${job.jd || ''} ${job.job_city || ''}`);
-  const locationMatches = getMatchedTerms(profile.locationTerms, `${locationText} ${fullText}`, 4);
-  const locationPass = profile.locationTerms.length === 0 || locationMatches.length > 0 || remoteFriendly;
-  if (!locationPass) return null;
-
-  const requiredYears = extractRequiredYears(`${job.job_title || ''} ${job.jd || ''}`);
-  const experienceScore = requiredYears === 0
-    ? 8
-    : profile.experienceYears === 0
-      ? 4
-      : profile.experienceYears >= requiredYears
-        ? 10
-        : profile.experienceYears + 1 >= requiredYears
-          ? 7
-          : profile.experienceYears + 2 >= requiredYears
-            ? 4
-            : 0;
-
-  const postedDate = parsePostedDate(job.raw_posted_at || job.posted);
-  const ageDays = postedDate ? Math.max(0, Math.floor((Date.now() - postedDate.getTime()) / (24 * 60 * 60 * 1000))) : null;
-  const recencyBonus = ageDays == null ? 0 : ageDays <= 2 ? 10 : ageDays <= 7 ? 6 : 3;
-  const hasCoreMatch = roleMatches.length > 0 || skillMatches.length >= 2 || keywordMatches.length >= 4;
-  if (!hasCoreMatch) return null;
-
-  const roleScore = Math.min(30, (roleMatches.length * 10) + (titleText.includes(normalizeResumeToken(profile.user.jobRole || '')) ? 5 : 0));
-  const skillScore = Math.min(42, Math.round((intelligence.coverage || 0) * 0.42) + (skillMatches.length * 4));
-  const locationScore = profile.locationTerms.length === 0 ? 8 : locationMatches.length > 0 ? 10 : remoteFriendly ? 6 : 0;
-  const matchScore = Math.min(100, roleScore + skillScore + locationScore + experienceScore + recencyBonus);
-  if (matchScore < PROFILE_JOB_MIN_SCORE) return null;
-
-  const strongMatches = dedupeNormalizedValues([
-    ...roleMatches,
-    ...skillMatches,
-    ...keywordMatches,
-  ]).slice(0, 8);
-  const missingSkills = (intelligence.missingKeywords || []).slice(0, 8);
-  const summaryBits = [];
-  if (roleMatches.length > 0) summaryBits.push(`Role aligned with ${roleMatches.slice(0, 2).join(', ')}`);
-  if (skillMatches.length > 0) summaryBits.push(`Skills matched: ${skillMatches.slice(0, 3).join(', ')}`);
-  if (locationMatches.length > 0) summaryBits.push(`Location fits ${locationMatches.slice(0, 2).join(', ')}`);
-  else if (remoteFriendly) summaryBits.push('Remote-friendly role');
-  if (requiredYears > 0) summaryBits.push(`Experience target: ${requiredYears}+ years`);
-
-  return {
-    ...job,
-    posted: job.posted || toPostedValue(postedDate),
-    match_score: matchScore,
-    strong_matches: JSON.stringify(strongMatches),
-    missing_skills: JSON.stringify(missingSkills),
-    match_summary: summaryBits.join('. '),
-    resume_text: null,
-    candidate_id: profile.user.id,
-    candidate_name: profile.user.fullName || '',
-    email: profile.user.email || '',
-    timestamp: new Date().toISOString(),
-    resume_summary: profile.resumeSummary,
-  };
-};
-
-const sortPipelineJobs = (jobs = []) => [...jobs].sort((left, right) => {
-  const scoreDiff = (parseInt(right.match_score, 10) || 0) - (parseInt(left.match_score, 10) || 0);
-  if (scoreDiff !== 0) return scoreDiff;
-  return (parsePostedDate(right.raw_posted_at || right.posted)?.getTime() || 0)
-    - (parsePostedDate(left.raw_posted_at || left.posted)?.getTime() || 0);
-});
-
-const collectMatchesFromJobs = (jobs, profile) => {
-  const seen = new Set();
-  const matches = [];
-
-  for (const job of jobs) {
-    const normalizedKey = [job.job_apply_link, job.employer_name, job.job_title]
-      .map((value) => normalizeResumeToken(value))
-      .join('|');
-    if (seen.has(normalizedKey)) continue;
-    seen.add(normalizedKey);
-
-    const scored = scoreJobForProfile(job, profile);
-    if (scored) matches.push(scored);
-  }
-
-  return sortPipelineJobs(matches).slice(0, PROFILE_SOURCE_RESULT_LIMIT);
-};
-
-const loadInternalJobCandidates = async (days) => {
-  const jobs = await prisma.job.findMany({
-    where: { isActive: true },
-    orderBy: [{ datePosted: 'desc' }, { createdAt: 'desc' }],
-    take: 250,
-    select: {
-      id: true,
-      title: true,
-      company: true,
-      location: true,
-      description: true,
-      source: true,
-      sourceUrl: true,
-      applicationType: true,
-      datePosted: true,
-      createdAt: true,
-    },
-  });
-
-  return jobs
-    .map(normalizeInternalJob)
-    .filter((job) => isJobWithinDays(job, days));
-};
-
-const loadCuratedJobCandidates = async (days) => {
-  const jobs = await getGoogleSheetJobsCached();
-  return jobs
-    .map(normalizeSheetPipelineJob)
-    .filter((job) => isJobWithinDays(job, days));
-};
-
-const runProfileJobSearch = async (user, days, { onJobFound, onStatus } = {}) => {
-  const selectedDays = Math.min(30, Math.max(1, parseInt(days, 10) || 1));
-  onStatus?.('Loading your profile, resume summary, skills, and preferences…');
-  const profile = await normalizeProfileSearchContext(user);
-
-  const sources = [
-    {
-      name: 'portal jobs',
-      loader: async () => collectMatchesFromJobs(await loadInternalJobCandidates(selectedDays), profile),
-    },
-    {
-      name: 'curated jobs',
-      loader: async () => collectMatchesFromJobs(await loadCuratedJobCandidates(selectedDays), profile),
-    },
-  ];
-
-  const emitted = [];
-  const seenLinks = new Set();
-  const pending = sources.map((source) => source.loader()
-    .then((results) => ({ source, results }))
-    .catch((error) => ({ source, results: [], error })));
-
-  while (pending.length > 0) {
-    const settled = await Promise.race(
-      pending.map((promise, pendingIndex) => promise.then((result) => ({ pendingIndex, ...result })))
-    );
-    pending.splice(settled.pendingIndex, 1);
-
-    if (settled.error) {
-      console.error(`Profile job search source failed (${settled.source.name}):`, settled.error.message || settled.error);
-      onStatus?.(`Skipping ${settled.source.name} for now…`);
-      continue;
-    }
-
-    if (settled.results.length === 0) {
-      onStatus?.(`No strong matches found in ${settled.source.name}.`);
-      continue;
-    }
-
-    onStatus?.(`Adding ${settled.results.length} matching ${settled.source.name}…`);
-
-    for (const job of settled.results) {
-      const linkKey = normalizeResumeToken(job.job_apply_link || `${job.employer_name}|${job.job_title}`);
-      if (seenLinks.has(linkKey)) continue;
-      seenLinks.add(linkKey);
-      emitted.push(job);
-      if (typeof onJobFound === 'function') await onJobFound(job);
-    }
-  }
-
-  return sortPipelineJobs(emitted);
-};
-
-exports._runProfileJobSearch = runProfileJobSearch;
-
-// Reset search count if a new day has started
-const resetSearchCountIfNeeded = async (user) => {
-  const now = new Date();
-  const last = user.lastSearchReset ? new Date(user.lastSearchReset) : null;
-  if (!last || last.toDateString() !== now.toDateString()) {
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { jobSearchCount: 0, lastSearchReset: now },
-    });
-    return 0;
-  }
-  return user.jobSearchCount || 0;
-};
-
-// Auto-verify Stripe session and update plan if payment completed but plan never saved
-const autoVerifyStripeSession = async (user) => {
-  try {
-    if (user.subscriptionPlan && normalizePlan(user.subscriptionPlan) !== 'free') return normalizePlan(user.subscriptionPlan);
-    if (!user.stripeSessionId) return user.subscriptionPlan || 'free';
-
-    const config = require('../config');
-    const secretKey = config.stripe.secretKey;
-    if (!secretKey) return user.subscriptionPlan || 'free';
-
-    const { data: session } = await axios.get(
-      `https://api.stripe.com/v1/checkout/sessions/${user.stripeSessionId}`,
-      { headers: { 'Authorization': `Bearer ${secretKey}` } }
-    );
-
-    if (session.payment_status === 'paid' && session.metadata?.plan) {
-      const plan = normalizePlan(session.metadata.plan);
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          subscriptionPlan: plan,
-          subscriptionStatus: 'active',
-          subscriptionStart: new Date(),
-        },
-      });
-      console.log(`Auto-verify: Updated user ${user.email} to plan: ${plan}`);
-      return plan;
-    }
-    return user.subscriptionPlan || 'free';
-  } catch (err) {
-    console.error('Auto-verify Stripe session error:', err.message);
-    return user.subscriptionPlan || 'free';
-  }
-};
-
-// Get usage stats for the current user
-exports.getUsage = async (req, res) => {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.id },
-      select: { id: true, email: true, subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true },
-    });
-    // Self-healing: if plan is free but a Stripe session exists, auto-verify payment
-    const plan = normalizePlan(await autoVerifyStripeSession(user));
-    const limit = getPlanLimit(plan);
-    const used = await resetSearchCountIfNeeded(user);
-    res.json({ plan, used, max: limit.maxSearches, label: limit.label });
-  } catch (err) {
-    res.status(500).json({ message: 'Failed to get usage', error: err.message });
-  }
-};
+// ── SSE: live search stream ───────────────────────────────────────────────────
 
 exports.streamJobSearch = async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
+  // Set SSE headers
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection',    'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // nginx: disable buffering
   res.flushHeaders();
 
-  const send = (obj) => {
-    if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`);
-  };
-
+  // Heartbeat every 20 s to keep the connection alive through proxies
   const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write(':heartbeat\n\n');
+    try { if (!res.writableEnded) res.write(': heartbeat\n\n'); } catch { /* ignore */ }
   }, 20000);
 
-  const finish = () => {
+  const userId = req.params.studentId || req.user.id;
+  const days   = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 30);
+
+  req.on('close', () => clearInterval(heartbeat));
+
+  try {
+    await runJobSearchPipeline({ userId, res, days });
+  } finally {
     clearInterval(heartbeat);
     if (!res.writableEnded) res.end();
-  };
-
-  try {
-    const userId = req.user.id;
-    invalidateUserJobCaches(userId);
-
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        phone: true,
-        linkedinProfile: true,
-        keySkills: true,
-        resumeUrl: true,
-        parsedResumeText: true,
-        jobRole: true,
-        location: true,
-        experience: true,
-        education: true,
-        subscriptionPlan: true,
-        stripeSessionId: true,
-        jobSearchCount: true,
-        lastSearchReset: true,
-      },
-    });
-
-    if (!user) {
-      send({ type: 'error', message: 'User not found' });
-      return finish();
-    }
-
-    const plan = normalizePlan(await autoVerifyStripeSession(user));
-    const limit = getPlanLimit(plan);
-    const used = await resetSearchCountIfNeeded(user);
-    if (used >= limit.maxSearches) {
-      send({
-        type: 'error',
-        message: `You've reached your ${limit.label} plan limit of ${limit.maxSearches} searches today. Upgrade for more!`,
-        limitReached: true,
-      });
-      return finish();
-    }
-
-    const days = Math.min(30, Math.max(1, parseInt(req.query.days, 10) || 1));
-    let savedCount = 0;
-    const seenLinks = new Set();
-
-    const onJobFound = async (job) => {
-      const linkKey = normalizeResumeToken(job.job_apply_link || `${job.employer_name}|${job.job_title}`);
-      if (seenLinks.has(linkKey)) return;
-      seenLinks.add(linkKey);
-
-      const dbRecord = await saveOneJobForUser(userId, job);
-      if (dbRecord) savedCount += 1;
-
-      send({
-        type: 'job',
-        job: dbRecord
-          ? { ...job, id: dbRecord.id, saved_at: dbRecord.createdAt }
-          : job,
-      });
-      invalidateMatchedJobsCache(userId);
-    };
-
-    const emittedJobs = await runProfileJobSearch(user, days, {
-      onJobFound,
-      onStatus: (message) => send({ type: 'status', message }),
-    });
-
-    try {
-      await prisma.user.update({
-        where: { id: userId },
-        data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
-      });
-    } catch (error) {
-      console.error('streamJobSearch count increment error:', error.message);
-    }
-
-    invalidateDashboardStatsCache(userId);
-    invalidateMatchedJobsCache(userId);
-
-    send({
-      type: 'done',
-      count: savedCount,
-      message: savedCount > 0
-        ? `Found ${savedCount} matching job${savedCount === 1 ? '' : 's'} for your profile.`
-        : emittedJobs.length > 0
-          ? 'Matching jobs were found but could not be saved.'
-          : 'No 60%+ matches were found for your profile in that time window.',
-    });
-  } catch (error) {
-    console.error('streamJobSearch error:', error.message || error);
-    send({ type: 'error', message: error.message || 'Job search failed. Please try again.' });
-  } finally {
-    finish();
   }
 };
 
-exports.triggerJobSearch = async (req, res) => {
+// ── Matched jobs (last saved run) ─────────────────────────────────────────────
+
+exports.getMatchedJobs = async (req, res) => {
   try {
-    const userId = req.user.id;
-    invalidateUserJobCaches(userId);
+    const userId = req.params.studentId || req.user.id;
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        phone: true,
-        linkedinProfile: true,
-        keySkills: true,
-        resumeUrl: true,
-        parsedResumeText: true,
-        jobRole: true,
-        location: true,
-        experience: true,
-        education: true,
-        subscriptionPlan: true,
-        stripeSessionId: true,
-        jobSearchCount: true,
-        lastSearchReset: true,
-      },
+    const matches = await prisma.jobMatch.findMany({
+      where: { userId },
+      orderBy: [{ matchScore: 'desc' }, { savedAt: 'desc' }],
+      take: 100,
     });
 
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const plan = normalizePlan(await autoVerifyStripeSession(user));
-    const limit = getPlanLimit(plan);
-    const used = await resetSearchCountIfNeeded(user);
-    if (used >= limit.maxSearches) {
-      return res.status(403).json({
-        message: `You've reached your ${limit.label} plan limit of ${limit.maxSearches} searches today. Upgrade for more!`,
-        limitReached: true,
-        used,
-        max: limit.maxSearches,
-      });
-    }
-
-    const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
-    const results = await runProfileJobSearch(user, days);
-    const savedJobs = await saveSearchResultsForUser(userId, results);
-
-    try {
-      await prisma.user.update({
-        where: { id: userId },
-        data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
-      });
-    } catch (error) {
-      console.error('triggerJobSearch count increment error:', error.message);
-    }
-
-    invalidateDashboardStatsCache(userId);
-    invalidateMatchedJobsCache(userId);
-
-    return res.json({
-      message: savedJobs.length > 0
-        ? `Found ${savedJobs.length} matching job${savedJobs.length === 1 ? '' : 's'} for your profile.`
-        : 'No 60%+ matches were found for your profile in that time window.',
-      jobs: savedJobs.map((job) => mapSavedJobToListing(job, user)),
-      mode: 'profile',
-    });
-  } catch (error) {
-    console.error('triggerJobSearch error:', error.message || error);
-    res.status(500).json({ message: 'Failed to trigger job search', error: error.message || String(error) });
+    // Shape to frontend-expected job object
+    const jobs = matches.map(mapMatchToJob);
+    res.json({ jobs });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to load matched jobs', error: err.message });
   }
 };
 
-// Get all jobs with filters
-exports.getJobs = async (req, res) => {
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+exports.getStats = async (req, res) => {
   try {
-    const { search, source, type, location, page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const userId = req.params.studentId || req.user.id;
 
-    const where = { isActive: true };
-
-    if (search) {
-      where.OR = [
-        { title: { contains: search, mode: 'insensitive' } },
-        { company: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } },
-      ];
-    }
-
-    if (source) where.source = source;
-    if (type) where.applicationType = type;
-    if (location) where.location = { contains: location, mode: 'insensitive' };
-
-    const [jobs, total] = await Promise.all([
-      prisma.job.findMany({
-        where,
-        orderBy: { datePosted: 'desc' },
-        skip,
-        take: parseInt(limit),
+    const [totalMatchedJobs, totalExternal, runs] = await Promise.all([
+      prisma.jobMatch.count({ where: { userId } }),
+      prisma.externalJobApplication.count({ where: { userId } }),
+      prisma.jobSearchRun.findFirst({
+        where: { userId, status: 'COMPLETED' },
+        orderBy: { createdAt: 'desc' },
+        select: { jobsFound: true, durationMs: true, createdAt: true },
       }),
-      prisma.job.count({ where }),
     ]);
 
+    const adminApplyCount = await prisma.externalJobApplication.count({
+      where: { userId, appliedById: { not: null } },
+    });
+
     res.json({
-      jobs,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        totalPages: Math.ceil(total / parseInt(limit)),
-      },
+      totalMatchedJobs,
+      externalAppliedCount: totalExternal,
+      candidateApplyCount: totalExternal - adminApplyCount,
+      adminApplyCount,
+      lastSearch: runs ? {
+        jobsFound: runs.jobsFound,
+        durationMs: runs.durationMs,
+        at: runs.createdAt,
+      } : null,
+      totalApplications: totalExternal,
     });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch jobs', error: error.message });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to load stats', error: err.message });
   }
 };
 
-// Get single job
-exports.getJob = async (req, res) => {
+// ── Usage ─────────────────────────────────────────────────────────────────────
+
+exports.getUsage = async (req, res) => {
   try {
-    const job = await prisma.job.findUnique({
-      where: { id: req.params.id },
+    const userId = req.params.studentId || req.user.id;
+    const user   = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { subscriptionPlan: true },
     });
-
-    if (!job) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-
-    res.json(job);
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch job', error: error.message });
+    const info = await getUsageInfo(userId, user?.subscriptionPlan);
+    res.json(info);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to load usage', error: err.message });
   }
 };
 
-// Scrape jobs — pipeline removed
-exports.scrapeJobs = (req, res) => res.status(503).json({ message: 'Job scraper pipeline is being rebuilt.' });
+// ── External apply: student or admin marks a job as applied ──────────────────
 
-// Add sample jobs — pipeline removed
-exports.addSampleJobs = (req, res) => res.status(503).json({ message: 'Job scraper pipeline is being rebuilt.' });
-
-// Apply for a job
-exports.applyForJob = async (req, res) => {
+exports.markExternalApplied = async (req, res) => {
   try {
-    const { jobId } = req.params;
-    const userId = req.user.id;
+    const userId     = req.params.studentId || req.user.id;
+    const appliedById = req.user.role === 'STUDENT' ? null : req.user.id;
+    const { jobLink, jobTitle, employerName, matchScore, jobMatchId } = req.body;
 
-    const job = await prisma.job.findUnique({ where: { id: jobId } });
-    if (!job) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
+    if (!jobLink) return res.status(400).json({ message: 'jobLink is required' });
 
-    // Check if already applied
-    const existing = await prisma.jobApplication.findUnique({
-      where: { userId_jobId: { userId, jobId } },
-    });
-
-    if (existing) {
-      return res.status(409).json({ message: 'Already applied for this job' });
-    }
-
-    // Get user profile for resume generation
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-
-    // Generate tailored resume
-    let tailoredResume = null;
-    try {
-      const resumeResult = await resumeService.generateTailoredResume(user, job);
-      tailoredResume = await prisma.tailoredResume.create({
-        data: {
-          userId,
-          jobId,
-          resumeUrl: resumeResult.filePath,
-          matchScore: resumeResult.matchScore,
-          keywords: resumeResult.keywords,
-        },
-      });
-    } catch (error) {
-      console.error('Resume generation error:', error);
-    }
-
-    const application = await prisma.jobApplication.create({
-      data: {
+    const record = await prisma.externalJobApplication.upsert({
+      where: { userId_jobLink: { userId, jobLink } },
+      create: {
         userId,
-        jobId,
+        jobMatchId:   jobMatchId || null,
+        appliedById,
+        jobLink,
+        jobTitle:     jobTitle     || null,
+        employerName: employerName || null,
+        matchScore:   matchScore   ? String(matchScore) : null,
+        appliedMethod: appliedById ? 'ADMIN' : 'MANUAL',
         status: 'APPLIED',
-        isAutoApplied: job.applicationType === 'EASY_APPLY',
-        resumeUsed: tailoredResume?.resumeUrl || user.resumeUrl,
       },
-      include: { job: true },
-    });
-
-    // Create notification
-    await prisma.notification.create({
-      data: {
-        userId,
-        title: 'Application Submitted',
-        message: `You have applied for ${job.title} at ${job.company}`,
-        type: 'application',
+      update: {
+        appliedById,
+        appliedMethod: appliedById ? 'ADMIN' : 'MANUAL',
       },
     });
 
-    invalidateDashboardStatsCache(userId);
-
-    res.status(201).json({
-      message: 'Application submitted successfully',
-      application,
-      tailoredResume,
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Application failed', error: error.message });
+    res.json({ message: 'Application recorded', application: record });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to record application', error: err.message });
   }
 };
 
-// Easy Apply - bulk apply for all easy apply jobs
-exports.easyApplyAll = async (req, res) => {
+// ── External applied status ───────────────────────────────────────────────────
+
+exports.getExternalAppliedStatus = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const userId = req.params.studentId || req.user.id;
 
-    // Get all easy apply jobs not yet applied
-    const appliedJobIds = await prisma.jobApplication.findMany({
+    const applications = await prisma.externalJobApplication.findMany({
       where: { userId },
-      select: { jobId: true },
+      orderBy: { createdAt: 'desc' },
     });
 
-    const appliedIds = appliedJobIds.map(a => a.jobId);
-
-    const easyApplyJobs = await prisma.job.findMany({
-      where: {
-        applicationType: 'EASY_APPLY',
-        isActive: true,
-        id: { notIn: appliedIds },
-      },
-    });
-
-    const results = [];
-    for (const job of easyApplyJobs) {
-      try {
-        // Generate tailored resume
-        let resumeUrl = user.resumeUrl;
-        try {
-          const resumeResult = await resumeService.generateTailoredResume(user, job);
-          await prisma.tailoredResume.upsert({
-            where: { userId_jobId: { userId, jobId: job.id } },
-            update: { resumeUrl: resumeResult.filePath, matchScore: resumeResult.matchScore, keywords: resumeResult.keywords },
-            create: { userId, jobId: job.id, resumeUrl: resumeResult.filePath, matchScore: resumeResult.matchScore, keywords: resumeResult.keywords },
-          });
-          resumeUrl = resumeResult.filePath;
-        } catch (e) {
-          console.error('Resume generation error for job:', job.id, e.message);
-        }
-
-        const application = await prisma.jobApplication.create({
-          data: {
-            userId,
-            jobId: job.id,
-            status: 'APPLIED',
-            isAutoApplied: true,
-            resumeUsed: resumeUrl,
-          },
-        });
-        results.push({ jobId: job.id, status: 'applied', title: job.title });
-      } catch (error) {
-        results.push({ jobId: job.id, status: 'failed', error: error.message });
-      }
-    }
-
-    if (results.filter(r => r.status === 'applied').length > 0) {
-      await prisma.notification.create({
-        data: {
-          userId,
-          title: 'Bulk Apply Complete',
-          message: `Applied to ${results.filter(r => r.status === 'applied').length} jobs automatically`,
-          type: 'application',
-        },
-      });
-    }
-
-    invalidateDashboardStatsCache(userId);
-
-    res.json({
-      message: 'Easy apply completed',
-      totalProcessed: results.length,
-      applied: results.filter(r => r.status === 'applied').length,
-      failed: results.filter(r => r.status === 'failed').length,
-      results,
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Easy apply failed', error: error.message });
+    res.json({ applications });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to load applied status', error: err.message });
   }
 };
 
-// Get user's applications
+// ── My applications (formal tracked) ─────────────────────────────────────────
+
 exports.getMyApplications = async (req, res) => {
   try {
-    const { status, page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const where = { userId: req.user.id };
+    const userId = req.params.studentId || req.user.id;
+    const { status, limit = 20, page = 1 } = req.query;
+
+    const where = { userId };
     if (status) where.status = status;
 
     const [applications, total] = await Promise.all([
       prisma.jobApplication.findMany({
         where,
-        include: {
-          job: true,
-          user: { select: { id: true, fullName: true, email: true, phone: true, avatarUrl: true, education: true, jobRole: true } },
-        },
         orderBy: { appliedAt: 'desc' },
-        skip,
         take: parseInt(limit),
+        skip: (parseInt(page) - 1) * parseInt(limit),
+        include: {
+          appliedByUser: { select: { id: true, fullName: true, role: true } },
+          jobMatch:      { select: { title: true, company: true, applyLink: true } },
+        },
       }),
       prisma.jobApplication.count({ where }),
     ]);
 
-    // Enrich with appliedBy info
-    const appliedByIds = [...new Set(applications.filter(a => a.appliedById).map(a => a.appliedById))];
-    let appliedByMap = {};
-    if (appliedByIds.length > 0) {
-      const users = await prisma.user.findMany({
-        where: { id: { in: appliedByIds } },
-        select: { id: true, fullName: true, role: true },
-      });
-      users.forEach(u => { appliedByMap[u.id] = u; });
-    }
-    const enriched = applications.map(a => ({
-      ...a,
-      appliedBy: a.appliedById ? (appliedByMap[a.appliedById] || null) : null,
-    }));
-
     res.json({
-      applications: enriched,
+      applications: applications.map((a) => ({
+        id:       a.id,
+        status:   a.status,
+        appliedAt: a.appliedAt,
+        appliedBy: a.appliedByUser || null,
+        job: {
+          title:    a.title   || a.jobMatch?.title   || 'Untitled',
+          company:  a.company || a.jobMatch?.company || '—',
+          applyLink: a.applyLink || a.jobMatch?.applyLink || null,
+        },
+        interviewDate:     a.interviewDate,
+        interviewLocation: a.interviewLocation,
+        interviewNotes:    a.interviewNotes,
+        notes:             a.notes,
+      })),
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
         total,
+        page: parseInt(page),
         totalPages: Math.ceil(total / parseInt(limit)),
       },
     });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch applications', error: error.message });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to load applications', error: err.message });
   }
 };
 
-// Update application status
+// ── All applications (admin view) ─────────────────────────────────────────────
+
+exports.getAllApplications = async (req, res) => {
+  try {
+    const { status, search, page = 1, limit = 20 } = req.query;
+
+    const where = {};
+    if (status) where.status = status;
+    if (search) {
+      where.OR = [
+        { title:   { contains: search, mode: 'insensitive' } },
+        { company: { contains: search, mode: 'insensitive' } },
+        { user: { fullName: { contains: search, mode: 'insensitive' } } },
+        { user: { email:    { contains: search, mode: 'insensitive' } } },
+      ];
+    }
+
+    const [applications, total] = await Promise.all([
+      prisma.jobApplication.findMany({
+        where,
+        orderBy: { appliedAt: 'desc' },
+        take:  parseInt(limit),
+        skip: (parseInt(page) - 1) * parseInt(limit),
+        include: {
+          user:          { select: { id: true, fullName: true, email: true, phone: true } },
+          appliedByUser: { select: { id: true, fullName: true, role: true } },
+        },
+      }),
+      prisma.jobApplication.count({ where }),
+    ]);
+
+    res.json({
+      applications: applications.map((a) => ({
+        id:       a.id,
+        status:   a.status,
+        appliedAt: a.appliedAt,
+        notes:     a.notes,
+        interviewDate:     a.interviewDate,
+        interviewLocation: a.interviewLocation,
+        interviewNotes:    a.interviewNotes,
+        user:     a.user,
+        appliedBy: a.appliedByUser || null,
+        job: {
+          title:    a.title,
+          company:  a.company,
+          applyLink: a.applyLink,
+        },
+      })),
+      pagination: {
+        total,
+        page: parseInt(page),
+        totalPages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to load applications', error: err.message });
+  }
+};
+
+// ── Update application status (admin) ─────────────────────────────────────────
+
 exports.updateApplicationStatus = async (req, res) => {
   try {
     const { id } = req.params;
     const { status, notes, interviewDate, interviewLocation, interviewNotes } = req.body;
 
-    // Only ADMIN and SUPER_ADMIN can update application status
-    if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN') {
-      return res.status(403).json({ message: 'Not authorized to update application status' });
+    const validStatuses = ['APPLIED', 'INTERVIEW_SCHEDULED', 'OFFER_RECEIVED', 'REJECTED'];
+    if (status && !validStatuses.includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
     }
 
     const data = {};
-    if (status) data.status = status;
-    if (notes !== undefined) data.notes = notes;
-    if (interviewDate !== undefined) data.interviewDate = interviewDate ? new Date(interviewDate) : null;
+    if (status)            data.status            = status;
+    if (notes !== undefined) data.notes            = notes;
+    if (interviewDate !== undefined) data.interviewDate     = interviewDate ? new Date(interviewDate) : null;
     if (interviewLocation !== undefined) data.interviewLocation = interviewLocation;
-    if (interviewNotes !== undefined) data.interviewNotes = interviewNotes;
+    if (interviewNotes !== undefined)    data.interviewNotes   = interviewNotes;
 
-    const application = await prisma.jobApplication.update({
+    const updated = await prisma.jobApplication.update({
       where: { id },
       data,
-      include: {
-        job: true,
-        user: { select: { id: true, fullName: true, email: true } },
-      },
     });
 
-    invalidateDashboardStatsCache(application.user.id);
-
-    res.json(application);
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to update application', error: error.message });
+    res.json({ message: 'Application updated', application: updated });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to update application', error: err.message });
   }
 };
 
-// Get all applications (Admin/Super Admin) — includes applicant info
-exports.getAllApplications = async (req, res) => {
+// ── Match score (on-demand JD vs resume) ──────────────────────────────────────
+
+exports.getMatchScore = async (req, res) => {
   try {
-    const { status, page = 1, limit = 20, search } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const where = {};
-    if (status) where.status = status;
-    if (search) {
-      where.OR = [
-        { user: { fullName: { contains: search, mode: 'insensitive' } } },
-        { user: { email: { contains: search, mode: 'insensitive' } } },
-        { job: { title: { contains: search, mode: 'insensitive' } } },
-        { job: { company: { contains: search, mode: 'insensitive' } } },
-      ];
-    }
+    const userId = req.params.studentId || req.user.id;
+    const { jd, resume_text, match_score, skills } = req.body;
 
-    const [applications, total] = await Promise.all([
-      prisma.jobApplication.findMany({
-        where,
-        include: {
-          job: true,
-          user: { select: { id: true, fullName: true, email: true, phone: true, avatarUrl: true, education: true, jobRole: true } },
-        },
-        orderBy: { appliedAt: 'desc' },
-        skip,
-        take: parseInt(limit),
-      }),
-      prisma.jobApplication.count({ where }),
-    ]);
+    if (!jd) return res.status(400).json({ message: 'jd is required' });
 
-    res.json({
-      applications,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        totalPages: Math.ceil(total / parseInt(limit)),
-      },
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch applications', error: error.message });
-  }
-};
-
-// Get dashboard stats
-exports.getDashboardStats = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
-    const cachedStats = dashboardStatsCache.get(userId);
-
-    if (!forceRefresh && cachedStats && Date.now() < cachedStats.expiry) {
-      return res.json(cachedStats.data);
-    }
-
-    const [totalApplied, interviewScheduled, rejected, offerReceived, totalMatchedJobs, totalInternalJobs, dbAdminApplied, sheetAdminApplied, sheetTotalApplied] = await Promise.all([
-      prisma.jobApplication.count({ where: { userId, status: 'APPLIED' } }),
-      prisma.jobApplication.count({ where: { userId, status: 'INTERVIEW_SCHEDULED' } }),
-      prisma.jobApplication.count({ where: { userId, status: 'REJECTED' } }),
-      prisma.jobApplication.count({ where: { userId, status: 'OFFER_RECEIVED' } }),
-      prisma.savedJobResult.count({ where: { userId, matchScore: { gte: 60 } } }),
-      prisma.job.count({ where: { isActive: true } }),
-      prisma.jobApplication.count({ where: { userId, appliedById: { not: null } } }),
-      prisma.sheetJobApplication.count({ where: { userId, appliedById: { not: null } } }),
-      prisma.sheetJobApplication.count({ where: { userId } }),
-    ]);
-
-    const manualPending = await prisma.job.count({
-      where: {
-        isActive: true,
-        applicationType: 'MANUAL_APPLY',
-        NOT: {
-          applications: {
-            some: { userId },
-          },
-        },
-      },
+    // Load intent from user profile for accurate scoring
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { jobRole: true, experience: true, location: true, keySkills: true, parsedResumeText: true, subscriptionPlan: true },
     });
 
-    const allDbApplied = totalApplied + interviewScheduled + rejected + offerReceived;
-    const adminApplyCount = dbAdminApplied + sheetAdminApplied;
-    const candidateApplyCount = (allDbApplied - dbAdminApplied) + (sheetTotalApplied - sheetAdminApplied);
+    const { extractResumeIntro } = require('../services/jobPipelineService');
 
-    const stats = {
-      totalJobs: totalMatchedJobs,
-      totalSheetJobs: totalMatchedJobs,
-      totalInternalJobs,
-      totalApplied: allDbApplied,
-      totalApplications: allDbApplied + sheetTotalApplied,
-      interviewScheduled,
-      rejected,
-      offerReceived,
-      manualPending,
-      adminApplyCount,
-      candidateApplyCount,
-      sheetAppliedCount: sheetTotalApplied,
+    const intent = await buildSearchIntent({
+      jobRole:            user?.jobRole    || '',
+      experience:         user?.experience || '',
+      location:           user?.location   || '',
+      skills:             skills || user?.keySkills || [],
+      resumeIntroSummary: extractResumeIntro(resume_text || user?.parsedResumeText || ''),
+    }).catch(() => ({
+      normalizedRole:       user?.jobRole || '',
+      titleVariants:        [],
+      searchQueries:        [],
+      seniority:            'any',
+      seniorityRange:       { minYears: 0, maxYears: 20 },
+      skillKeywords:        skills || user?.keySkills || [],
+      locationVariants:     [user?.location, 'remote'].filter(Boolean),
+      exclusionKeywords:    [],
+      cleanedResumeSummary: extractResumeIntro(resume_text || user?.parsedResumeText || ''),
+    }));
+
+    const fakeJob = {
+      title:       intent.normalizedRole,
+      company:     '',
+      location:    user?.location || '',
+      description: jd,
+      isRemote:    false,
+      impliedSkills: [],
     };
 
-    dashboardStatsCache.set(userId, {
-      data: stats,
-      expiry: Date.now() + DASHBOARD_STATS_CACHE_TTL_MS,
-    });
-
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch stats', error: error.message });
-  }
-};
-
-// Get tailored resume for a job
-exports.getTailoredResume = async (req, res) => {
-  try {
-    const { jobId } = req.params;
-    const userId = req.user.id;
-
-    let resume = await prisma.tailoredResume.findUnique({
-      where: { userId_jobId: { userId, jobId } },
-    });
-
-    if (!resume) {
-      const user = await prisma.user.findUnique({ where: { id: userId } });
-      const job = await prisma.job.findUnique({ where: { id: jobId } });
-
-      if (!job) return res.status(404).json({ message: 'Job not found' });
-
-      const result = await resumeService.generateTailoredResume(user, job);
-      resume = await prisma.tailoredResume.create({
-        data: {
-          userId,
-          jobId,
-          resumeUrl: result.filePath,
-          matchScore: result.matchScore,
-          keywords: result.keywords,
-        },
-      });
-    }
-
-    res.json(resume);
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to generate resume', error: error.message });
-  }
-};
-
-// ══════════════════════════════════════════════════════════════
-// AUTO-APPLY BOT — applies to all Google Sheet jobs for the user
-// ══════════════════════════════════════════════════════════════
-
-// Apply All — marks all sheet jobs as applied and returns links for browser
-exports.autoApplyAllSheetJobs = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const userEmail = req.user.email;
-
-    const allJobs = await getGoogleSheetJobsCached({ forceRefresh: true });
-    const myJobs = filterJobsForUser(allJobs, userId, userEmail);
-
-    if (myJobs.length === 0) {
-      return res.json({ message: 'No jobs found for your account', summary: { total: 0, readyToApply: 0, alreadyApplied: 0, noLink: 0 }, results: [], applyLinks: [] });
-    }
-
-    // 2. Check already-applied (best-effort)
-    let appliedLinks = new Set();
-    try {
-      const existingApps = await prisma.sheetJobApplication.findMany({
-        where: { userId },
-        select: { jobLink: true },
-      });
-      appliedLinks = new Set(existingApps.map(a => a.jobLink));
-    } catch { /* table may not exist yet */ }
-
-    // 3. Process each job
-    const results = [];
-    const linksToOpen = [];
-
-    for (const job of myJobs) {
-      const link = job.job_apply_link;
-
-      if (!link) {
-        results.push({ employer: job.employer_name, status: 'NO_LINK', message: 'No apply link' });
-        continue;
-      }
-
-      if (appliedLinks.has(link)) {
-        results.push({ employer: job.employer_name, status: 'ALREADY_APPLIED', message: 'Already applied', link });
-        continue;
-      }
-
-      // Mark as applied and queue link for opening in browser
-      linksToOpen.push(link);
-      results.push({ employer: job.employer_name, status: 'APPLIED', message: 'Open in browser to apply', link });
-
-      // Save to DB (best-effort)
-      try {
-        await prisma.sheetJobApplication.upsert({
-          where: { userId_jobLink: { userId, jobLink: link } },
-          update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName: job.employer_name, matchScore: job.match_score, pdfLink: job.pdf_link },
-          create: { userId, jobLink: link, status: 'APPLIED', appliedMethod: 'MANUAL', employerName: job.employer_name, matchScore: job.match_score, pdfLink: job.pdf_link },
-        });
-      } catch { /* ignore */ }
-    }
-
-    const readyToApply = results.filter(r => r.status === 'APPLIED').length;
-    const alreadyApplied = results.filter(r => r.status === 'ALREADY_APPLIED').length;
-    const noLink = results.filter(r => r.status === 'NO_LINK').length;
-
-    // Create notification (best-effort)
-    try {
-      await prisma.notification.create({
-        data: {
-          userId,
-          title: 'Apply All Complete',
-          message: `Ready to apply: ${readyToApply} | Already applied: ${alreadyApplied} | No link: ${noLink}`,
-          type: 'application',
-        },
-      });
-    } catch { /* ignore */ }
-
-    invalidateDashboardStatsCache(userId);
+    const result = scoreJob(fakeJob, intent);
 
     res.json({
-      message: `${readyToApply} job${readyToApply !== 1 ? 's' : ''} ready — opening in your browser`,
-      summary: { total: myJobs.length, readyToApply, alreadyApplied, noLink },
-      results,
-      applyLinks: linksToOpen,
-    });
-  } catch (error) {
-    console.error('Apply all error:', error.message);
-    res.status(500).json({ message: 'Apply all failed', error: error.message });
-  }
-};
-
-// Get applied status for all sheet jobs
-exports.getSheetAppliedStatus = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const applications = await prisma.sheetJobApplication.findMany({
-      where: { userId },
-      select: { jobLink: true, status: true, appliedMethod: true, appliedById: true, employerName: true, jobTitle: true, matchScore: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-    });
-    res.json({ applications });
-  } catch (error) {
-    // Table might not exist yet — return empty
-    res.json({ applications: [] });
-  }
-};
-
-// Mark a single sheet job as applied
-exports.markSheetJobApplied = async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { jobLink, employerName, matchScore, jobTitle } = req.body;
-    if (!jobLink) return res.status(400).json({ message: 'jobLink is required' });
-
-    const scoreStr = matchScore != null ? String(matchScore) : null;
-    const application = await prisma.sheetJobApplication.upsert({
-      where: { userId_jobLink: { userId, jobLink } },
-      update: { status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore: scoreStr, jobTitle },
-      create: { userId, jobLink, status: 'APPLIED', appliedMethod: 'MANUAL', employerName, matchScore: scoreStr, jobTitle },
-    });
-
-    invalidateDashboardStatsCache(userId);
-
-    res.json({ message: 'Marked as applied', application });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to mark applied', error: error.message });
-  }
-};
-
-// ══════════════════════════════════════════════════════════════
-// AUTO-APPLY (Single Job) — AI + Playwright, streams NDJSON progress
-// ══════════════════════════════════════════════════════════════
-exports.autoApplyToJob = async (req, res) => {
-  // Extend timeouts for this long-running request
-  req.setTimeout(300000);
-  res.setTimeout(300000);
-
-  const userId = req.user.id;
-  const { applyUrl, employerName, matchScore } = req.body;
-
-  if (!applyUrl) {
-    return res.status(400).json({ message: 'Apply URL is required' });
-  }
-
-  // Fetch full user profile
-  let user;
-  try {
-    user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true, fullName: true, email: true, phone: true,
-        keySkills: true, jobRole: true, location: true,
-        resumeUrl: true, linkedinProfile: true,
-        education: true, experience: true,
-      },
+      score:          result.score,
+      summary:        result.summary,
+      jdKeywords:     intent.skillKeywords,
+      matchedKeywords: result.strongMatches ? result.strongMatches.split(', ') : [],
+      missingKeywords: result.skillGaps     ? result.skillGaps.split(', ')     : [],
+      missingSkills:   result.skillGaps     ? result.skillGaps.split(', ')     : [],
     });
   } catch (err) {
-    return res.status(500).json({ message: 'Database error', error: err.message });
+    res.status(500).json({ message: 'Match score failed', error: err.message });
   }
+};
 
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
-  }
+// ── ATS Resume generate ───────────────────────────────────────────────────────
 
-  // Set headers for NDJSON streaming
-  res.writeHead(200, {
-    'Content-Type': 'application/x-ndjson',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
-
-  // Progress callback — writes NDJSON lines to the response stream
-  const onProgress = (event) => {
-    try { res.write(JSON.stringify(event) + '\n'); } catch {}
-  };
-
+exports.generateResume = async (req, res) => {
   try {
-    const autoApplyService = require('../services/autoApplyService');
-    const result = await autoApplyService.applyToJob(
-      { applyUrl, employerName, matchScore },
-      user,
-      onProgress
-    );
+    const userId  = req.params.studentId || req.user.id;
+    const job     = req.body; // full job object from frontend
 
-    // Save to DB (best-effort)
-    try {
-      await prisma.sheetJobApplication.upsert({
-        where: { userId_jobLink: { userId, jobLink: applyUrl } },
-        update: {
-          status: result.success ? 'APPLIED' : 'FAILED',
-          appliedMethod: 'BOT',
-          employerName,
-          matchScore: String(result.matchScore || matchScore || ''),
-          pdfLink: result.resumeUrl || null,
-          reportUrl: result.reportUrl || null,
-        },
-        create: {
-          userId,
-          jobLink: applyUrl,
-          status: result.success ? 'APPLIED' : 'FAILED',
-          appliedMethod: 'BOT',
-          employerName,
-          matchScore: String(result.matchScore || matchScore || ''),
-          pdfLink: result.resumeUrl || null,
-          reportUrl: result.reportUrl || null,
-        },
-      });
-
-      invalidateDashboardStatsCache(userId);
-    } catch (err) {
-      console.error('Failed to save auto-apply record:', err.message);
+    if (!job?.applyLink && !job?.job_apply_link) {
+      return res.status(400).json({ message: 'Job apply link is required' });
     }
 
-    // Create notification (best-effort)
-    try {
-      await prisma.notification.create({
-        data: {
-          userId,
-          title: result.success ? 'Auto-Apply Successful' : 'Auto-Apply Attempted',
-          message: `${result.success ? 'Applied' : 'Attempted'} to ${employerName || 'job'}${result.reportUrl ? '. Report generated.' : ''}`,
-          type: 'application',
-        },
-      });
-    } catch {}
-
-    // Send final "done" event and close the stream
-    onProgress({
-      type: 'done',
-      data: {
-        success: result.success,
-        message: result.success
-          ? `Successfully applied to ${employerName || 'this job'}!`
-          : `Application attempted for ${employerName || 'this job'}. Check the report for details.`,
-        reportUrl: result.reportUrl,
-        resumeUrl: result.resumeUrl,
-        matchScore: result.matchScore,
-        steps: result.steps,
-        error: result.error,
-      },
-    });
-  } catch (error) {
-    console.error('Auto-apply endpoint error:', error.message);
-    onProgress({
-      type: 'done',
-      data: {
-        success: false,
-        message: 'Auto-apply failed',
-        error: error.message,
-        steps: [],
-      },
-    });
-  }
-
-  res.end();
-};
-
-exports.clearJobCaches = async (req, res) => {
-  invalidateUserJobCaches(req.user.id);
-  res.json({ message: 'Backend caches cleared' });
-};
-
-// ─── Get saved job results for a user ───
-exports.getSavedJobs = async (req, res) => {
-  try {
-    const userId = req.user?.id;
-    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
-
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
-    const skip = (page - 1) * limit;
-    const forceRefresh = req.query.refresh === '1';
-
-    // Serve from cache on page 1 (the common case) unless forced refresh
-    if (!forceRefresh && page === 1) {
-      const cached = matchedJobsCache.get(userId);
-      if (cached && Date.now() < cached.expiry) {
-        return res.json(cached.data);
-      }
-    }
-
-    // Single query: fetch enough rows to determine threshold and deduplicate
-    // Default order: newest first (createdAt desc) — frontend sort controls handle score ordering
-    const allJobs = await prisma.savedJobResult.findMany({
-      where: { userId, matchScore: { gte: PROFILE_JOB_MIN_SCORE } },
-      orderBy: [{ createdAt: 'desc' }],
-      take: 200,
-      select: {
-        id: true, userId: true, employerName: true, jobTitle: true,
-        jobCity: true, jobState: true, jobCountry: true, employmentType: true,
-        applyLink: true, employerLogo: true, source: true, postedAt: true,
-        jd: true, matchScore: true, strongMatches: true, missingSkills: true,
-        matchSummary: true, resumeText: true, originalResume: true, createdAt: true,
-      },
-    });
-
-    const deduped = [];
-    const seenJobKeys = new Set();
-    for (const job of allJobs) {
-      const key = normalizeSavedJobDedupeKey(job) || job.applyLink || job.id;
-      if (seenJobKeys.has(key)) continue;
-      seenJobKeys.add(key);
-      deduped.push(job);
-    }
-
-    const jobs = deduped.slice(skip, skip + limit);
-    const total = deduped.length;
-    const mapped = jobs.map((job) => mapSavedJobToListing(job, req.user || {}));
-    const responseData = { jobs: mapped, total, page, limit, minScore: PROFILE_JOB_MIN_SCORE };
-
-    // Cache page 1 result per user for 5 minutes
-    if (page === 1) {
-      matchedJobsCache.set(userId, { data: responseData, expiry: Date.now() + MATCHED_JOBS_TTL_MS });
-    }
-
-    res.json(responseData);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to retrieve saved jobs' });
-  }
-};
-
-exports.analyzeJobDescription = async (req, res) => {
-  try {
-    const jd = req.body?.jd || req.body?.job_description || '';
-    const resumeText = req.body?.resume_text || '';
-    const userSkills = Array.isArray(req.body?.skills) ? req.body.skills : [];
-
-    if (!jd || jd.trim().length < 80) {
-      return res.status(400).json({ message: 'A full job description is required for JD analysis.' });
-    }
-
-    const analysis = calculateResumeIntelligence({ jd, resumeText, userSkills, existingScore: req.body?.match_score });
-    res.json({
-      jobTitle: req.body?.job_title || 'Target Role',
-      keywords: analysis.jdKeywords,
-      matchedKeywords: analysis.matchedKeywords,
-      missingSkills: analysis.missingKeywords,
-      suggestedActionVerbs: analysis.actionVerbs,
-      suggestions: analysis.suggestions,
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to analyze job description', error: error.message || String(error) });
-  }
-};
-
-exports.calculateResumeMatchScore = async (req, res) => {
-  try {
-    const jd = req.body?.jd || '';
-    const resumeText = req.body?.resume_text || '';
-    const userSkills = Array.isArray(req.body?.skills) ? req.body.skills : [];
-
-    if (!jd || !resumeText) {
-      return res.status(400).json({ message: 'Job description and resume text are required.' });
-    }
-
-    res.json(calculateResumeIntelligence({ jd, resumeText, userSkills, existingScore: req.body?.match_score }));
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to calculate resume match score', error: error.message || String(error) });
-  }
-};
-
-exports.saveGeneratedResumeText = async (req, res) => {
-  try {
-    const userId = req.user?.id;
-    const { id, job_apply_link, resume_text } = req.body || {};
-    if (!userId) return res.status(401).json({ message: 'Not authenticated' });
-    if (!resume_text || resume_text.trim().length < 800) return res.status(400).json({ message: 'Resume text is too short to save.' });
-
-    const where = id
-      ? { id, userId }
-      : { userId, applyLink: job_apply_link || undefined };
-    const existing = await prisma.savedJobResult.findFirst({ where });
-    if (!existing) return res.status(404).json({ message: 'Saved job was not found.' });
-
-    const savedJob = await prisma.savedJobResult.update({
-      where: { id: existing.id },
-      data: { resumeText: resume_text.trim() },
-    });
-
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, fullName: true, email: true } });
-    res.json({ message: 'Resume edits saved.', job: mapSavedJobToListing(savedJob, user || {}) });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to save resume edits', error: error.message || String(error) });
-  }
-};
-
-exports.exportPdfInstructions = async (_req, res) => {
-  res.json({
-    message: 'PDF export is handled in the browser with selectable text and print-safe ATS spacing.',
-    engine: 'html2pdf.js',
-    atsRules: ['single-column layout', 'standard headings', 'readable fonts', 'selectable text', 'multi-page support'],
-  });
-};
-
-// Generate or regenerate an ATS resume for a saved/external job.
-exports.generateSavedJobResume = async (req, res) => {
-  try {
-    const userId = req.user?.id;
-    if (!userId) return res.status(401).json({ message: 'Not authenticated' });
-
-    const {
-      job_apply_link,
-      employer_name,
-      job_title,
-      job_city,
-      job_state,
-      job_country,
-      job_employment_type,
-      employer_logo,
-      source,
-      posted,
-      jd,
-      match_score,
-      strong_matches,
-      missing_skills,
-      match_summary,
-    } = req.body || {};
+    const applyLink = job.applyLink || job.job_apply_link;
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        phone: true,
-        linkedinProfile: true,
-        keySkills: true,
-        jobRole: true,
-        location: true,
-        education: true,
-        experience: true,
-        resumeUrl: true,
-        parsedResumeText: true,
-      },
+      select: { fullName: true, parsedResumeText: true, keySkills: true, jobRole: true, experience: true, location: true, email: true, phone: true, linkedinProfile: true },
     });
 
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const existing = job_apply_link
-      ? await prisma.savedJobResult.findFirst({ where: { userId, applyLink: job_apply_link } })
-      : await prisma.savedJobResult.findFirst({
-          where: {
-            userId,
-            employerName: employer_name || undefined,
-            jobTitle: job_title || undefined,
-          },
-        });
-
-    if (existing && isReusableGeneratedResume(existing.resumeText) && !req.body?.forceRegenerate) {
-      return res.json({
-        message: 'Existing ATS resume loaded.',
-        job: mapSavedJobToListing(existing, user),
-        provider: 'cached',
-      });
+    if (!user?.parsedResumeText) {
+      return res.status(400).json({ message: 'No resume uploaded. Please upload your resume first.' });
     }
 
-    const jobData = {
-      job_apply_link: job_apply_link || existing?.applyLink || null,
-      employer_name: employer_name || existing?.employerName || '',
-      job_title: job_title || existing?.jobTitle || '',
-      job_city: job_city || existing?.jobCity || '',
-      job_state: job_state || existing?.jobState || '',
-      job_country: job_country || existing?.jobCountry || '',
-      job_employment_type: job_employment_type || existing?.employmentType || '',
-      employer_logo: employer_logo || existing?.employerLogo || '',
-      source: source || existing?.source || '',
-      posted: posted || existing?.postedAt || '',
-      jd: jd || existing?.jd || '',
-      match_score: parseInt(match_score, 10) || existing?.matchScore || 0,
-      strong_matches: strong_matches ?? existing?.strongMatches ?? [],
-      missing_skills: missing_skills ?? existing?.missingSkills ?? [],
-      match_summary: match_summary || existing?.matchSummary || '',
-    };
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-    if (!jobData.jd) {
-      return res.status(400).json({ message: 'Job description is required to create an ATS resume.' });
-    }
-
-    const parsedResumeText = await getParsedResumeTextForUser(user);
-    if (!parsedResumeText || parsedResumeText.length < 800) {
-      return res.status(400).json({
-        message: 'Please upload a readable PDF resume in your profile before creating an ATS resume.',
-      });
-    }
-
-    const generatedResume = await aiService.generateATSResumeText({ ...user, parsedResumeText }, jobData);
-    const resumeText = typeof generatedResume === 'string' ? generatedResume : generatedResume?.text;
-    const provider = typeof generatedResume === 'string' ? 'gemini' : generatedResume?.provider || 'fallback';
-    if (!resumeText || !resumeText.trim()) {
-      return res.status(500).json({ message: 'Failed to generate ATS resume.' });
-    }
-
-    const savedData = {
-      userId,
-      employerName: jobData.employer_name || null,
-      jobTitle: jobData.job_title || null,
-      jobCity: jobData.job_city || null,
-      jobState: jobData.job_state || null,
-      jobCountry: jobData.job_country || null,
-      employmentType: jobData.job_employment_type || null,
-      applyLink: jobData.job_apply_link || null,
-      employerLogo: jobData.employer_logo || null,
-      source: jobData.source || null,
-      postedAt: jobData.posted || null,
-      jd: jobData.jd || null,
-      matchScore: parseInt(jobData.match_score, 10) || 0,
-      strongMatches: parseJsonField(jobData.strong_matches),
-      missingSkills: parseJsonField(jobData.missing_skills),
-      matchSummary: jobData.match_summary || null,
-      resumeText,
-    };
-
-    const savedJob = existing
-      ? await prisma.savedJobResult.update({ where: { id: existing.id }, data: savedData })
-      : await prisma.savedJobResult.create({ data: savedData });
-
-    res.json({
-      message: 'ATS resume created successfully.',
-      job: mapSavedJobToListing(savedJob, user),
-      provider,
-      analysis: calculateResumeIntelligence({
-        jd: jobData.jd,
-        resumeText,
-        userSkills: user.keySkills || [],
-        existingScore: jobData.match_score,
-      }),
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
     });
-  } catch (error) {
-    console.error('Generate ATS resume error:', error.message || error);
-    res.status(500).json({ message: 'Failed to generate ATS resume', error: error.message || String(error) });
+
+    const jd          = job.jd || job.description || '';
+    const jobTitle    = job.job_title || job.title || 'the role';
+    const companyName = job.employer_name || job.company || '';
+
+    const prompt = `You are an expert ATS resume writer. 
+Rewrite the candidate's resume to be optimised for this specific job, preserving ALL original content (experience, education, achievements) while tailoring the language to match the JD.
+
+CANDIDATE NAME: ${user.fullName}
+ORIGINAL RESUME:
+${user.parsedResumeText.substring(0, 8000)}
+
+JOB TITLE: ${jobTitle}
+COMPANY: ${companyName}
+JOB DESCRIPTION (first 3000 chars):
+${jd.substring(0, 3000)}
+
+Instructions:
+1. Keep all real experience, projects, education — do not invent anything
+2. Naturally incorporate keywords from the JD into existing bullet points
+3. Start with a tailored professional summary (3-4 sentences)
+4. Use clean plain-text format with clear section headings (SUMMARY, EXPERIENCE, SKILLS, EDUCATION)
+5. Keep bullet points concise and achievement-oriented
+6. Output ONLY the resume text, no explanations or meta-commentary`;
+
+    const result = await model.generateContent(prompt);
+    const resumeText = result.response.text().trim();
+
+    // Save to JobMatch if we can find it
+    const updatedMatch = await prisma.jobMatch.update({
+      where: { userId_applyLink: { userId, applyLink } },
+      data: { resumeText, candidateName: user.fullName },
+    }).catch(() => null); // ok if match not found
+
+    const updatedJob = updatedMatch ? { ...job, ...mapMatchToJob(updatedMatch) } : { ...job, resume_text: resumeText, candidate_name: user.fullName };
+
+    res.json({ message: 'ATS resume generated successfully.', job: updatedJob });
+  } catch (err) {
+    res.status(500).json({ message: 'Resume generation failed', error: err.message });
   }
 };
+
+// ── ATS Resume save (user edited the draft) ───────────────────────────────────
+
+exports.saveResume = async (req, res) => {
+  try {
+    const userId    = req.params.studentId || req.user.id;
+    const { id, job_apply_link, resume_text } = req.body;
+
+    const applyLink = job_apply_link;
+    if (!applyLink) return res.status(400).json({ message: 'job_apply_link is required' });
+
+    const updatedMatch = await prisma.jobMatch.update({
+      where: { userId_applyLink: { userId, applyLink } },
+      data:  { resumeText: resume_text },
+    }).catch(() => null);
+
+    res.json({
+      message: 'Resume saved.',
+      job: updatedMatch ? mapMatchToJob(updatedMatch) : null,
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Resume save failed', error: err.message });
+  }
+};
+
+// ── Helper: map DB JobMatch → frontend job shape ──────────────────────────────
+
+function mapMatchToJob(m) {
+  return {
+    id:                          m.id,
+    externalId:                  m.externalId,
+    job_title:                   m.title,
+    employer_name:                m.company,
+    job_location:                 m.location,
+    job_employment_type:          m.employmentType,
+    jd:                           m.description,
+    job_apply_link:               m.applyLink,
+    job_posted_at_datetime_utc:   m.postedAt ? m.postedAt.toISOString() : null,
+    match_score:                  m.matchScore,
+    match_summary:                m.matchSummary,
+    strong_matches:               m.strongMatches,
+    skill_gaps:                   m.skillGaps,
+    resume_text:                  m.resumeText || null,
+    candidate_name:               m.candidateName || null,
+    saved_at:                     m.savedAt ? m.savedAt.toISOString() : null,
+    // Also include camelCase variants for backward compat
+    title:       m.title,
+    company:     m.company,
+    location:    m.location,
+    description: m.description,
+    applyLink:   m.applyLink,
+    matchScore:  m.matchScore,
+    matchSummary: m.matchSummary,
+    strongMatches: m.strongMatches,
+    skillGaps:    m.skillGaps,
+  };
+}

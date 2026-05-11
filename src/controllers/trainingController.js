@@ -1,10 +1,82 @@
 const prisma = require('../config/database');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
 
+const TRAINING_MATERIALS_CACHE_TTL_MS = 20 * 1000;
+const trainingMaterialsCache = new Map();
+
+const getTrainingMaterialsCacheKey = (user, query = {}) => JSON.stringify({
+  role: user.role,
+  userId: user.role === 'STUDENT' ? user.id : 'staff',
+  category: query.category || '',
+  type: query.type || '',
+  search: query.search || '',
+});
+
+const getCachedTrainingMaterials = (cacheKey) => {
+  const cached = trainingMaterialsCache.get(cacheKey);
+  if (!cached || Date.now() >= cached.expiresAt) {
+    trainingMaterialsCache.delete(cacheKey);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setCachedTrainingMaterials = (cacheKey, payload) => {
+  trainingMaterialsCache.set(cacheKey, {
+    payload,
+    expiresAt: Date.now() + TRAINING_MATERIALS_CACHE_TTL_MS,
+  });
+};
+
+const clearTrainingMaterialsCache = () => trainingMaterialsCache.clear();
+
+const studentMaterialSelect = {
+  id: true,
+  title: true,
+  description: true,
+  type: true,
+  url: true,
+  content: true,
+  category: true,
+  createdAt: true,
+  updatedAt: true,
+};
+
+const staffMaterialSelect = {
+  id: true,
+  title: true,
+  description: true,
+  type: true,
+  url: true,
+  content: true,
+  category: true,
+  createdAt: true,
+  updatedAt: true,
+  assignments: {
+    select: {
+      id: true,
+      studentId: true,
+      assignedAt: true,
+      student: {
+        select: {
+          id: true,
+        },
+      },
+    },
+  },
+};
+
 // Get all training materials (admin/superadmin see all, students see only assigned)
 exports.getMaterials = async (req, res) => {
   try {
     const { category, type, search } = req.query;
+    const cacheKey = getTrainingMaterialsCacheKey(req.user, req.query);
+    const cachedMaterials = getCachedTrainingMaterials(cacheKey);
+
+    if (cachedMaterials) {
+      return res.json(cachedMaterials);
+    }
+
     const where = { isPublished: true };
 
     if (category) where.category = category;
@@ -23,14 +95,11 @@ exports.getMaterials = async (req, res) => {
 
     const materials = await prisma.trainingMaterial.findMany({
       where,
-      include: {
-        uploadedBy: { select: { id: true, fullName: true, role: true } },
-        assignments: {
-          include: { student: { select: { id: true, fullName: true, email: true } } }
-        }
-      },
+      select: req.user.role === 'STUDENT' ? studentMaterialSelect : staffMaterialSelect,
       orderBy: { createdAt: 'desc' },
     });
+
+    setCachedTrainingMaterials(cacheKey, materials);
 
     res.json(materials);
   } catch (error) {
@@ -92,6 +161,8 @@ exports.createMaterial = async (req, res) => {
       },
     });
 
+    clearTrainingMaterialsCache();
+
     res.status(201).json(material);
   } catch (error) {
     res.status(500).json({ message: 'Failed to create material', error: error.message });
@@ -121,6 +192,8 @@ exports.updateMaterial = async (req, res) => {
       where: { id: req.params.id },
       data: updateData,
     });
+
+    clearTrainingMaterialsCache();
 
     res.json(material);
   } catch (error) {
@@ -171,6 +244,7 @@ exports.deleteMaterial = async (req, res) => {
     await prisma.trainingMaterial.delete({
       where: { id: req.params.id },
     });
+    clearTrainingMaterialsCache();
     res.json({ message: 'Material deleted' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to delete material', error: error.message });
@@ -324,6 +398,8 @@ exports.assignMaterial = async (req, res) => {
       },
     });
 
+    clearTrainingMaterialsCache();
+
     res.json(updated);
   } catch (error) {
     res.status(500).json({ message: 'Failed to assign material', error: error.message });
@@ -355,6 +431,8 @@ exports.unassignMaterial = async (req, res) => {
         }
       },
     });
+
+    clearTrainingMaterialsCache();
 
     res.json(updated);
   } catch (error) {
