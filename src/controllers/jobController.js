@@ -1,7 +1,5 @@
 const prisma = require('../config/database');
-const jobScraperService = require('../services/jobScraperService');
 const resumeService = require('../services/resumeService');
-const jsJobSearchService = require('../services/jsJobSearchService');
 const aiService = require('../services/aiService');
 const { PDFParse } = require('pdf-parse');
 const axios = require('axios');
@@ -10,18 +8,6 @@ const crypto = require('crypto');
 const dns = require('dns');
 const https = require('https');
 const config = require('../config');
-
-// JOB_SEARCH_MODE: 'js' = JavaScript direct search, 'n8n' = n8n webhook (default: 'js')
-const JOB_SEARCH_MODE = process.env.JOB_SEARCH_MODE || 'js';
-
-// Force IPv4 to avoid AggregateError on Render/cloud platforms
-const n8nAxios = axios.create({
-  timeout: 20000,
-  httpsAgent: new https.Agent({ family: 4, keepAlive: true }),
-});
-
-// Cache n8n form field discovery (avoids re-fetching HTML every trigger)
-const n8nFormFieldsCache = { fields: null, expiry: 0 };
 
 // Google Sheet config
 const GOOGLE_SHEET_ID = '1oBInp6BCblszz6RWdmhok3tlsRUfKX8BoEYs5uB0j6g';
@@ -204,7 +190,6 @@ exports._getPlanUsageForUser = async (user) => {
   return { plan, used, max: limit.maxSearches, label: limit.label };
 };
 exports._calculateResumeIntelligence = calculateResumeIntelligence;
-exports._saveOneJobForUser = saveOneJobForUser;
 exports._invalidateDashboardStatsCache = invalidateDashboardStatsCache;
 exports._invalidateMatchedJobsCache = invalidateMatchedJobsCache;
 
@@ -291,6 +276,8 @@ const saveOneJobForUser = async (userId, result) => {
     return null;
   }
 };
+
+exports._saveOneJobForUser = saveOneJobForUser;
 
 const saveSearchResultsForUser = async (userId, results) => {
   const seenLinks = new Set();
@@ -501,6 +488,360 @@ const PLAN_LIMITS = {
 const normalizePlan = (plan) => String(plan || 'free').toLowerCase();
 const getPlanLimit = (plan) => PLAN_LIMITS[normalizePlan(plan)] || PLAN_LIMITS.free;
 
+const PROFILE_JOB_MIN_SCORE = 60;
+const PROFILE_SOURCE_RESULT_LIMIT = 18;
+
+const dedupeNormalizedValues = (values = []) => {
+  const seen = new Set();
+  return values.filter((value) => {
+    const normalized = normalizeResumeToken(value);
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+};
+
+const extractMeaningfulTokens = (value, limit = 8) => dedupeNormalizedValues(
+  normalizeResumeToken(value)
+    .split(/\s+/)
+    .filter((token) => token.length > 2 && !RESUME_STOP_WORDS.has(token))
+).slice(0, limit);
+
+const buildSearchTerms = (values = [], { limit = 18, tokenLimit = 4 } = {}) => {
+  const terms = [];
+  for (const value of values) {
+    const trimmed = String(value || '').trim();
+    if (!trimmed) continue;
+    const normalized = normalizeResumeToken(trimmed);
+    if (normalized) terms.push(normalized);
+    extractMeaningfulTokens(trimmed, tokenLimit).forEach((token) => terms.push(token));
+  }
+  return dedupeNormalizedValues(terms).slice(0, limit);
+};
+
+const parseExperienceYears = (value = '') => {
+  const matches = [...String(value || '').matchAll(/(\d+)\s*\+?\s*(?:years?|yrs?)/gi)];
+  if (matches.length === 0) {
+    const fallback = String(value || '').match(/(\d+)/);
+    return fallback ? parseInt(fallback[1], 10) : 0;
+  }
+  return matches.reduce((maxYears, match) => Math.max(maxYears, parseInt(match[1], 10) || 0), 0);
+};
+
+const extractRequiredYears = (value = '') => {
+  const text = String(value || '');
+  const patterns = [
+    /(\d+)\s*\+?\s*(?:years?|yrs?)\s*(?:of\s+)?experience/gi,
+    /experience\s*[:\-]?\s*(\d+)\s*\+?\s*(?:years?|yrs?)/gi,
+    /minimum\s+of\s+(\d+)\s*\+?\s*(?:years?|yrs?)/gi,
+    /at\s+least\s+(\d+)\s*\+?\s*(?:years?|yrs?)/gi,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (match) return parseInt(match[1], 10) || 0;
+  }
+  return 0;
+};
+
+const parsePostedDate = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  if (typeof value === 'number') {
+    const date = new Date(value > 9999999999 ? value : value * 1000);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) {
+    const asNumber = Number(trimmed);
+    const date = new Date(trimmed.length > 10 ? asNumber : asNumber * 1000);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const date = new Date(trimmed);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const toPostedValue = (value) => {
+  const date = parsePostedDate(value);
+  return date ? date.toISOString() : '';
+};
+
+const isJobWithinDays = (job, days) => {
+  const postedDate = parsePostedDate(job.raw_posted_at || job.posted);
+  if (!postedDate) return false;
+  return postedDate.getTime() >= (Date.now() - (days * 24 * 60 * 60 * 1000));
+};
+
+const buildResumeSummary = (value = '') => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 320);
+
+const normalizeProfileSearchContext = async (user) => {
+  const parsedResumeText = await getParsedResumeTextForUser(user);
+  const resumeSummary = buildResumeSummary(parsedResumeText);
+  const resumeKeywords = extractResumeKeywords(parsedResumeText, user.keySkills || [], 18);
+  const roleTerms = buildSearchTerms([user.jobRole || ''], { limit: 8, tokenLimit: 5 });
+  const skillTerms = buildSearchTerms([...(user.keySkills || []), ...resumeKeywords], { limit: 24, tokenLimit: 4 });
+  const locationTerms = buildSearchTerms([user.location || ''], { limit: 8, tokenLimit: 3 });
+
+  if (roleTerms.length === 0 && skillTerms.length === 0 && !resumeSummary) {
+    throw new Error('Complete your job role, skills, or resume before finding jobs.');
+  }
+
+  return {
+    user,
+    parsedResumeText,
+    resumeSummary,
+    resumeKeywords,
+    roleTerms,
+    skillTerms,
+    locationTerms,
+    experienceYears: parseExperienceYears(user.experience),
+  };
+};
+
+const prettifyMatch = (value) => String(value || '')
+  .split(/\s+/)
+  .filter(Boolean)
+  .map((part) => (part.length <= 3 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1)))
+  .join(' ');
+
+const getMatchedTerms = (terms = [], haystack = '', limit = 6) => {
+  const seen = new Set();
+  const matches = [];
+  for (const term of terms) {
+    if (!haystack.includes(term) || seen.has(term)) continue;
+    seen.add(term);
+    matches.push(prettifyMatch(term));
+    if (matches.length >= limit) break;
+  }
+  return matches;
+};
+
+const normalizeInternalJob = (job) => ({
+  employer_name: job.company || '',
+  job_title: job.title || '',
+  job_city: job.location || '',
+  job_state: '',
+  job_country: '',
+  job_employment_type: job.applicationType || '',
+  job_apply_link: job.sourceUrl || '',
+  employer_logo: '',
+  source: job.source || 'Portal',
+  posted: toPostedValue(job.datePosted || job.createdAt),
+  raw_posted_at: job.datePosted || job.createdAt,
+  jd: job.description || '',
+});
+
+const normalizeSheetPipelineJob = (job) => ({
+  employer_name: job.employer_name || '',
+  job_title: job.job_title || '',
+  job_city: job.job_city || '',
+  job_state: job.job_state || '',
+  job_country: job.job_country || '',
+  job_employment_type: job.job_employment_type || '',
+  job_apply_link: job.job_apply_link || '',
+  employer_logo: job.employer_logo || '',
+  source: job.source || 'Curated',
+  posted: toPostedValue(job.posted || job.timestamp),
+  raw_posted_at: job.posted || job.timestamp,
+  jd: job.jd || '',
+});
+
+const scoreJobForProfile = (job, profile) => {
+  if (!job.job_apply_link || !job.job_apply_link.startsWith('http')) return null;
+
+  const titleText = normalizeResumeToken(job.job_title || '');
+  const locationText = normalizeResumeToken([job.job_city, job.job_state, job.job_country].filter(Boolean).join(' '));
+  const fullText = normalizeResumeToken([
+    job.job_title,
+    job.employer_name,
+    job.job_city,
+    job.job_state,
+    job.job_country,
+    job.job_employment_type,
+    job.jd,
+  ].filter(Boolean).join(' '));
+
+  const roleMatches = getMatchedTerms(profile.roleTerms, `${titleText} ${fullText}`, 5);
+  const skillMatches = getMatchedTerms(profile.skillTerms, fullText, 8);
+  const intelligence = calculateResumeIntelligence({
+    jd: job.jd || job.job_title || '',
+    resumeText: profile.parsedResumeText || profile.resumeSummary || '',
+    userSkills: profile.user.keySkills || [],
+    existingScore: 0,
+  });
+  const keywordMatches = (intelligence.matchedKeywords || []).slice(0, 6);
+  const remoteFriendly = /\b(remote|anywhere|work\s+from\s+home|wfh|hybrid)\b/i.test(`${job.job_employment_type || ''} ${job.jd || ''} ${job.job_city || ''}`);
+  const locationMatches = getMatchedTerms(profile.locationTerms, `${locationText} ${fullText}`, 4);
+  const locationPass = profile.locationTerms.length === 0 || locationMatches.length > 0 || remoteFriendly;
+  if (!locationPass) return null;
+
+  const requiredYears = extractRequiredYears(`${job.job_title || ''} ${job.jd || ''}`);
+  const experienceScore = requiredYears === 0
+    ? 8
+    : profile.experienceYears === 0
+      ? 4
+      : profile.experienceYears >= requiredYears
+        ? 10
+        : profile.experienceYears + 1 >= requiredYears
+          ? 7
+          : profile.experienceYears + 2 >= requiredYears
+            ? 4
+            : 0;
+
+  const postedDate = parsePostedDate(job.raw_posted_at || job.posted);
+  const ageDays = postedDate ? Math.max(0, Math.floor((Date.now() - postedDate.getTime()) / (24 * 60 * 60 * 1000))) : null;
+  const recencyBonus = ageDays == null ? 0 : ageDays <= 2 ? 10 : ageDays <= 7 ? 6 : 3;
+  const hasCoreMatch = roleMatches.length > 0 || skillMatches.length >= 2 || keywordMatches.length >= 4;
+  if (!hasCoreMatch) return null;
+
+  const roleScore = Math.min(30, (roleMatches.length * 10) + (titleText.includes(normalizeResumeToken(profile.user.jobRole || '')) ? 5 : 0));
+  const skillScore = Math.min(42, Math.round((intelligence.coverage || 0) * 0.42) + (skillMatches.length * 4));
+  const locationScore = profile.locationTerms.length === 0 ? 8 : locationMatches.length > 0 ? 10 : remoteFriendly ? 6 : 0;
+  const matchScore = Math.min(100, roleScore + skillScore + locationScore + experienceScore + recencyBonus);
+  if (matchScore < PROFILE_JOB_MIN_SCORE) return null;
+
+  const strongMatches = dedupeNormalizedValues([
+    ...roleMatches,
+    ...skillMatches,
+    ...keywordMatches,
+  ]).slice(0, 8);
+  const missingSkills = (intelligence.missingKeywords || []).slice(0, 8);
+  const summaryBits = [];
+  if (roleMatches.length > 0) summaryBits.push(`Role aligned with ${roleMatches.slice(0, 2).join(', ')}`);
+  if (skillMatches.length > 0) summaryBits.push(`Skills matched: ${skillMatches.slice(0, 3).join(', ')}`);
+  if (locationMatches.length > 0) summaryBits.push(`Location fits ${locationMatches.slice(0, 2).join(', ')}`);
+  else if (remoteFriendly) summaryBits.push('Remote-friendly role');
+  if (requiredYears > 0) summaryBits.push(`Experience target: ${requiredYears}+ years`);
+
+  return {
+    ...job,
+    posted: job.posted || toPostedValue(postedDate),
+    match_score: matchScore,
+    strong_matches: JSON.stringify(strongMatches),
+    missing_skills: JSON.stringify(missingSkills),
+    match_summary: summaryBits.join('. '),
+    resume_text: null,
+    candidate_id: profile.user.id,
+    candidate_name: profile.user.fullName || '',
+    email: profile.user.email || '',
+    timestamp: new Date().toISOString(),
+    resume_summary: profile.resumeSummary,
+  };
+};
+
+const sortPipelineJobs = (jobs = []) => [...jobs].sort((left, right) => {
+  const scoreDiff = (parseInt(right.match_score, 10) || 0) - (parseInt(left.match_score, 10) || 0);
+  if (scoreDiff !== 0) return scoreDiff;
+  return (parsePostedDate(right.raw_posted_at || right.posted)?.getTime() || 0)
+    - (parsePostedDate(left.raw_posted_at || left.posted)?.getTime() || 0);
+});
+
+const collectMatchesFromJobs = (jobs, profile) => {
+  const seen = new Set();
+  const matches = [];
+
+  for (const job of jobs) {
+    const normalizedKey = [job.job_apply_link, job.employer_name, job.job_title]
+      .map((value) => normalizeResumeToken(value))
+      .join('|');
+    if (seen.has(normalizedKey)) continue;
+    seen.add(normalizedKey);
+
+    const scored = scoreJobForProfile(job, profile);
+    if (scored) matches.push(scored);
+  }
+
+  return sortPipelineJobs(matches).slice(0, PROFILE_SOURCE_RESULT_LIMIT);
+};
+
+const loadInternalJobCandidates = async (days) => {
+  const jobs = await prisma.job.findMany({
+    where: { isActive: true },
+    orderBy: [{ datePosted: 'desc' }, { createdAt: 'desc' }],
+    take: 250,
+    select: {
+      id: true,
+      title: true,
+      company: true,
+      location: true,
+      description: true,
+      source: true,
+      sourceUrl: true,
+      applicationType: true,
+      datePosted: true,
+      createdAt: true,
+    },
+  });
+
+  return jobs
+    .map(normalizeInternalJob)
+    .filter((job) => isJobWithinDays(job, days));
+};
+
+const loadCuratedJobCandidates = async (days) => {
+  const jobs = await getGoogleSheetJobsCached();
+  return jobs
+    .map(normalizeSheetPipelineJob)
+    .filter((job) => isJobWithinDays(job, days));
+};
+
+const runProfileJobSearch = async (user, days, { onJobFound, onStatus } = {}) => {
+  const selectedDays = Math.min(30, Math.max(1, parseInt(days, 10) || 1));
+  onStatus?.('Loading your profile, resume summary, skills, and preferences…');
+  const profile = await normalizeProfileSearchContext(user);
+
+  const sources = [
+    {
+      name: 'portal jobs',
+      loader: async () => collectMatchesFromJobs(await loadInternalJobCandidates(selectedDays), profile),
+    },
+    {
+      name: 'curated jobs',
+      loader: async () => collectMatchesFromJobs(await loadCuratedJobCandidates(selectedDays), profile),
+    },
+  ];
+
+  const emitted = [];
+  const seenLinks = new Set();
+  const pending = sources.map((source) => source.loader()
+    .then((results) => ({ source, results }))
+    .catch((error) => ({ source, results: [], error })));
+
+  while (pending.length > 0) {
+    const settled = await Promise.race(
+      pending.map((promise, pendingIndex) => promise.then((result) => ({ pendingIndex, ...result })))
+    );
+    pending.splice(settled.pendingIndex, 1);
+
+    if (settled.error) {
+      console.error(`Profile job search source failed (${settled.source.name}):`, settled.error.message || settled.error);
+      onStatus?.(`Skipping ${settled.source.name} for now…`);
+      continue;
+    }
+
+    if (settled.results.length === 0) {
+      onStatus?.(`No strong matches found in ${settled.source.name}.`);
+      continue;
+    }
+
+    onStatus?.(`Adding ${settled.results.length} matching ${settled.source.name}…`);
+
+    for (const job of settled.results) {
+      const linkKey = normalizeResumeToken(job.job_apply_link || `${job.employer_name}|${job.job_title}`);
+      if (seenLinks.has(linkKey)) continue;
+      seenLinks.add(linkKey);
+      emitted.push(job);
+      if (typeof onJobFound === 'function') await onJobFound(job);
+    }
+  }
+
+  return sortPipelineJobs(emitted);
+};
+
+exports._runProfileJobSearch = runProfileJobSearch;
+
 // Reset search count if a new day has started
 const resetSearchCountIfNeeded = async (user) => {
   const now = new Date();
@@ -567,35 +908,17 @@ exports.getUsage = async (req, res) => {
   }
 };
 
-/**
- * SSE streaming job search.
- * GET /api/jobs/search/stream?days=N
- *
- * Pipeline:
- *   1. Validate auth + plan limits
- *   2. Open SSE connection (text/event-stream)
- *   3. For each job found by searchJobsStreaming → emit immediately so frontend appends it live
- *   4. After all sources are exhausted → save qualifying jobs to DB → emit 'done'
- *
- * Event shapes:
- *   { type: 'status', message: string }   — progress update
- *   { type: 'job', job: JobListing }       — a single matching job (emit immediately)
- *   { type: 'done', count: number, message: string }
- *   { type: 'error', message: string, limitReached?: boolean }
- */
 exports.streamJobSearch = async (req, res) => {
-  // ── SSE headers ──
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx/proxy buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const send = (obj) => {
     if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`);
   };
 
-  // Heartbeat keeps the connection alive through proxies / load balancers
   const heartbeat = setInterval(() => {
     if (!res.writableEnded) res.write(':heartbeat\n\n');
   }, 20000);
@@ -612,10 +935,22 @@ exports.streamJobSearch = async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
-        id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, parsedResumeText: true, jobRole: true, location: true,
-        experience: true, education: true, subscriptionPlan: true,
-        stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
+        id: true,
+        fullName: true,
+        email: true,
+        phone: true,
+        linkedinProfile: true,
+        keySkills: true,
+        resumeUrl: true,
+        parsedResumeText: true,
+        jobRole: true,
+        location: true,
+        experience: true,
+        education: true,
+        subscriptionPlan: true,
+        stripeSessionId: true,
+        jobSearchCount: true,
+        lastSearchReset: true,
       },
     });
 
@@ -627,7 +962,6 @@ exports.streamJobSearch = async (req, res) => {
     const plan = normalizePlan(await autoVerifyStripeSession(user));
     const limit = getPlanLimit(plan);
     const used = await resetSearchCountIfNeeded(user);
-
     if (used >= limit.maxSearches) {
       send({
         type: 'error',
@@ -638,53 +972,38 @@ exports.streamJobSearch = async (req, res) => {
     }
 
     const days = Math.min(30, Math.max(1, parseInt(req.query.days, 10) || 1));
-    send({ type: 'status', message: 'Starting job search based on your profile…' });
-
-    // Track how many were saved to DB successfully (updated in real time)
     let savedCount = 0;
-    const seenLinks = new Set(); // deduplicate within this stream session
+    const seenLinks = new Set();
 
-    /**
-     * onJobFound callback — called by searchJobsStreaming for every qualifying job.
-     * We save the job to DB immediately, then emit the DB record (with real id) to the frontend.
-     * This way the frontend gets the real DB id and the job is persisted even if the connection drops.
-     */
     const onJobFound = async (job) => {
-      // Skip duplicate apply links within this session
-      const linkKey = (job.job_apply_link || '').toLowerCase();
-      if (linkKey && seenLinks.has(linkKey)) return;
-      if (linkKey) seenLinks.add(linkKey);
+      const linkKey = normalizeResumeToken(job.job_apply_link || `${job.employer_name}|${job.job_title}`);
+      if (seenLinks.has(linkKey)) return;
+      seenLinks.add(linkKey);
 
-      // Save to DB immediately — fire-and-forget pattern with await so we get the real id
       const dbRecord = await saveOneJobForUser(userId, job);
-      savedCount += dbRecord ? 1 : 0;
+      if (dbRecord) savedCount += 1;
 
-      // Emit the job with the real DB id (so frontend job.id is always the real PK)
-      const jobWithId = dbRecord
-        ? { ...job, id: dbRecord.id, saved_at: dbRecord.createdAt }
-        : job;
-
-      send({ type: 'job', job: jobWithId });
-
-      // Invalidate the in-memory matched-jobs cache so the refreshed list is always fresh
+      send({
+        type: 'job',
+        job: dbRecord
+          ? { ...job, id: dbRecord.id, saved_at: dbRecord.createdAt }
+          : job,
+      });
       invalidateMatchedJobsCache(userId);
     };
 
-    const emittedJobs = await jsJobSearchService.searchJobsStreaming(
-      user,
-      days,
+    const emittedJobs = await runProfileJobSearch(user, days, {
       onJobFound,
-      (msg) => send({ type: 'status', message: msg }),
-    );
+      onStatus: (message) => send({ type: 'status', message }),
+    });
 
-    // Increment search count once the full pipeline finishes
     try {
       await prisma.user.update({
         where: { id: userId },
         data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
       });
-    } catch (err) {
-      console.error('streamJobSearch count increment error:', err.message);
+    } catch (error) {
+      console.error('streamJobSearch count increment error:', error.message);
     }
 
     invalidateDashboardStatsCache(userId);
@@ -694,10 +1013,10 @@ exports.streamJobSearch = async (req, res) => {
       type: 'done',
       count: savedCount,
       message: savedCount > 0
-        ? `Found ${savedCount} matching job${savedCount === 1 ? '' : 's'} for your profile!`
+        ? `Found ${savedCount} matching job${savedCount === 1 ? '' : 's'} for your profile.`
         : emittedJobs.length > 0
-          ? 'Jobs found but could not be saved. Please refresh.'
-          : 'No matching jobs found for your profile and time window.',
+          ? 'Matching jobs were found but could not be saved.'
+          : 'No 60%+ matches were found for your profile in that time window.',
     });
   } catch (error) {
     console.error('streamJobSearch error:', error.message || error);
@@ -707,7 +1026,6 @@ exports.streamJobSearch = async (req, res) => {
   }
 };
 
-// Trigger job search directly and save results for immediate frontend display.
 exports.triggerN8nWorkflow = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -716,19 +1034,30 @@ exports.triggerN8nWorkflow = async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
-        id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, parsedResumeText: true, jobRole: true, location: true, experience: true, education: true,
-        subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
+        id: true,
+        fullName: true,
+        email: true,
+        phone: true,
+        linkedinProfile: true,
+        keySkills: true,
+        resumeUrl: true,
+        parsedResumeText: true,
+        jobRole: true,
+        location: true,
+        experience: true,
+        education: true,
+        subscriptionPlan: true,
+        stripeSessionId: true,
+        jobSearchCount: true,
+        lastSearchReset: true,
       },
     });
 
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    // Self-healing plan check
     const plan = normalizePlan(await autoVerifyStripeSession(user));
     const limit = getPlanLimit(plan);
     const used = await resetSearchCountIfNeeded(user);
-
     if (used >= limit.maxSearches) {
       return res.status(403).json({
         message: `You've reached your ${limit.label} plan limit of ${limit.maxSearches} searches today. Upgrade for more!`,
@@ -739,17 +1068,16 @@ exports.triggerN8nWorkflow = async (req, res) => {
     }
 
     const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
-    const results = await jsJobSearchService.searchJobs(user, days);
+    const results = await runProfileJobSearch(user, days);
     const savedJobs = await saveSearchResultsForUser(userId, results);
 
-    // Increment search count and update lastSearchReset
     try {
       await prisma.user.update({
         where: { id: userId },
         data: { jobSearchCount: { increment: 1 }, lastSearchReset: new Date() },
       });
-    } catch (err) {
-      console.error('Failed to increment search count:', err.message);
+    } catch (error) {
+      console.error('triggerN8nWorkflow count increment error:', error.message);
     }
 
     invalidateDashboardStatsCache(userId);
@@ -757,14 +1085,13 @@ exports.triggerN8nWorkflow = async (req, res) => {
 
     return res.json({
       message: savedJobs.length > 0
-        ? `Found ${savedJobs.length} matching job${savedJobs.length === 1 ? '' : 's'}.`
-        : 'No matching jobs found for this profile and time window.',
+        ? `Found ${savedJobs.length} matching job${savedJobs.length === 1 ? '' : 's'} for your profile.`
+        : 'No 60%+ matches were found for your profile in that time window.',
       jobs: savedJobs.map((job) => mapSavedJobToListing(job, user)),
-      mode: 'js',
+      mode: 'profile',
     });
   } catch (error) {
-    console.error('Job search error:', error.message || error);
-    console.error('Job search stack:', error.stack);
+    console.error('triggerN8nWorkflow error:', error.message || error);
     res.status(500).json({ message: 'Failed to trigger job search', error: error.message || String(error) });
   }
 };
@@ -830,26 +1157,11 @@ exports.getJob = async (req, res) => {
   }
 };
 
-// Scrape jobs
-exports.scrapeJobs = async (req, res) => {
-  try {
-    const { searchTerm, location } = req.body;
-    const result = await jobScraperService.scrapeAllJobs(searchTerm, location);
-    res.json({ message: 'Job scraping completed', ...result });
-  } catch (error) {
-    res.status(500).json({ message: 'Job scraping failed', error: error.message });
-  }
-};
+// Scrape jobs — pipeline removed
+exports.scrapeJobs = (req, res) => res.status(503).json({ message: 'Job scraper pipeline is being rebuilt.' });
 
-// Add sample jobs
-exports.addSampleJobs = async (req, res) => {
-  try {
-    const result = await jobScraperService.addSampleJobs();
-    res.json({ message: 'Sample jobs added', ...result });
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to add sample jobs', error: error.message });
-  }
-};
+// Add sample jobs — pipeline removed
+exports.addSampleJobs = (req, res) => res.status(503).json({ message: 'Job scraper pipeline is being rebuilt.' });
 
 // Apply for a job
 exports.applyForJob = async (req, res) => {
@@ -1510,13 +1822,10 @@ exports.getSavedJobs = async (req, res) => {
       }
     }
 
-    const STRICT_MATCH_SCORE = 60;
-    const FALLBACK_MATCH_SCORE = 45;
-
     // Single query: fetch enough rows to determine threshold and deduplicate
     // Default order: newest first (createdAt desc) — frontend sort controls handle score ordering
     const allJobs = await prisma.savedJobResult.findMany({
-      where: { userId, matchScore: { gte: FALLBACK_MATCH_SCORE } },
+      where: { userId, matchScore: { gte: PROFILE_JOB_MIN_SCORE } },
       orderBy: [{ createdAt: 'desc' }],
       take: 200,
       select: {
@@ -1528,16 +1837,9 @@ exports.getSavedJobs = async (req, res) => {
       },
     });
 
-    // Determine threshold from fetched rows (no second DB round-trip)
-    const strictCount = allJobs.filter(j => (j.matchScore || 0) >= STRICT_MATCH_SCORE).length;
-    const minScore = strictCount >= 10 ? STRICT_MATCH_SCORE : FALLBACK_MATCH_SCORE;
-    const filtered = minScore === STRICT_MATCH_SCORE
-      ? allJobs.filter(j => (j.matchScore || 0) >= STRICT_MATCH_SCORE)
-      : allJobs;
-
     const deduped = [];
     const seenJobKeys = new Set();
-    for (const job of filtered) {
+    for (const job of allJobs) {
       const key = normalizeSavedJobDedupeKey(job) || job.applyLink || job.id;
       if (seenJobKeys.has(key)) continue;
       seenJobKeys.add(key);
@@ -1547,7 +1849,7 @@ exports.getSavedJobs = async (req, res) => {
     const jobs = deduped.slice(skip, skip + limit);
     const total = deduped.length;
     const mapped = jobs.map((job) => mapSavedJobToListing(job, req.user || {}));
-    const responseData = { jobs: mapped, total, page, limit, minScore };
+    const responseData = { jobs: mapped, total, page, limit, minScore: PROFILE_JOB_MIN_SCORE };
 
     // Cache page 1 result per user for 5 minutes
     if (page === 1) {

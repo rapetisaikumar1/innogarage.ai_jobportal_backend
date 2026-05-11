@@ -1,14 +1,18 @@
 const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const jsJobSearchService = require('../services/jsJobSearchService');
 const aiService = require('../services/aiService');
+const {
+  AVAILABLE_TECHNOLOGY_CATEGORIES,
+  normalizeTechnologyName,
+} = require('../constants/availableTechnologies');
 const {
   _calculateResumeIntelligence,
   _getParsedResumeTextForUser,
   _getPlanUsageForUser,
   _invalidateDashboardStatsCache,
   _invalidateMatchedJobsCache,
+  _runProfileJobSearch,
   _saveOneJobForUser,
 } = require('./jobController');
 
@@ -105,6 +109,79 @@ const saveSearchResultsForStudent = async (studentId, results) => {
   return saved;
 };
 
+const AVAILABLE_TECH_CATEGORY_ORDER = new Map(
+  AVAILABLE_TECHNOLOGY_CATEGORIES.map((category, index) => [category, index])
+);
+
+const ANALYTICS_CACHE_TTL_MS = 15 * 1000;
+const TECHNOLOGY_CACHE_TTL_MS = 30 * 1000;
+const USER_LIST_CACHE_TTL_MS = 20 * 1000;
+let analyticsCache = { expiresAt: 0, payload: null };
+const availableTechnologiesCache = new Map();
+const adminListCache = new Map();
+const studentListCache = new Map();
+
+const clearAvailableTechnologiesCache = () => availableTechnologiesCache.clear();
+const clearAdminListCache = () => adminListCache.clear();
+const clearStudentListCache = () => studentListCache.clear();
+
+const getCachedListPayload = (cache, key) => {
+  const cached = cache.get(key);
+  if (!cached || Date.now() >= cached.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.payload;
+};
+
+const setCachedListPayload = (cache, key, payload) => {
+  cache.set(key, {
+    payload,
+    expiresAt: Date.now() + USER_LIST_CACHE_TTL_MS,
+  });
+};
+
+const sortAvailableTechnologies = (technologies = []) => {
+  return [...technologies].sort((left, right) => {
+    const categoryOrderDiff =
+      (AVAILABLE_TECH_CATEGORY_ORDER.get(left.category) ?? Number.MAX_SAFE_INTEGER) -
+      (AVAILABLE_TECH_CATEGORY_ORDER.get(right.category) ?? Number.MAX_SAFE_INTEGER);
+
+    if (categoryOrderDiff !== 0) return categoryOrderDiff;
+
+    const sortOrderDiff = (left.sortOrder ?? 0) - (right.sortOrder ?? 0);
+    if (sortOrderDiff !== 0) return sortOrderDiff;
+
+    return left.name.localeCompare(right.name);
+  });
+};
+
+const buildTechnologyUsageCounts = (students = []) => {
+  const usageCounts = new Map();
+
+  students.forEach((student) => {
+    const studentValues = new Set();
+    const normalizedRole = normalizeTechnologyName(student.jobRole || '');
+
+    if (normalizedRole) {
+      studentValues.add(normalizedRole);
+    }
+
+    (student.keySkills || []).forEach((skill) => {
+      const normalizedSkill = normalizeTechnologyName(skill || '');
+      if (normalizedSkill) {
+        studentValues.add(normalizedSkill);
+      }
+    });
+
+    studentValues.forEach((value) => {
+      usageCounts.set(value, (usageCounts.get(value) || 0) + 1);
+    });
+  });
+
+  return usageCounts;
+};
+
 // ---- Admin (Mentor) Management ----
 
 // Create Super Admin
@@ -152,12 +229,7 @@ exports.createSuperAdmin = async (req, res) => {
 // Create Admin (Mentor)
 exports.createAdmin = async (req, res) => {
   try {
-    const { fullName, email, password, mentorBio, phone, department } = req.body;
-
-    const validDepartments = ['MARKETING', 'PROXY', 'HR'];
-    if (department && !validDepartments.includes(department)) {
-      return res.status(400).json({ message: 'Invalid department. Must be MARKETING, PROXY, or HR' });
-    }
+    const { fullName, email, password, mentorBio, phone } = req.body;
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
@@ -176,7 +248,6 @@ exports.createAdmin = async (req, res) => {
         isActive: true,
         isEmailVerified: true,
         mentorBio,
-        department: department || null,
       },
       select: {
         id: true,
@@ -186,10 +257,11 @@ exports.createAdmin = async (req, res) => {
         role: true,
         isActive: true,
         mentorBio: true,
-        department: true,
         createdAt: true,
       },
     });
+
+    clearAdminListCache();
 
     res.status(201).json(admin);
   } catch (error) {
@@ -200,23 +272,39 @@ exports.createAdmin = async (req, res) => {
 // Get all admins
 exports.getAdmins = async (req, res) => {
   try {
+    const summary = req.query.summary === 'true';
+    const cacheKey = JSON.stringify({ summary });
+    const cachedAdmins = getCachedListPayload(adminListCache, cacheKey);
+
+    if (cachedAdmins) {
+      return res.json(cachedAdmins);
+    }
+
     const admins = await prisma.user.findMany({
       where: { role: 'ADMIN' },
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        phone: true,
-        isActive: true,
-        mentorBio: true,
-        department: true,
-        createdAt: true,
-        _count: {
-          select: { assignedStudents: true, mentoringSlots: true },
-        },
-      },
+      select: summary
+        ? {
+            id: true,
+            fullName: true,
+            email: true,
+            isActive: true,
+          }
+        : {
+            id: true,
+            fullName: true,
+            email: true,
+            phone: true,
+            isActive: true,
+            mentorBio: true,
+            createdAt: true,
+            _count: {
+              select: { assignedStudents: true, mentoringSlots: true },
+            },
+          },
       orderBy: { createdAt: 'desc' },
     });
+
+    setCachedListPayload(adminListCache, cacheKey, admins);
 
     res.json(admins);
   } catch (error) {
@@ -240,37 +328,69 @@ exports.toggleAdminStatus = async (req, res) => {
       select: { id: true, fullName: true, isActive: true },
     });
 
+    clearAdminListCache();
+
     res.json(updated);
   } catch (error) {
     res.status(500).json({ message: 'Failed to toggle admin status', error: error.message });
   }
 };
 
-// Update admin department
-exports.updateAdminDepartment = async (req, res) => {
+// Update admin details and optional credentials
+exports.updateAdmin = async (req, res) => {
   try {
     const { id } = req.params;
-    const { department } = req.body;
-
-    const validDepartments = ['MARKETING', 'PROXY', 'HR'];
-    if (!department || !validDepartments.includes(department)) {
-      return res.status(400).json({ message: 'Invalid department. Must be MARKETING, PROXY, or HR' });
-    }
+    const { fullName, email, phone, password } = req.body;
 
     const admin = await prisma.user.findUnique({ where: { id } });
     if (!admin || admin.role !== 'ADMIN') {
       return res.status(404).json({ message: 'Admin not found' });
     }
 
+    if (!fullName || !email) {
+      return res.status(400).json({ message: 'Full name and email are required' });
+    }
+
+    if (email !== admin.email) {
+      const existing = await prisma.user.findUnique({ where: { email } });
+      if (existing && existing.id !== id) {
+        return res.status(409).json({ message: 'Email already registered' });
+      }
+    }
+
+    const data = {
+      fullName,
+      email,
+      phone: phone || null,
+    };
+
+    if (password) {
+      data.password = await bcrypt.hash(password, 12);
+    }
+
     const updated = await prisma.user.update({
       where: { id },
-      data: { department },
-      select: { id: true, fullName: true, department: true },
+      data,
+      select: {
+        id: true,
+        fullName: true,
+        email: true,
+        phone: true,
+        role: true,
+        isActive: true,
+        mentorBio: true,
+        createdAt: true,
+        _count: {
+          select: { assignedStudents: true, mentoringSlots: true },
+        },
+      },
     });
+
+    clearAdminListCache();
 
     res.json(updated);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to update department', error: error.message });
+    res.status(500).json({ message: 'Failed to update admin', error: error.message });
   }
 };
 
@@ -280,7 +400,21 @@ exports.updateAdminDepartment = async (req, res) => {
 exports.getStudents = async (req, res) => {
   try {
     const { search, page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const summary = req.query.summary === 'true';
+    const pageNumber = parseInt(page, 10);
+    const limitNumber = parseInt(limit, 10);
+    const skip = (pageNumber - 1) * limitNumber;
+    const cacheKey = JSON.stringify({
+      search: search || '',
+      page: pageNumber,
+      limit: limitNumber,
+      summary,
+    });
+    const cachedStudents = getCachedListPayload(studentListCache, cacheKey);
+
+    if (cachedStudents) {
+      return res.json(cachedStudents);
+    }
 
     const where = { role: 'STUDENT' };
     if (search) {
@@ -294,51 +428,79 @@ exports.getStudents = async (req, res) => {
     const [students, total] = await Promise.all([
       prisma.user.findMany({
         where,
-        select: {
-          id: true,
-          registrationNumber: true,
-          fullName: true,
-          email: true,
-          phone: true,
-          isActive: true,
-          isEmailVerified: true,
-          status: true,
-          education: true,
-          experience: true,
-          keySkills: true,
-          resumeUrl: true,
-          subscriptionPlan: true,
-          assignedMentorId: true,
-          assignedMentor: {
-            select: { id: true, fullName: true },
-          },
-          adminAssignments: {
-            include: {
-              admin: { select: { id: true, fullName: true, email: true, department: true } },
+        select: summary
+          ? {
+              id: true,
+              registrationNumber: true,
+              fullName: true,
+              email: true,
+              isActive: true,
+              status: true,
+              subscriptionPlan: true,
+              assignedMentorId: true,
+              assignedMentor: {
+                select: { id: true, fullName: true },
+              },
+              adminAssignments: {
+                select: {
+                  id: true,
+                  adminId: true,
+                  admin: { select: { id: true, fullName: true } },
+                },
+                orderBy: { createdAt: 'asc' },
+              },
+              createdAt: true,
+            }
+          : {
+              id: true,
+              registrationNumber: true,
+              fullName: true,
+              email: true,
+              phone: true,
+              isActive: true,
+              isEmailVerified: true,
+              status: true,
+              education: true,
+              experience: true,
+              keySkills: true,
+              resumeUrl: true,
+              subscriptionPlan: true,
+              assignedMentorId: true,
+              assignedMentor: {
+                select: { id: true, fullName: true },
+              },
+              adminAssignments: {
+                select: {
+                  id: true,
+                  adminId: true,
+                  admin: { select: { id: true, fullName: true, email: true } },
+                },
+                orderBy: { createdAt: 'asc' },
+              },
+              createdAt: true,
+              _count: {
+                select: { jobApplications: true, bookings: true, sheetApplications: true },
+              },
             },
-            orderBy: { createdAt: 'asc' },
-          },
-          createdAt: true,
-          _count: {
-            select: { jobApplications: true, bookings: true, sheetApplications: true },
-          },
-        },
         orderBy: { createdAt: 'desc' },
         skip,
-        take: parseInt(limit),
+        take: limitNumber,
       }),
       prisma.user.count({ where }),
     ]);
 
-    res.json({
+    const payload = {
       students,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: pageNumber,
+        limit: limitNumber,
         total,
-        totalPages: Math.ceil(total / parseInt(limit)),
+        totalPages: Math.ceil(total / limitNumber),
       },
-    });
+    };
+
+    setCachedListPayload(studentListCache, cacheKey, payload);
+    res.json(payload);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch students', error: error.message });
   }
@@ -356,6 +518,7 @@ exports.getStudentDetail = async (req, res) => {
         email: true,
         phone: true,
         isActive: true,
+        status: true,
         isEmailVerified: true,
         linkedinProfile: true,
         education: true,
@@ -372,8 +535,7 @@ exports.getStudentDetail = async (req, res) => {
         adminAssignments: {
           select: {
             id: true,
-            department: true,
-            admin: { select: { id: true, fullName: true, email: true, department: true } },
+            admin: { select: { id: true, fullName: true, email: true } },
           },
         },
         createdAt: true,
@@ -421,6 +583,7 @@ exports.deleteStudent = async (req, res) => {
     }
 
     await prisma.user.delete({ where: { id } });
+    clearStudentListCache();
     res.json({ message: 'Student deleted' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to delete student', error: error.message });
@@ -449,6 +612,8 @@ exports.updateStudentPlan = async (req, res) => {
       select: { id: true, fullName: true, subscriptionPlan: true },
     });
 
+    clearStudentListCache();
+
     res.json(updated);
   } catch (error) {
     res.status(500).json({ message: 'Failed to update plan', error: error.message });
@@ -471,6 +636,8 @@ exports.toggleStudentStatus = async (req, res) => {
       data: { status: newStatus },
       select: { id: true, fullName: true, status: true },
     });
+
+    clearStudentListCache();
 
     res.json(updated);
   } catch (error) {
@@ -516,6 +683,8 @@ exports.registerStudent = async (req, res) => {
         createdAt: true,
       },
     });
+
+    clearStudentListCache();
 
     res.status(201).json({ ...student, tempPassword });
   } catch (error) {
@@ -582,6 +751,7 @@ exports.assignMentor = async (req, res) => {
         where: { id: { in: studentIds }, role: 'STUDENT' },
         data: { assignedMentorId: null },
       });
+      clearStudentListCache();
       return res.json({ message: `${studentIds.length} students unassigned from all admins` });
     }
 
@@ -590,32 +760,26 @@ exports.assignMentor = async (req, res) => {
       return res.status(404).json({ message: 'Admin not found' });
     }
 
-    // For each student, check they don't already have 5 admins
-    // Rule: first admin must be MARKETING department
+    // For now, each student can only have one assigned admin.
     const results = [];
     for (const studentId of studentIds) {
       const existingAssignments = await prisma.studentAdminAssignment.findMany({
         where: { studentId },
-        include: { admin: { select: { id: true, department: true } } },
+        select: { adminId: true },
       });
       const existingCount = existingAssignments.length;
-      const alreadyAssigned = existingAssignments.some(a => a.adminId === mentorId);
+      const alreadyAssigned = existingAssignments.some((assignment) => assignment.adminId === mentorId);
       if (alreadyAssigned) {
         results.push({ studentId, status: 'already_assigned' });
         continue;
       }
-      if (existingCount >= 5) {
-        results.push({ studentId, status: 'limit_reached' });
+      if (existingCount >= 1) {
+        results.push({ studentId, status: 'limit_reached', message: 'Only one admin can be assigned per student' });
         continue;
       }
-      // First assignment must be a MARKETING admin
-      if (existingCount === 0 && mentor.department !== 'MARKETING') {
-        results.push({ studentId, status: 'marketing_first', message: 'First admin must be from Marketing department' });
-        continue;
-      }
-      // After first, check that this department type isn't duplicated
+
       await prisma.studentAdminAssignment.create({
-        data: { studentId, adminId: mentorId, department: mentor.department || null },
+        data: { studentId, adminId: mentorId },
       });
       // Keep legacy field in sync (set to first assigned admin)
       await prisma.user.update({
@@ -658,7 +822,10 @@ exports.assignMentor = async (req, res) => {
     const assigned = results.filter(r => r.status === 'assigned').length;
     const limited = results.filter(r => r.status === 'limit_reached').length;
     let msg = `${assigned} student(s) assigned to ${mentor.fullName}`;
-    if (limited > 0) msg += `. ${limited} student(s) already have 5 admins assigned.`;
+    if (limited > 0) msg += `. ${limited} student(s) already have an admin assigned.`;
+
+    clearStudentListCache();
+    clearAdminListCache();
 
     res.json({ message: msg, results });
   } catch (error) {
@@ -668,9 +835,138 @@ exports.assignMentor = async (req, res) => {
 
 // ---- Analytics ----
 
+exports.getAvailableTechnologies = async (req, res) => {
+  try {
+    const includeUsage = req.query.usage !== 'false';
+    const cacheKey = includeUsage ? 'with-usage' : 'list-only';
+    const cached = availableTechnologiesCache.get(cacheKey);
+
+    if (cached && Date.now() < cached.expiresAt) {
+      return res.json(cached.payload);
+    }
+
+    const technologies = await prisma.availableTechnology.findMany({
+      select: {
+        id: true,
+        name: true,
+        normalizedName: true,
+        category: true,
+        sortOrder: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    if (!includeUsage) {
+      const payload = sortAvailableTechnologies(technologies).map(({ normalizedName, ...technology }) => technology);
+      availableTechnologiesCache.set(cacheKey, { payload, expiresAt: Date.now() + TECHNOLOGY_CACHE_TTL_MS });
+      return res.json(payload);
+    }
+
+    const students = await prisma.user.findMany({
+      where: { role: 'STUDENT' },
+      select: {
+        jobRole: true,
+        keySkills: true,
+      },
+    });
+    const usageCounts = buildTechnologyUsageCounts(students);
+    const payload = sortAvailableTechnologies(technologies).map(({ normalizedName, ...technology }) => ({
+      ...technology,
+      usageCount: usageCounts.get(normalizedName) || 0,
+    }));
+
+    availableTechnologiesCache.set(cacheKey, { payload, expiresAt: Date.now() + TECHNOLOGY_CACHE_TTL_MS });
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to fetch available technologies', error: error.message });
+  }
+};
+
+exports.createAvailableTechnology = async (req, res) => {
+  try {
+    const rawName = typeof req.body?.name === 'string' ? req.body.name : '';
+    const trimmedName = rawName.trim().replace(/\s+/g, ' ');
+    const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
+
+    if (!trimmedName || !category) {
+      return res.status(400).json({ message: 'Technology name and category are required' });
+    }
+
+    if (!AVAILABLE_TECHNOLOGY_CATEGORIES.includes(category)) {
+      return res.status(400).json({ message: 'Invalid technology category' });
+    }
+
+    const normalizedName = normalizeTechnologyName(trimmedName);
+    const existingTechnology = await prisma.availableTechnology.findUnique({
+      where: { normalizedName },
+      select: { id: true },
+    });
+
+    if (existingTechnology) {
+      return res.status(409).json({ message: 'Technology already exists' });
+    }
+
+    const categoryOrder = await prisma.availableTechnology.aggregate({
+      where: { category },
+      _max: { sortOrder: true },
+    });
+
+    const technology = await prisma.availableTechnology.create({
+      data: {
+        name: trimmedName,
+        normalizedName,
+        category,
+        sortOrder: (categoryOrder._max.sortOrder ?? 0) + 1,
+      },
+      select: {
+        id: true,
+        name: true,
+        category: true,
+        sortOrder: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    res.status(201).json({
+      ...technology,
+      usageCount: 0,
+    });
+    clearAvailableTechnologiesCache();
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to create technology', error: error.message });
+  }
+};
+
+exports.deleteAvailableTechnology = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const existingTechnology = await prisma.availableTechnology.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+
+    if (!existingTechnology) {
+      return res.status(404).json({ message: 'Technology not found' });
+    }
+
+    await prisma.availableTechnology.delete({ where: { id } });
+    clearAvailableTechnologiesCache();
+
+    res.json({ message: 'Technology deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to delete technology', error: error.message });
+  }
+};
+
 // Get platform analytics
 exports.getAnalytics = async (req, res) => {
   try {
+    if (analyticsCache.payload && Date.now() < analyticsCache.expiresAt) {
+      return res.json(analyticsCache.payload);
+    }
+
     const [
       totalStudents,
       totalAdmins,
@@ -699,7 +995,7 @@ exports.getAnalytics = async (req, res) => {
 
     // Parallel: recent apps, combined status breakdown, technology breakdown
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const [recentApplications, internalApplicationsByStatus, sheetApplicationsByStatus, studentsWithRole] = await Promise.all([
+    const [recentApplications, internalApplicationsByStatus, sheetApplicationsByStatus, studentsWithRole, recentStudents] = await Promise.all([
       prisma.jobApplication.groupBy({
         by: ['appliedAt'],
         where: { appliedAt: { gte: sevenDaysAgo } },
@@ -716,6 +1012,20 @@ exports.getAnalytics = async (req, res) => {
       prisma.user.findMany({
         where: { role: 'STUDENT', jobRole: { not: null } },
         select: { jobRole: true },
+      }),
+      prisma.user.findMany({
+        where: { role: 'STUDENT' },
+        select: {
+          id: true,
+          registrationNumber: true,
+          fullName: true,
+          email: true,
+          createdAt: true,
+          isActive: true,
+          status: true,
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
       }),
     ]);
 
@@ -743,7 +1053,7 @@ exports.getAnalytics = async (req, res) => {
     const offersReceived = statusBreakdown.OFFER_RECEIVED || 0;
     const rejectedApplications = statusBreakdown.REJECTED || 0;
 
-    res.json({
+    const payload = {
       totalStudents,
       totalAdmins,
       totalMentors: totalAdmins,
@@ -762,9 +1072,13 @@ exports.getAnalytics = async (req, res) => {
       completedBookings,
       totalMaterials,
       recentApplications,
+      recentStudents,
       applicationsByStatus: statusBreakdown,
       technologyBreakdown,
-    });
+    };
+
+    analyticsCache = { payload, expiresAt: Date.now() + ANALYTICS_CACHE_TTL_MS };
+    res.json(payload);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch analytics', error: error.message });
   }
@@ -775,24 +1089,17 @@ exports.getAnalytics = async (req, res) => {
 // Get mentor's assigned students
 exports.getAssignedStudents = async (req, res) => {
   try {
-    // Check new multi-admin table first, fall back to legacy
-    const assignments = await prisma.studentAdminAssignment.findMany({
-      where: { adminId: req.user.id },
-      select: { studentId: true },
-    });
-    const studentIds = assignments.map(a => a.studentId);
-
-    // Also include legacy assignedMentorId students
-    const legacyStudents = await prisma.user.findMany({
-      where: { assignedMentorId: req.user.id, role: 'STUDENT', id: { notIn: studentIds } },
-      select: { id: true },
-    });
-    const allIds = [...studentIds, ...legacyStudents.map(s => s.id)];
-
     const students = await prisma.user.findMany({
-      where: { id: { in: allIds }, role: 'STUDENT' },
+      where: {
+        role: 'STUDENT',
+        OR: [
+          { assignedMentorId: req.user.id },
+          { adminAssignments: { some: { adminId: req.user.id } } },
+        ],
+      },
       select: {
         id: true,
+        registrationNumber: true,
         fullName: true,
         email: true,
         phone: true,
@@ -985,6 +1292,9 @@ exports.getStudentApplications = async (req, res) => {
 exports.getStudentMatchedJobs = async (req, res) => {
   try {
     const { studentId } = req.params;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const skip = (page - 1) * limit;
     const MIN_MATCH_SCORE = 60;
 
     const student = await prisma.user.findUnique({
@@ -995,13 +1305,32 @@ exports.getStudentMatchedJobs = async (req, res) => {
       return res.status(404).json({ message: 'Student not found' });
     }
 
-    const jobs = await prisma.savedJobResult.findMany({
+    const allJobs = await prisma.savedJobResult.findMany({
       where: { userId: studentId, matchScore: { gte: MIN_MATCH_SCORE } },
-      orderBy: [{ matchScore: 'desc' }, { createdAt: 'desc' }],
-      take: 30,
+      orderBy: [{ createdAt: 'desc' }],
+      take: 200,
     });
 
-    res.json({ jobs: jobs.map((job) => mapSavedJobToListing(job, student)) });
+    const seenJobKeys = new Set();
+    const deduped = [];
+    for (const job of allJobs) {
+      const key = [job.employerName, job.jobTitle, job.jobCountry]
+        .map((value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim())
+        .join('|') || job.applyLink || job.id;
+      if (seenJobKeys.has(key)) continue;
+      seenJobKeys.add(key);
+      deduped.push(job);
+    }
+
+    const jobs = deduped.slice(skip, skip + limit);
+
+    res.json({
+      jobs: jobs.map((job) => mapSavedJobToListing(job, student)),
+      total: deduped.length,
+      page,
+      limit,
+      minScore: MIN_MATCH_SCORE,
+    });
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch student job listings', error: error.message });
   }
@@ -1117,12 +1446,10 @@ exports.streamStudentJobSearch = async (req, res) => {
       _invalidateMatchedJobsCache(student.id);
     };
 
-    const emittedJobs = await jsJobSearchService.searchJobsStreaming(
-      student,
-      days,
+    const emittedJobs = await _runProfileJobSearch(student, days, {
       onJobFound,
-      (message) => send({ type: 'status', message })
-    );
+      onStatus: (message) => send({ type: 'status', message }),
+    });
 
     try {
       await prisma.user.update({
@@ -1183,6 +1510,9 @@ exports.unassignAdmin = async (req, res) => {
       });
     }
 
+    clearStudentListCache();
+    clearAdminListCache();
+
     res.json({ message: 'Admin unassigned from student' });
   } catch (error) {
     res.status(500).json({ message: 'Failed to unassign admin', error: error.message });
@@ -1199,7 +1529,7 @@ exports.triggerStudentJobSearch = async (req, res) => {
       where: { id: studentId },
       select: {
         id: true, fullName: true, email: true, keySkills: true,
-        resumeUrl: true, jobRole: true, location: true, role: true, experience: true, education: true,
+        resumeUrl: true, parsedResumeText: true, jobRole: true, location: true, role: true, experience: true, education: true,
         subscriptionPlan: true, stripeSessionId: true, jobSearchCount: true, lastSearchReset: true,
       },
     });
@@ -1208,7 +1538,7 @@ exports.triggerStudentJobSearch = async (req, res) => {
     }
 
     const days = Math.min(30, Math.max(1, parseInt(req.body.days, 10) || 1));
-    const results = await jsJobSearchService.searchJobs(student, days);
+  const results = await _runProfileJobSearch(student, days);
     const savedJobs = await saveSearchResultsForStudent(studentId, results);
 
     // Bust the matched-jobs cache so the student sees fresh results immediately
@@ -1217,9 +1547,9 @@ exports.triggerStudentJobSearch = async (req, res) => {
     res.json({
       message: savedJobs.length > 0
         ? `Found ${savedJobs.length} matching jobs for ${student.fullName}.`
-        : 'No matching jobs found for this profile and time window.',
+        : 'No 60%+ matches were found for this profile in that time window.',
       jobs: savedJobs.map((job) => mapSavedJobToListing(job, student)),
-      mode: 'js',
+      mode: 'profile',
     });
   } catch (error) {
     console.error('Admin trigger job search error:', error.message);
@@ -1438,7 +1768,7 @@ exports.getStudentAdmins = async (req, res) => {
       orderBy: { createdAt: 'asc' },
     });
 
-    res.json(assignments.map(a => ({ ...a.admin, department: a.department, assignedAt: a.createdAt })));
+    res.json(assignments.map(a => ({ ...a.admin, assignedAt: a.createdAt })));
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch student admins', error: error.message });
   }
