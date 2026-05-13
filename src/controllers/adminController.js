@@ -13,6 +13,7 @@ const AVAILABLE_TECH_CATEGORY_ORDER = new Map(
 const ANALYTICS_CACHE_TTL_MS = 15 * 1000;
 const TECHNOLOGY_CACHE_TTL_MS = 30 * 1000;
 const USER_LIST_CACHE_TTL_MS = 20 * 1000;
+const VISIBLE_JOB_APPLICATION_STATUSES = ['mentor applied', 'student applied', 'APPLIED'];
 let analyticsCache = { expiresAt: 0, payload: null };
 const availableTechnologiesCache = new Map();
 const adminListCache = new Map();
@@ -21,6 +22,7 @@ const studentListCache = new Map();
 const clearAvailableTechnologiesCache = () => availableTechnologiesCache.clear();
 const clearAdminListCache = () => adminListCache.clear();
 const clearStudentListCache = () => studentListCache.clear();
+const clearAnalyticsCache = () => { analyticsCache = { expiresAt: 0, payload: null }; };
 
 const getCachedListPayload = (cache, key) => {
   const cached = cache.get(key);
@@ -57,23 +59,10 @@ const buildTechnologyUsageCounts = (students = []) => {
   const usageCounts = new Map();
 
   students.forEach((student) => {
-    const studentValues = new Set();
-    const normalizedRole = normalizeTechnologyName(student.jobRole || '');
-
-    if (normalizedRole) {
-      studentValues.add(normalizedRole);
+    const normalizedAssignedTechnology = normalizeTechnologyName(student.assignedTechnology?.name || '');
+    if (normalizedAssignedTechnology) {
+      usageCounts.set(normalizedAssignedTechnology, (usageCounts.get(normalizedAssignedTechnology) || 0) + 1);
     }
-
-    (student.keySkills || []).forEach((skill) => {
-      const normalizedSkill = normalizeTechnologyName(skill || '');
-      if (normalizedSkill) {
-        studentValues.add(normalizedSkill);
-      }
-    });
-
-    studentValues.forEach((value) => {
-      usageCounts.set(value, (usageCounts.get(value) || 0) + 1);
-    });
   });
 
   return usageCounts;
@@ -296,7 +285,7 @@ exports.updateAdmin = async (req, res) => {
 // Get all students
 exports.getStudents = async (req, res) => {
   try {
-    const { search, page = 1, limit = 20 } = req.query;
+    const { search, page = 1, limit = 20, technologyId = '' } = req.query;
     const summary = req.query.summary === 'true';
     const pageNumber = parseInt(page, 10);
     const limitNumber = parseInt(limit, 10);
@@ -306,6 +295,7 @@ exports.getStudents = async (req, res) => {
       page: pageNumber,
       limit: limitNumber,
       summary,
+      technologyId: technologyId || '',
     });
     const cachedStudents = getCachedListPayload(studentListCache, cacheKey);
 
@@ -314,6 +304,9 @@ exports.getStudents = async (req, res) => {
     }
 
     const where = { role: 'STUDENT' };
+    if (technologyId && technologyId !== 'all') {
+      where.assignedTechnologyId = technologyId === 'unassigned' ? null : technologyId;
+    }
     if (search) {
       where.OR = [
         { fullName: { contains: search, mode: 'insensitive' } },
@@ -334,6 +327,10 @@ exports.getStudents = async (req, res) => {
               isActive: true,
               status: true,
               subscriptionPlan: true,
+              assignedTechnologyId: true,
+              assignedTechnology: {
+                select: { id: true, name: true, category: true },
+              },
               assignedMentorId: true,
               assignedMentor: {
                 select: { id: true, fullName: true },
@@ -345,6 +342,9 @@ exports.getStudents = async (req, res) => {
                   admin: { select: { id: true, fullName: true } },
                 },
                 orderBy: { createdAt: 'asc' },
+              },
+              _count: {
+                select: { jobApplications: true },
               },
               createdAt: true,
             }
@@ -362,6 +362,10 @@ exports.getStudents = async (req, res) => {
               keySkills: true,
               resumeUrl: true,
               subscriptionPlan: true,
+              assignedTechnologyId: true,
+              assignedTechnology: {
+                select: { id: true, name: true, category: true },
+              },
               assignedMentorId: true,
               assignedMentor: {
                 select: { id: true, fullName: true },
@@ -376,7 +380,7 @@ exports.getStudents = async (req, res) => {
               },
               createdAt: true,
               _count: {
-                select: { bookings: true },
+                select: { bookings: true, jobApplications: true },
               },
             },
         orderBy: { createdAt: 'desc' },
@@ -422,6 +426,10 @@ exports.getStudentDetail = async (req, res) => {
         experience: true,
         keySkills: true,
         jobRole: true,
+        assignedTechnologyId: true,
+        assignedTechnology: {
+          select: { id: true, name: true, category: true },
+        },
         location: true,
         resumeUrl: true,
         avatarUrl: true,
@@ -447,7 +455,7 @@ exports.getStudentDetail = async (req, res) => {
           take: 10,
         },
         _count: {
-          select: { bookings: true, trainingNotes: true },
+          select: { bookings: true, trainingNotes: true, jobApplications: true },
         },
       },
     });
@@ -507,6 +515,49 @@ exports.updateStudentPlan = async (req, res) => {
     res.json(updated);
   } catch (error) {
     res.status(500).json({ message: 'Failed to update plan', error: error.message });
+  }
+};
+
+exports.updateStudentTechnology = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const rawTechnologyId = typeof req.body?.technologyId === 'string' ? req.body.technologyId.trim() : '';
+
+    const student = await prisma.user.findUnique({ where: { id }, select: { id: true, role: true } });
+    if (!student || student.role !== 'STUDENT') {
+      return res.status(404).json({ message: 'Student not found' });
+    }
+
+    if (rawTechnologyId) {
+      const technology = await prisma.availableTechnology.findUnique({
+        where: { id: rawTechnologyId },
+        select: { id: true },
+      });
+
+      if (!technology) {
+        return res.status(404).json({ message: 'Technology not found' });
+      }
+    }
+
+    const updated = await prisma.user.update({
+      where: { id },
+      data: { assignedTechnologyId: rawTechnologyId || null },
+      select: {
+        id: true,
+        assignedTechnologyId: true,
+        assignedTechnology: {
+          select: { id: true, name: true, category: true },
+        },
+      },
+    });
+
+    clearStudentListCache();
+    clearAvailableTechnologiesCache();
+    clearAnalyticsCache();
+
+    return res.json(updated);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update student technology', error: error.message });
   }
 };
 
@@ -602,6 +653,10 @@ exports.getStudentByRegNumber = async (req, res) => {
         experience: true,
         keySkills: true,
         resumeUrl: true,
+        assignedTechnologyId: true,
+        assignedTechnology: {
+          select: { id: true, name: true, category: true },
+        },
         avatarUrl: true,
         assignedMentorId: true,
         assignedMentor: {
@@ -738,6 +793,7 @@ exports.getAvailableTechnologies = async (req, res) => {
         normalizedName: true,
         category: true,
         sortOrder: true,
+        content: true,
         createdAt: true,
         updatedAt: true,
       },
@@ -752,8 +808,9 @@ exports.getAvailableTechnologies = async (req, res) => {
     const students = await prisma.user.findMany({
       where: { role: 'STUDENT' },
       select: {
-        jobRole: true,
-        keySkills: true,
+        assignedTechnology: {
+          select: { name: true },
+        },
       },
     });
     const usageCounts = buildTechnologyUsageCounts(students);
@@ -774,6 +831,7 @@ exports.createAvailableTechnology = async (req, res) => {
     const rawName = typeof req.body?.name === 'string' ? req.body.name : '';
     const trimmedName = rawName.trim().replace(/\s+/g, ' ');
     const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
 
     if (!trimmedName || !category) {
       return res.status(400).json({ message: 'Technology name and category are required' });
@@ -804,12 +862,14 @@ exports.createAvailableTechnology = async (req, res) => {
         normalizedName,
         category,
         sortOrder: (categoryOrder._max.sortOrder ?? 0) + 1,
+        content,
       },
       select: {
         id: true,
         name: true,
         category: true,
         sortOrder: true,
+        content: true,
         createdAt: true,
         updatedAt: true,
       },
@@ -822,6 +882,42 @@ exports.createAvailableTechnology = async (req, res) => {
     clearAvailableTechnologiesCache();
   } catch (error) {
     res.status(500).json({ message: 'Failed to create technology', error: error.message });
+  }
+};
+
+exports.updateAvailableTechnology = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+
+    const existingTechnology = await prisma.availableTechnology.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+
+    if (!existingTechnology) {
+      return res.status(404).json({ message: 'Technology not found' });
+    }
+
+    const technology = await prisma.availableTechnology.update({
+      where: { id },
+      data: { content },
+      select: {
+        id: true,
+        name: true,
+        category: true,
+        sortOrder: true,
+        content: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    clearAvailableTechnologiesCache();
+
+    return res.json(technology);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update technology', error: error.message });
   }
 };
 
@@ -839,6 +935,8 @@ exports.deleteAvailableTechnology = async (req, res) => {
 
     await prisma.availableTechnology.delete({ where: { id } });
     clearAvailableTechnologiesCache();
+    clearStudentListCache();
+    clearAnalyticsCache();
 
     res.json({ message: 'Technology deleted successfully' });
   } catch (error) {
@@ -849,10 +947,6 @@ exports.deleteAvailableTechnology = async (req, res) => {
 // Get platform analytics
 exports.getAnalytics = async (req, res) => {
   try {
-    if (analyticsCache.payload && Date.now() < analyticsCache.expiresAt) {
-      return res.json(analyticsCache.payload);
-    }
-
     const [
       totalStudents,
       totalAdmins,
@@ -861,6 +955,8 @@ exports.getAnalytics = async (req, res) => {
       studentsWithoutMentor,
       completedBookings,
       totalMaterials,
+      totalApplications,
+      offersReceived,
     ] = await Promise.all([
       prisma.user.count({ where: { role: 'STUDENT' } }),
       prisma.user.count({ where: { role: 'ADMIN' } }),
@@ -869,12 +965,18 @@ exports.getAnalytics = async (req, res) => {
       prisma.user.count({ where: { role: 'STUDENT', assignedMentorId: null, adminAssignments: { none: {} } } }),
       prisma.mentorBooking.count({ where: { status: 'COMPLETED' } }),
       prisma.trainingMaterial.count(),
+      prisma.userJobApplication.count({ where: { status: { in: VISIBLE_JOB_APPLICATION_STATUSES } } }),
+      prisma.userJobApplication.count({ where: { status: 'OFFER_RECEIVED' } }),
     ]);
 
-    const [studentsWithRole, recentStudents] = await Promise.all([
+    const [studentsWithAssignedTechnology, recentStudents] = await Promise.all([
       prisma.user.findMany({
-        where: { role: 'STUDENT', jobRole: { not: null } },
-        select: { jobRole: true },
+        where: { role: 'STUDENT', assignedTechnologyId: { not: null } },
+        select: {
+          assignedTechnology: {
+            select: { name: true },
+          },
+        },
       }),
       prisma.user.findMany({
         where: { role: 'STUDENT' },
@@ -886,6 +988,9 @@ exports.getAnalytics = async (req, res) => {
           createdAt: true,
           isActive: true,
           status: true,
+          assignedTechnology: {
+            select: { id: true, name: true, category: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
         take: 5,
@@ -893,10 +998,10 @@ exports.getAnalytics = async (req, res) => {
     ]);
 
     const technologyBreakdown = {};
-    studentsWithRole.forEach(s => {
-      const role = (s.jobRole || '').trim();
-      if (role) {
-        technologyBreakdown[role] = (technologyBreakdown[role] || 0) + 1;
+    studentsWithAssignedTechnology.forEach((student) => {
+      const technologyName = (student.assignedTechnology?.name || '').trim();
+      if (technologyName) {
+        technologyBreakdown[technologyName] = (technologyBreakdown[technologyName] || 0) + 1;
       }
     });
 
@@ -909,11 +1014,12 @@ exports.getAnalytics = async (req, res) => {
       studentsWithoutMentor,
       completedBookings,
       totalMaterials,
+      totalApplications,
+      offersReceived,
       recentStudents,
       technologyBreakdown,
     };
 
-    analyticsCache = { payload, expiresAt: Date.now() + ANALYTICS_CACHE_TTL_MS };
     res.json(payload);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch analytics', error: error.message });
@@ -943,9 +1049,16 @@ exports.getAssignedStudents = async (req, res) => {
         experience: true,
         keySkills: true,
         resumeUrl: true,
+        assignedTechnologyId: true,
+        assignedTechnology: {
+          select: { id: true, name: true, category: true },
+        },
         isActive: true,
         status: true,
         createdAt: true,
+        _count: {
+          select: { jobApplications: true },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });

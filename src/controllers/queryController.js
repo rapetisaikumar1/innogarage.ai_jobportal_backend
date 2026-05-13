@@ -115,7 +115,13 @@ const getMyQueries = async (req, res) => {
 // Admin / Super Admin: Get queries (ADMIN sees assigned and unassigned, SUPER_ADMIN sees all)
 const getAllQueries = async (req, res) => {
   try {
-    const cacheKey = req.user.role === 'ADMIN' ? `admin:${req.user.id}:all` : 'super-admin:all';
+    const parsedLimit = parseInt(req.query.limit, 10);
+    const parsedPage = parseInt(req.query.page, 10);
+    const limitNumber = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : null;
+    const pageNumber = Number.isInteger(parsedPage) && parsedPage > 0 ? parsedPage : 1;
+    const cacheKey = req.user.role === 'ADMIN'
+      ? `admin:${req.user.id}:all:${pageNumber}:${limitNumber || 'all'}`
+      : `super-admin:all:${pageNumber}:${limitNumber || 'all'}`;
     const cachedQueries = getCachedValue(queryListCache, cacheKey);
     if (cachedQueries) {
       return res.json(cachedQueries);
@@ -131,6 +137,7 @@ const getAllQueries = async (req, res) => {
         assignedTo: { select: { id: true, fullName: true, role: true } },
       },
       orderBy: { createdAt: 'desc' },
+      ...(limitNumber ? { skip: (pageNumber - 1) * limitNumber, take: limitNumber } : {}),
     });
 
     setCachedValue(queryListCache, cacheKey, queries);

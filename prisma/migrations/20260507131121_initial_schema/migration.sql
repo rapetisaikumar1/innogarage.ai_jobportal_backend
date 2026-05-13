@@ -2,12 +2,6 @@
 CREATE TYPE "Role" AS ENUM ('SUPER_ADMIN', 'ADMIN', 'STUDENT');
 
 -- CreateEnum
-CREATE TYPE "ApplicationStatus" AS ENUM ('APPLIED', 'INTERVIEW_SCHEDULED', 'REJECTED', 'OFFER_RECEIVED');
-
--- CreateEnum
-CREATE TYPE "ApplicationType" AS ENUM ('EASY_APPLY', 'MANUAL_APPLY');
-
--- CreateEnum
 CREATE TYPE "BookingStatus" AS ENUM ('PENDING', 'CONFIRMED', 'COMPLETED', 'CANCELLED');
 
 -- CreateEnum
@@ -45,8 +39,6 @@ CREATE TABLE "users" (
     "subscriptionStart" TIMESTAMP(3),
     "subscriptionEnd" TIMESTAMP(3),
     "stripeSessionId" TEXT,
-    "jobSearchCount" INTEGER NOT NULL DEFAULT 0,
-    "lastSearchReset" TIMESTAMP(3),
     "mentorBio" TEXT,
     "assignedMentorId" TEXT,
     "verificationToken" TEXT,
@@ -71,83 +63,6 @@ CREATE TABLE "student_admin_assignments" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "student_admin_assignments_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "saved_job_results" (
-    "id" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "employerName" TEXT,
-    "jobTitle" TEXT,
-    "jobCity" TEXT,
-    "jobState" TEXT,
-    "jobCountry" TEXT,
-    "employmentType" TEXT,
-    "applyLink" TEXT,
-    "employerLogo" TEXT,
-    "source" TEXT,
-    "postedAt" TEXT,
-    "jd" TEXT,
-    "matchScore" INTEGER,
-    "strongMatches" JSONB,
-    "missingSkills" JSONB,
-    "matchSummary" TEXT,
-    "resumeText" TEXT,
-    "originalResume" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT "saved_job_results_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "jobs" (
-    "id" TEXT NOT NULL,
-    "title" TEXT NOT NULL,
-    "company" TEXT NOT NULL,
-    "location" TEXT,
-    "description" TEXT NOT NULL,
-    "source" TEXT NOT NULL,
-    "sourceUrl" TEXT,
-    "applicationType" "ApplicationType" NOT NULL DEFAULT 'MANUAL_APPLY',
-    "salary" TEXT,
-    "datePosted" TIMESTAMP(3),
-    "isActive" BOOLEAN NOT NULL DEFAULT true,
-    "externalId" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "jobs_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "job_applications" (
-    "id" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "jobId" TEXT NOT NULL,
-    "status" "ApplicationStatus" NOT NULL DEFAULT 'APPLIED',
-    "appliedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "resumeUsed" TEXT,
-    "notes" TEXT,
-    "isAutoApplied" BOOLEAN NOT NULL DEFAULT false,
-    "appliedById" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "job_applications_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
-CREATE TABLE "tailored_resumes" (
-    "id" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "jobId" TEXT NOT NULL,
-    "resumeUrl" TEXT NOT NULL,
-    "matchScore" DOUBLE PRECISION,
-    "keywords" TEXT[],
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "tailored_resumes_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -277,24 +192,6 @@ CREATE TABLE "notifications" (
 );
 
 -- CreateTable
-CREATE TABLE "external_job_applications" (
-    "id" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "jobLink" TEXT NOT NULL,
-    "employerName" TEXT,
-    "jobTitle" TEXT,
-    "status" TEXT NOT NULL DEFAULT 'APPLIED',
-    "appliedMethod" TEXT NOT NULL DEFAULT 'BOT',
-    "appliedById" TEXT,
-    "matchScore" TEXT,
-    "pdfLink" TEXT,
-    "reportUrl" TEXT,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT "external_job_applications_pkey" PRIMARY KEY ("id")
-);
-
--- CreateTable
 CREATE TABLE "success_stories" (
     "id" TEXT NOT NULL,
     "userId" TEXT NOT NULL,
@@ -372,33 +269,6 @@ CREATE UNIQUE INDEX "users_googleId_key" ON "users"("googleId");
 CREATE UNIQUE INDEX "student_admin_assignments_studentId_adminId_key" ON "student_admin_assignments"("studentId", "adminId");
 
 -- CreateIndex
-CREATE INDEX "saved_job_results_userId_matchScore_createdAt_idx" ON "saved_job_results"("userId", "matchScore", "createdAt");
-
--- CreateIndex
-CREATE UNIQUE INDEX "jobs_externalId_key" ON "jobs"("externalId");
-
--- CreateIndex
-CREATE INDEX "jobs_isActive_applicationType_idx" ON "jobs"("isActive", "applicationType");
-
--- CreateIndex
-CREATE INDEX "jobs_datePosted_idx" ON "jobs"("datePosted");
-
--- CreateIndex
-CREATE INDEX "job_applications_userId_status_idx" ON "job_applications"("userId", "status");
-
--- CreateIndex
-CREATE INDEX "job_applications_appliedAt_idx" ON "job_applications"("appliedAt");
-
--- CreateIndex
-CREATE INDEX "job_applications_appliedById_idx" ON "job_applications"("appliedById");
-
--- CreateIndex
-CREATE UNIQUE INDEX "job_applications_userId_jobId_key" ON "job_applications"("userId", "jobId");
-
--- CreateIndex
-CREATE UNIQUE INDEX "tailored_resumes_userId_jobId_key" ON "tailored_resumes"("userId", "jobId");
-
--- CreateIndex
 CREATE UNIQUE INDEX "mentor_bookings_slotId_key" ON "mentor_bookings"("slotId");
 
 -- CreateIndex
@@ -423,15 +293,6 @@ CREATE INDEX "notifications_userId_createdAt_idx" ON "notifications"("userId", "
 CREATE INDEX "notifications_userId_isRead_idx" ON "notifications"("userId", "isRead");
 
 -- CreateIndex
-CREATE INDEX "external_job_applications_userId_createdAt_idx" ON "external_job_applications"("userId", "createdAt");
-
--- CreateIndex
-CREATE INDEX "external_job_applications_userId_appliedById_idx" ON "external_job_applications"("userId", "appliedById");
-
--- CreateIndex
-CREATE UNIQUE INDEX "external_job_applications_userId_jobLink_key" ON "external_job_applications"("userId", "jobLink");
-
--- CreateIndex
 CREATE UNIQUE INDEX "shout_likes_postId_userId_key" ON "shout_likes"("postId", "userId");
 
 -- AddForeignKey
@@ -442,18 +303,6 @@ ALTER TABLE "student_admin_assignments" ADD CONSTRAINT "student_admin_assignment
 
 -- AddForeignKey
 ALTER TABLE "student_admin_assignments" ADD CONSTRAINT "student_admin_assignments_adminId_fkey" FOREIGN KEY ("adminId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "job_applications" ADD CONSTRAINT "job_applications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "job_applications" ADD CONSTRAINT "job_applications_jobId_fkey" FOREIGN KEY ("jobId") REFERENCES "jobs"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "tailored_resumes" ADD CONSTRAINT "tailored_resumes_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "tailored_resumes" ADD CONSTRAINT "tailored_resumes_jobId_fkey" FOREIGN KEY ("jobId") REFERENCES "jobs"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "mentoring_slots" ADD CONSTRAINT "mentoring_slots_mentorId_fkey" FOREIGN KEY ("mentorId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -499,9 +348,6 @@ ALTER TABLE "training_notes" ADD CONSTRAINT "training_notes_userId_fkey" FOREIGN
 
 -- AddForeignKey
 ALTER TABLE "notifications" ADD CONSTRAINT "notifications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "external_job_applications" ADD CONSTRAINT "external_job_applications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "success_stories" ADD CONSTRAINT "success_stories_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;

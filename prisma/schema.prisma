@@ -13,13 +13,6 @@ enum Role {
   STUDENT
 }
 
-enum ApplicationStatus {
-  APPLIED
-  INTERVIEW_SCHEDULED
-  OFFER_RECEIVED
-  REJECTED
-}
-
 enum BookingStatus {
   PENDING
   CONFIRMED
@@ -48,6 +41,8 @@ model User {
   experience      String?
   keySkills       String[]
   jobRole         String?
+  assignedTechnologyId String?
+  assignedTechnology   AvailableTechnology? @relation("StudentAssignedTechnology", fields: [assignedTechnologyId], references: [id], onDelete: SetNull)
   location        String?
   resumeUrl       String?
   parsedResumeText String?
@@ -94,13 +89,11 @@ model User {
   uploadedMaterials   TrainingMaterial[] @relation("MaterialUploader")
   adminAssignments    StudentAdminAssignment[] @relation("StudentAssignments")
   adminOfStudents     StudentAdminAssignment[] @relation("AdminAssignments")
-
-  // Job pipeline
-  jobSearchRuns       JobSearchRun[]
-  jobMatches          JobMatch[]           @relation("UserJobMatches")
-  jobApplications     JobApplication[]     @relation("UserApplications")
-  adminJobApplications JobApplication[]    @relation("AdminApplied")
-  externalApplications ExternalJobApplication[] @relation("UserExternalApps")
+  jobListings         UserJobListing[] @relation("UserJobListings")
+  appliedJobListings  UserJobListing[] @relation("UserAppliedJobListings")
+  yourJobs            UserYourJob[]
+  jobApplications     UserJobApplication[] @relation("UserJobApplications")
+  appliedJobApplications UserJobApplication[] @relation("UserJobApplicationsAppliedBy")
 
   // Tokens
   verificationToken       String?
@@ -114,6 +107,7 @@ model User {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
+  @@index([assignedTechnologyId])
   @@map("users")
 }
 
@@ -136,6 +130,8 @@ model AvailableTechnology {
   normalizedName String   @unique
   category       String
   sortOrder      Int      @default(0)
+  content        String   @default("")
+  assignedStudents User[] @relation("StudentAssignedTechnology")
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -409,109 +405,108 @@ model AdminRequest {
   @@map("admin_requests")
 }
 
-// ─── Job Pipeline ────────────────────────────────────────────────────────────
-
-model JobSearchRun {
-  id          String    @id @default(uuid())
-  userId      String
-  queries     String[]
-  jobsFound   Int       @default(0)
-  durationMs  Int?
-  status      String    @default("RUNNING")
-  createdAt   DateTime  @default(now())
-  completedAt DateTime?
-
-  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  matches     JobMatch[]
-
-  @@index([userId, createdAt])
-  @@map("job_search_runs")
-}
-
-model JobMatch {
-  id             String    @id @default(uuid())
+model UserJobListing {
+  id             String   @id @default(uuid())
   userId         String
-  runId          String
-
-  externalId     String?
-  applyLink      String
-
+  sourceJobId    String?
   title          String
   company        String
   location       String?
-  employmentType String?
-  description    String?
-  salary         String?
+  datePostedText String?
   postedAt       DateTime?
-
-  matchScore     Int       @default(0)
-  matchSummary   String?
-  strongMatches  String?
-  skillGaps      String?
-
-  resumeText     String?
-  candidateName  String?
-
+  applyLink      String
+  source         String   @default("JSEARCH")
   rawPayload     Json?
-  savedAt        DateTime  @default(now())
+  isApplied      Boolean  @default(false)
+  appliedAt      DateTime?
+  appliedById    String?
+  firstSeenAt    DateTime @default(now())
+  lastSeenAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  user           User         @relation("UserJobMatches", fields: [userId], references: [id], onDelete: Cascade)
-  run            JobSearchRun @relation(fields: [runId], references: [id], onDelete: Cascade)
-  application    JobApplication?
-  externalApplications ExternalJobApplication[]
+  user           User     @relation("UserJobListings", fields: [userId], references: [id], onDelete: Cascade)
+  appliedBy      User?    @relation("UserAppliedJobListings", fields: [appliedById], references: [id], onDelete: SetNull)
+  yourJob        UserYourJob?
+  applications   UserJobApplication[]
 
   @@unique([userId, applyLink])
-  @@index([userId, matchScore])
-  @@index([userId, savedAt])
-  @@map("job_matches")
+  @@index([userId, lastSeenAt])
+  @@index([userId, isApplied, appliedAt])
+  @@map("user_job_listings")
 }
 
-model JobApplication {
-  id                String            @id @default(uuid())
-  userId            String
-  jobMatchId        String?           @unique
-  appliedById       String?
+model UserYourJob {
+  id             String   @id @default(uuid())
+  userId         String
+  sourceListingId String  @unique
+  sourceJobId    String?
+  title          String
+  company        String
+  location       String?
+  datePostedText String?
+  postedAt       DateTime?
+  applyLink      String
+  source         String   @default("JSEARCH")
+  rawPayload     Json?
+  matchingScore  Int
+  matchLabel     String
+  matchProvider  String   @default("fallback")
+  matchModel     String?
+  matchSummary   String?
+  matchWarning   String?
+  matchBreakdown Json?
+  strongMatches  Json?
+  missingSkills  Json?
+  matchedAt      DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  title             String
-  company           String
-  applyLink         String?
-  matchScore        String?
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceListing  UserJobListing @relation(fields: [sourceListingId], references: [id], onDelete: Cascade)
+  application    UserJobApplication?
 
-  status            ApplicationStatus @default(APPLIED)
-  appliedAt         DateTime          @default(now())
+  @@unique([userId, applyLink])
+  @@index([userId, matchingScore, updatedAt])
+  @@map("user_your_jobs")
+}
 
-  interviewDate     DateTime?
-  interviewLocation String?
-  interviewNotes    String?
-  notes             String?
+model UserJobApplication {
+  id              String   @id @default(uuid())
+  userId          String
+  yourJobId       String?  @unique
+  sourceListingId String?
+  sourceJobId     String?
+  title           String
+  company         String
+  location        String?
+  datePostedText  String?
+  postedAt        DateTime?
+  applyLink       String
+  source          String   @default("JSEARCH")
+  rawPayload      Json?
+  matchingScore   Int?
+  matchLabel      String?
+  matchProvider   String?
+  matchModel      String?
+  matchSummary    String?
+  matchWarning    String?
+  matchBreakdown  Json?
+  strongMatches   Json?
+  missingSkills   Json?
+  status          String   @default("student applied")
+  appliedAt       DateTime @default(now())
+  appliedById     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  user              User       @relation("UserApplications", fields: [userId], references: [id], onDelete: Cascade)
-  jobMatch          JobMatch?  @relation(fields: [jobMatchId], references: [id], onDelete: SetNull)
-  appliedByUser     User?      @relation("AdminApplied", fields: [appliedById], references: [id], onDelete: SetNull)
+  user            User            @relation("UserJobApplications", fields: [userId], references: [id], onDelete: Cascade)
+  appliedBy       User?           @relation("UserJobApplicationsAppliedBy", fields: [appliedById], references: [id], onDelete: SetNull)
+  yourJob         UserYourJob?     @relation(fields: [yourJobId], references: [id], onDelete: SetNull)
+  sourceListing   UserJobListing?  @relation(fields: [sourceListingId], references: [id], onDelete: SetNull)
 
+  @@unique([userId, applyLink])
   @@index([userId, appliedAt])
-  @@index([status])
-  @@map("job_applications")
+  @@index([userId, status, appliedAt])
+  @@map("user_job_applications")
 }
-
-model ExternalJobApplication {
-  id           String            @id @default(uuid())
-  userId       String
-  jobMatchId   String?
-  appliedById  String?
-  jobLink      String
-  jobTitle     String?
-  employerName String?
-  matchScore   String?
-  status       ApplicationStatus @default(APPLIED)
-  appliedMethod String           @default("MANUAL")
-  createdAt    DateTime          @default(now())
-
-  user         User      @relation("UserExternalApps", fields: [userId], references: [id], onDelete: Cascade)
-  jobMatch     JobMatch? @relation(fields: [jobMatchId], references: [id], onDelete: SetNull)
-
-  @@unique([userId, jobLink])
-  @@index([userId, createdAt])
-  @@map("external_job_applications")
-}
-

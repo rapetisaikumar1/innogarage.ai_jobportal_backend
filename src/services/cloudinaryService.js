@@ -12,7 +12,7 @@ if (!process.env.CLOUDINARY_URL) {
 }
 
 const cfg = cloudinary.config();
-console.log('Cloudinary init:', cfg.cloud_name ? `cloud=${cfg.cloud_name} key=${cfg.api_key}` : 'NOT CONFIGURED');
+console.log('Cloudinary init:', cfg.cloud_name ? 'CONFIGURED' : 'NOT CONFIGURED');
 
 /**
  * Upload a file buffer to Cloudinary

@@ -1,8 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
-const requestController = require('../controllers/requestController');
 const jobController = require('../controllers/jobController');
+const requestController = require('../controllers/requestController');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Super Admin routes
@@ -18,12 +18,25 @@ router.get('/students/:id', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adm
 router.delete('/students/:id', authenticate, authorize('SUPER_ADMIN'), adminController.deleteStudent);
 router.patch('/students/:id/toggle-status', authenticate, authorize('SUPER_ADMIN'), adminController.toggleStudentStatus);
 router.patch('/students/:id/plan', authenticate, authorize('SUPER_ADMIN'), adminController.updateStudentPlan);
+router.patch('/students/:id/technology', authenticate, authorize('SUPER_ADMIN'), adminController.updateStudentTechnology);
+router.get('/students/:studentId/matched-jobs', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getMatchedJobs);
+router.get('/students/:studentId/stats', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getStats);
+router.get('/students/:studentId/your-jobs', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getYourJobs);
+router.get('/students/:studentId/your-jobs/stream', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.streamYourJobs);
+router.post('/students/:studentId/your-jobs/:yourJobId/resume-generate', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.generateYourJobResume);
+router.get('/students/:studentId/external-applied-status', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getExternalAppliedStatus);
+router.get('/students/:studentId/applications', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.getMyApplications);
+router.patch('/students/:studentId/applications/:applicationId/status', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.updateApplicationStatus);
+router.post('/students/:studentId/mark-external-viewed', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.markExternalViewed);
+router.post('/students/:studentId/mark-external-applied', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.markExternalApplied);
+router.get('/students/:studentId/search/stream', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), jobController.searchJobsStream);
 router.post('/register-student', authenticate, authorize('SUPER_ADMIN'), adminController.registerStudent);
 router.post('/assign-mentor', authenticate, authorize('SUPER_ADMIN'), adminController.assignMentor);
 router.post('/unassign-admin', authenticate, authorize('SUPER_ADMIN'), adminController.unassignAdmin);
 router.get('/students/:studentId/admins', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adminController.getStudentAdmins);
 router.get('/available-technologies', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), adminController.getAvailableTechnologies);
 router.post('/available-technologies', authenticate, authorize('SUPER_ADMIN'), adminController.createAvailableTechnology);
+router.patch('/available-technologies/:id', authenticate, authorize('SUPER_ADMIN'), adminController.updateAvailableTechnology);
 router.delete('/available-technologies/:id', authenticate, authorize('SUPER_ADMIN'), adminController.deleteAvailableTechnology);
 router.get('/requests', authenticate, authorize('SUPER_ADMIN', 'ADMIN'), requestController.getRequests);
 router.post('/requests', authenticate, authorize('ADMIN'), requestController.createRequest);
@@ -33,38 +46,5 @@ router.get('/analytics', authenticate, authorize('SUPER_ADMIN'), adminController
 
 // Admin (Mentor) routes
 router.get('/my-students', authenticate, authorize('ADMIN'), adminController.getAssignedStudents);
-
-// ── Admin: job pipeline on behalf of a student ────────────────────────────────
-const adminStudentAuth = [authenticate, authorize('SUPER_ADMIN', 'ADMIN')];
-
-// Stream live job search for a student (admin triggers)
-router.get('/students/:studentId/jobs/search/stream', ...adminStudentAuth, jobController.streamJobSearch);
-
-// Get student's saved job matches
-router.get('/students/:studentId/jobs/matched', ...adminStudentAuth, jobController.getMatchedJobs);
-
-// Get student's job search stats
-router.get('/students/:studentId/jobs/stats', ...adminStudentAuth, jobController.getStats);
-
-// Get student's daily usage info
-router.get('/students/:studentId/jobs/usage', ...adminStudentAuth, jobController.getUsage);
-
-// Mark a job as applied for a student (admin applies on student's behalf)
-router.post('/students/:studentId/jobs/external/mark-applied', ...adminStudentAuth, jobController.markExternalApplied);
-
-// Get student's external applied status list
-router.get('/students/:studentId/jobs/external-applied-status', ...adminStudentAuth, jobController.getExternalAppliedStatus);
-
-// Get student's formal job applications
-router.get('/students/:studentId/jobs/applications', ...adminStudentAuth, jobController.getMyApplications);
-
-// ATS resume generation for student
-router.post('/students/:studentId/jobs/resume/generate', ...adminStudentAuth, jobController.generateResume);
-
-// Save ATS resume for student
-router.post('/students/:studentId/jobs/resume/save', ...adminStudentAuth, jobController.saveResume);
-
-// On-demand match score
-router.post('/students/:studentId/jobs/match-score', ...adminStudentAuth, jobController.getMatchScore);
 
 module.exports = router;

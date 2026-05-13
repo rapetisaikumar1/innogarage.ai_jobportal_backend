@@ -409,6 +409,7 @@ exports.me = async (req, res) => {
         experience: true,
         keySkills: true,
         jobRole: true,
+        location: true,
         resumeUrl: true,
         avatarUrl: true,
         assignedMentorId: true,
