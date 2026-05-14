@@ -47,6 +47,13 @@ const generateTokens = (userId, role) => {
   return { accessToken, refreshToken };
 };
 
+exports.getPublicConfig = async (req, res) => {
+  res.json({
+    googleClientId: config.google.clientId || '',
+    googleConfigured: Boolean(config.google.clientId),
+  });
+};
+
 // Sign Up (Student only)
 exports.signup = async (req, res) => {
   try {

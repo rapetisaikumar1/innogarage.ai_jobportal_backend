@@ -35,6 +35,7 @@ const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 30 * DAY_MS;
 const MATCH_SCORE_THRESHOLD = 60;
+const GEMINI_MATCH_PROVIDER = 'gemini';
 const GEMINI_MATCH_CONCURRENCY = 2;
 const LISTING_META_KEY = '__innogarageMeta';
 const TAILORED_RESUME_META_KEY = '__innogarageTailoredResume';
@@ -424,6 +425,15 @@ const mergeListingPayload = (jobPayload, existingRawPayload, metaPatch = {}) => 
   };
 };
 
+const isGeminiMatchProvider = (value) => compact(value).toLowerCase() === GEMINI_MATCH_PROVIDER;
+
+const hasGeminiStoredYourJob = (listing) => isGeminiMatchProvider(listing?.yourJob?.matchProvider);
+
+const buildPersistedYourJobsWhere = (userId) => ({
+  userId,
+  matchProvider: GEMINI_MATCH_PROVIDER,
+});
+
 const isYourJobsAppliedListing = (listing) => Boolean(listing?.isApplied)
   && getListingAppliedSource(listing.rawPayload) === APPLIED_SOURCE_YOUR_JOBS;
 
@@ -704,6 +714,10 @@ const backfillLegacyYourJobSnapshots = async (sourceListings, persistedJobs) => 
 };
 
 const getPendingYourJobSourceListings = (sourceListings) => sourceListings.filter((listing) => {
+  if (listing.yourJob && !hasGeminiStoredYourJob(listing)) {
+    return true;
+  }
+
   const listingMeta = getListingMeta(listing.rawPayload);
   return compact(listingMeta.matchSnapshotHash) !== buildListingMatchSnapshotHash(listing);
 });
@@ -730,6 +744,18 @@ const markListingMatchSnapshotProcessed = async (sourceListing, snapshotHash, pr
     ),
   },
 });
+
+const ensureYourJobsGeminiReady = (profile) => {
+  if (!hasGeminiApiKey()) {
+    throw createSearchError('Gemini API key is not configured on the backend.', 500);
+  }
+  if (!compact(profile.parsedResumeText)) {
+    throw createSearchError(
+      'Please upload your resume before using Your Jobs. Your resume is required for smart matching.',
+      400
+    );
+  }
+};
 
 const getProfileYears = (profile) => {
   const values = [profile.experience, profile.parsedResumeText].filter(Boolean).join(' ');
@@ -997,15 +1023,13 @@ const createFallbackMatch = (profile, listing, reason = '') => {
 };
 
 const calculateListingMatchWithGemini = async (profile, listing) => {
+  ensureYourJobsGeminiReady(profile);
+
   const resumeText = buildResumeMatchText(profile);
   const jobDescription = getListingDescription(listing) || buildJobMatchText(listing);
 
   if (!resumeText || !jobDescription) {
-    return createFallbackMatch(profile, listing, 'Gemini needs resume and job content, so a local fallback score was used.');
-  }
-
-  if (!hasGeminiApiKey()) {
-    return createFallbackMatch(profile, listing, 'Gemini API key is not configured, so a local fallback score was used.');
+    throw createSearchError('Resume content and job content are required for Gemini smart matching.', 400);
   }
 
   const cacheKey = buildGeminiCacheKey(profile, listing, resumeText, jobDescription);
@@ -1022,17 +1046,16 @@ const calculateListingMatchWithGemini = async (profile, listing) => {
       jobContext: buildGeminiJobContext(listing),
     });
 
-    const fallbackMatch = calculateListingMatch(profile, listing);
     const resolvedMatch = {
-      ...fallbackMatch,
       ...geminiMatch,
-      summary: geminiMatch.summary || buildFallbackSummary(profile, listing, fallbackMatch),
-      strongMatches: geminiMatch.strongMatches?.length ? geminiMatch.strongMatches : fallbackMatch.strongMatches,
-      missingSkills: geminiMatch.missingSkills?.length ? geminiMatch.missingSkills : fallbackMatch.missingSkills,
       descriptionAvailable: Boolean(getListingDescription(listing)),
       warning: null,
     };
 
+    // Evict oldest entry when cache is full to prevent unbounded growth.
+    if (geminiMatchCache.size >= 500) {
+      geminiMatchCache.delete(geminiMatchCache.keys().next().value);
+    }
     geminiMatchCache.set(cacheKey, resolvedMatch);
     return resolvedMatch;
   } catch (error) {
@@ -1041,7 +1064,7 @@ const calculateListingMatchWithGemini = async (profile, listing) => {
       title: listing.title,
       message: error.message,
     });
-    return createFallbackMatch(profile, listing, 'Gemini could not score this job right now, so a local fallback score was used.');
+    throw createSearchError(error.message || 'Gemini could not score this job right now.', 502);
   }
 };
 
@@ -1269,7 +1292,7 @@ const findYourJobForApplication = async (userId, { yourJobId, sourceListingId, a
 
   return prisma.userYourJob.findFirst({
     where: {
-      userId,
+      ...buildPersistedYourJobsWhere(userId),
       OR: orFilters,
     },
     include: getYourJobInclude(),
@@ -1383,7 +1406,7 @@ const hydrateApplicationsWithYourJobs = async (userId, applications = []) => {
 
 const getPersistedYourJobs = async (userId, options = {}) => {
   const rows = await prisma.userYourJob.findMany({
-    where: { userId },
+    where: buildPersistedYourJobsWhere(userId),
     include: getYourJobInclude(),
     orderBy: [
       { matchingScore: 'desc' },
@@ -1487,6 +1510,7 @@ const getPersistedYourJobsFast = async (userId) => {
     LEFT JOIN user_job_listings s ON s.id = y."sourceListingId"
     LEFT JOIN user_job_applications a ON a."yourJobId" = y.id
     WHERE y."userId" = ${userId}
+      AND LOWER(COALESCE(y."matchProvider", '')) = ${GEMINI_MATCH_PROVIDER}
     ORDER BY y."matchingScore" DESC, y."updatedAt" DESC
   `;
 
@@ -1533,6 +1557,7 @@ const getYourJobsContext = async (userId) => {
         yourJob: {
           select: {
             id: true,
+            matchProvider: true,
           },
         },
       },
@@ -1542,7 +1567,7 @@ const getYourJobsContext = async (userId) => {
         { createdAt: 'desc' },
       ],
     }),
-    prisma.userYourJob.count({ where: { userId } }),
+    prisma.userYourJob.count({ where: buildPersistedYourJobsWhere(userId) }),
   ]);
 
   const sourceListings = await backfillLegacyYourJobSnapshots(loadedSourceListings, persistedJobs);
@@ -1937,11 +1962,16 @@ const getStreamJobDelay = (emittedCount) => (
 );
 
 exports.searchJobsStream = async (req, res) => {
-  let closed = false;
+  let clientDisconnected = false;
 
-  req.on('close', () => {
-    closed = true;
-  });
+  const markClientDisconnected = () => {
+    clientDisconnected = true;
+  };
+
+  const canStreamToClient = () => !clientDisconnected && !res.writableEnded && !res.destroyed;
+
+  req.on('close', markClientDisconnected);
+  req.on('aborted', markClientDisconnected);
 
   try {
     const {
@@ -1950,60 +1980,63 @@ exports.searchJobsStream = async (req, res) => {
       searchDays,
     } = await resolveSearchContext(req);
 
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
+    if (canStreamToClient()) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+    }
 
     const emittedKeys = new Set();
-    sendStreamEvent(res, 'meta', {
-      query,
-      profile: serializeProfile(profile),
-      postedWindowDays: searchDays,
-    });
-    sendStreamEvent(res, 'status', {
-      message: 'Searching...',
-      count: 0,
-    });
+    if (canStreamToClient()) {
+      sendStreamEvent(res, 'meta', {
+        query,
+        profile: serializeProfile(profile),
+        postedWindowDays: searchDays,
+      });
+      sendStreamEvent(res, 'status', {
+        message: 'Searching...',
+        count: 0,
+      });
+    }
 
     const { jobs, hasMore } = await collectSearchJobs({
       profile,
       searchDays,
-      shouldAbort: () => closed,
       onProgress: async ({ jobs: currentJobs, warning }) => {
-        if (closed || res.writableEnded) return;
+        if (canStreamToClient()) {
+          sendStreamEvent(res, 'status', {
+            message: 'Searching...',
+            count: emittedKeys.size,
+          });
 
-        sendStreamEvent(res, 'status', {
-          message: 'Searching...',
-          count: emittedKeys.size,
-        });
-
-        if (warning) {
-          sendStreamEvent(res, 'warning', { message: warning });
+          if (warning) {
+            sendStreamEvent(res, 'warning', { message: warning });
+          }
         }
 
         for (const job of currentJobs) {
-          if (closed || res.writableEnded) return;
-
           const key = job.applyLink || job.id;
           if (emittedKeys.has(key)) continue;
 
           const listing = await persistJobListing(profile.id, job);
 
           emittedKeys.add(key);
-          sendStreamEvent(res, 'job', {
-            job: listing ? serializeListing(listing) : job,
-            count: emittedKeys.size,
-          });
-          await wait(getStreamJobDelay(emittedKeys.size));
+          if (canStreamToClient()) {
+            sendStreamEvent(res, 'job', {
+              job: listing ? serializeListing(listing) : job,
+              count: emittedKeys.size,
+            });
+            await wait(getStreamJobDelay(emittedKeys.size));
+          }
         }
       },
     });
 
     await persistJobListings(profile.id, jobs);
 
-    if (closed || res.writableEnded) return;
+    if (!canStreamToClient()) return;
 
     sendStreamEvent(res, 'end', {
       count: jobs.length,
@@ -2015,8 +2048,14 @@ exports.searchJobsStream = async (req, res) => {
     const statusCode = error.statusCode || 500;
 
     if (res.headersSent) {
-      sendStreamEvent(res, 'error', { message: error.message });
-      res.end();
+      if (canStreamToClient()) {
+        sendStreamEvent(res, 'error', { message: error.message });
+        res.end();
+      }
+      return;
+    }
+
+    if (clientDisconnected || res.destroyed) {
       return;
     }
 
@@ -2215,21 +2254,11 @@ exports.getYourJobs = async (req, res) => {
     const fast = req.query.fast === '1' || req.query.fast === 'true';
 
     if (fast) {
-      const [profile, totalSavedJobs, totalMatchedJobs, jobs] = await Promise.all([
-        prisma.user.findUnique({
-          where: { id: userId },
-          select: {
-            jobRole: true,
-            experience: true,
-            keySkills: true,
-            location: true,
-            parsedResumeText: true,
-          },
-        }),
-        prisma.userJobListing.count({ where: { userId } }),
-        prisma.userYourJob.count({ where: { userId } }),
+      const [{ profile, sourceListings, persistedJobs }, jobs] = await Promise.all([
+        getYourJobsContext(userId),
         getPersistedYourJobsFast(userId),
       ]);
+      const refreshState = buildYourJobsRefreshState(sourceListings);
 
       if (!profile) {
         return res.status(404).json({ message: 'Profile not found' });
@@ -2238,11 +2267,11 @@ exports.getYourJobs = async (req, res) => {
       return res.json({
         jobs,
         threshold: MATCH_SCORE_THRESHOLD,
-        totalSavedJobs,
-        totalMatchedJobs,
-        refreshNeeded: false,
-        pendingSourceCount: 0,
-        scoringProvider: hasGeminiApiKey() ? 'gemini' : 'fallback',
+        totalSavedJobs: sourceListings.length,
+        totalMatchedJobs: persistedJobs,
+        refreshNeeded: refreshState.refreshNeeded,
+        pendingSourceCount: refreshState.pendingSourceCount,
+        scoringProvider: GEMINI_MATCH_PROVIDER,
         profile: {
           jobRole: profile.jobRole || '',
           experience: profile.experience || '',
@@ -2269,7 +2298,7 @@ exports.getYourJobs = async (req, res) => {
       totalMatchedJobs: persistedJobs,
       refreshNeeded: refreshState.refreshNeeded,
       pendingSourceCount: refreshState.pendingSourceCount,
-      scoringProvider: hasGeminiApiKey() ? 'gemini' : 'fallback',
+      scoringProvider: GEMINI_MATCH_PROVIDER,
       profile: {
         jobRole: profile.jobRole || '',
         experience: profile.experience || '',
@@ -2299,6 +2328,10 @@ exports.streamYourJobs = async (req, res) => {
       throw createSearchError('Profile not found', 404);
     }
 
+    if (pendingSourceCount > 0) {
+      ensureYourJobsGeminiReady(profile);
+    }
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -2321,7 +2354,7 @@ exports.streamYourJobs = async (req, res) => {
       persistedCount: persistedJobs,
       pendingSourceCount,
       refreshNeeded,
-      scoringProvider: hasGeminiApiKey() ? 'gemini' : 'fallback',
+      scoringProvider: GEMINI_MATCH_PROVIDER,
     });
 
     sendStreamEvent(res, 'status', {
@@ -2345,52 +2378,79 @@ exports.streamYourJobs = async (req, res) => {
       return;
     }
 
-    for (const sourceListing of pendingSourceListings) {
+    const processOneListing = async (sourceListing) => {
       if (closed || res.writableEnded) return;
 
       processedCount += 1;
-      sendStreamEvent(res, 'status', {
-        message: `Scoring new job ${processedCount} of ${pendingSourceCount}...`,
-        processedCount,
-        matchedCount,
-        total: pendingSourceCount,
-      });
-
-      const match = await calculateListingMatchWithGemini(profile, sourceListing);
+      const currentProcessed = processedCount;
       const snapshotHash = buildListingMatchSnapshotHash(sourceListing);
 
-      if (match.score >= MATCH_SCORE_THRESHOLD) {
-        const hadStoredMatch = Boolean(sourceListing.yourJob);
-        const storedJob = await upsertYourJobRecord(userId, sourceListing, match);
-        await markListingMatchSnapshotProcessed(sourceListing, snapshotHash);
-        if (!hadStoredMatch) {
-          matchedCount += 1;
-        }
-        sendStreamEvent(res, 'job', {
-          job: serializeStoredYourJob(storedJob),
-          processedCount,
+      if (!closed && !res.writableEnded) {
+        sendStreamEvent(res, 'status', {
+          message: `Scoring job ${currentProcessed} of ${pendingSourceCount}...`,
+          processedCount: currentProcessed,
           matchedCount,
           total: pendingSourceCount,
         });
-        await wait(getStreamJobDelay(matchedCount));
-        continue;
       }
 
-      const removed = await deleteYourJobRecord(sourceListing.id);
-      await markListingMatchSnapshotProcessed(sourceListing, snapshotHash);
-      if (sourceListing.yourJob && removed.count > 0) {
-        matchedCount = Math.max(0, matchedCount - 1);
-      }
-      if (removed.count > 0) {
-        sendStreamEvent(res, 'removed', {
-          sourceListingId: sourceListing.id,
-          applyLink: sourceListing.applyLink,
-          processedCount,
-          matchedCount,
-          total: pendingSourceCount,
+      try {
+        const match = await calculateListingMatchWithGemini(profile, sourceListing);
+
+        if (match.score >= MATCH_SCORE_THRESHOLD) {
+          const hadStoredMatch = hasGeminiStoredYourJob(sourceListing);
+          const storedJob = await upsertYourJobRecord(userId, sourceListing, match);
+          await markListingMatchSnapshotProcessed(sourceListing, snapshotHash);
+          if (!hadStoredMatch) matchedCount += 1;
+
+          if (!closed && !res.writableEnded) {
+            sendStreamEvent(res, 'job', {
+              job: serializeStoredYourJob(storedJob),
+              processedCount: currentProcessed,
+              matchedCount,
+              total: pendingSourceCount,
+            });
+            await wait(getStreamJobDelay(matchedCount));
+          }
+        } else if (hasGeminiStoredYourJob(sourceListing)) {
+          // Only hit the DB if a Gemini record actually exists for this listing.
+          const removed = await deleteYourJobRecord(sourceListing.id);
+          await markListingMatchSnapshotProcessed(sourceListing, snapshotHash);
+          if (removed.count > 0) {
+            matchedCount = Math.max(0, matchedCount - 1);
+            if (!closed && !res.writableEnded) {
+              sendStreamEvent(res, 'removed', {
+                sourceListingId: sourceListing.id,
+                applyLink: sourceListing.applyLink,
+                processedCount: currentProcessed,
+                matchedCount,
+                total: pendingSourceCount,
+              });
+            }
+          }
+        } else {
+          // Below threshold and never stored — just stamp as processed.
+          await markListingMatchSnapshotProcessed(sourceListing, snapshotHash);
+        }
+      } catch (scoringError) {
+        // Per-job error: log and skip — the stream continues for other listings.
+        console.error('Gemini scoring failed for listing, skipping', {
+          listingId: sourceListing.id,
+          title: sourceListing.title,
+          message: scoringError.message,
         });
+        if (!closed && !res.writableEnded) {
+          sendStreamEvent(res, 'status', {
+            message: `Skipped job ${currentProcessed} of ${pendingSourceCount} (scoring error). Continuing...`,
+            processedCount: currentProcessed,
+            matchedCount,
+            total: pendingSourceCount,
+          });
+        }
       }
-    }
+    };
+
+    await mapWithConcurrency(pendingSourceListings, GEMINI_MATCH_CONCURRENCY, processOneListing);
 
     if (closed || res.writableEnded) return;
 

@@ -8,6 +8,41 @@ const PLANS = {
   ultra: { name: 'Ultra Plan', amount: 249900, currency: 'usd', priceId: 'price_1TBSV297AKaR9zY1dzaeDR0Y' },
 };
 
+const STATIC_ALLOWED_FRONTEND_ORIGINS = [
+  config.frontendUrl,
+  'https://www.innogarage.ai',
+  'https://innogarage.ai',
+  'https://maverickproject-finalise-1.vercel.app',
+].filter(Boolean);
+
+const isLocalDevOrigin = (origin = '') => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+const isVercelOrigin = (origin = '') => /^https:\/\/[a-zA-Z0-9-]+(\.vercel\.app)$/.test(origin);
+
+const normalizeOrigin = (value = '') => {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return '';
+  }
+};
+
+const isAllowedFrontendOrigin = (origin) => {
+  if (!origin) return false;
+  return STATIC_ALLOWED_FRONTEND_ORIGINS.includes(origin) || isLocalDevOrigin(origin) || isVercelOrigin(origin);
+};
+
+const getCheckoutFrontendBaseUrl = (req) => {
+  const requestedOrigin = normalizeOrigin(
+    req.body?.redirectOrigin || req.get('origin') || req.get('referer') || ''
+  );
+
+  if (requestedOrigin && isAllowedFrontendOrigin(requestedOrigin)) {
+    return requestedOrigin;
+  }
+
+  return normalizeOrigin(config.frontendUrl) || 'http://localhost:5173';
+};
+
 // Create a Stripe Checkout Session using the REST API directly (no stripe npm package needed)
 exports.createCheckout = async (req, res) => {
   try {
@@ -20,6 +55,7 @@ exports.createCheckout = async (req, res) => {
 
     const planData = PLANS[plan];
     const secretKey = config.stripe.secretKey;
+    const frontendBaseUrl = getCheckoutFrontendBaseUrl(req);
 
     if (!secretKey) {
       return res.status(500).json({ message: 'Stripe secret key not configured' });
@@ -33,8 +69,8 @@ exports.createCheckout = async (req, res) => {
     params.append('line_items[0][price]', planData.priceId);
     params.append('line_items[0][quantity]', 1);
     params.append('allow_promotion_codes', 'true');
-    params.append('success_url', `${config.frontendUrl}/dashboard?upgraded=true`);
-    params.append('cancel_url', `${config.frontendUrl}/dashboard`);
+    params.append('success_url', `${frontendBaseUrl}/dashboard?upgraded=true`);
+    params.append('cancel_url', `${frontendBaseUrl}/dashboard`);
 
     const response = await axios.post(
       'https://api.stripe.com/v1/checkout/sessions',

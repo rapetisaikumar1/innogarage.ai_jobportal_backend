@@ -5,6 +5,8 @@ const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models
 const DEFAULT_GEMINI_MODEL = config.gemini?.model || process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const GEMINI_FLASH_MODEL = 'gemini-2.5-flash';
 const GEMINI_FLASH_LITE_MODEL = 'gemini-2.5-flash-lite';
+// Job match scoring uses only these two models: primary → fallback.
+const JOB_MATCH_GEMINI_MODELS = [GEMINI_FLASH_MODEL, GEMINI_FLASH_LITE_MODEL];
 const FALLBACK_GEMINI_MODELS = [
   DEFAULT_GEMINI_MODEL,
   GEMINI_FLASH_MODEL,
@@ -248,7 +250,7 @@ const scoreResumeAgainstJob = async ({ resumeText, jobDescription, profileContex
       profileContext,
       jobContext,
     }),
-    modelCandidates: getGeminiModelCandidates(),
+    modelCandidates: JOB_MATCH_GEMINI_MODELS,
   });
 
   return normalizeGeminiMatchResult({
