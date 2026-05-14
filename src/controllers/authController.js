@@ -155,7 +155,29 @@ exports.login = async (req, res) => {
       return res.status(403).json({ message: 'Account is deactivated. Contact support.' });
     }
 
-    // Generate 6-digit OTP
+    // ADMIN: skip OTP — log in directly after correct email + password
+    if (user.role === 'ADMIN') {
+      const { accessToken, refreshToken } = generateTokens(user.id, user.role);
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { refreshToken, loginOtp: null, loginOtpExpiry: null },
+      });
+      return res.json({
+        message: 'Login successful',
+        requiresOtp: false,
+        user: {
+          id: user.id,
+          fullName: user.fullName,
+          email: user.email,
+          role: user.role,
+          profileCompleted: !!user.education,
+        },
+        accessToken,
+        refreshToken,
+      });
+    }
+
+    // STUDENT / SUPER_ADMIN: require OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const otpExpiry = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
@@ -165,7 +187,7 @@ exports.login = async (req, res) => {
     });
 
     // Send OTP via email
-    const emailResult = await sendLoginOtpEmail(user, otp);
+    await sendLoginOtpEmail(user, otp);
     console.log(`\n🔑 OTP for ${user.email}: ${otp}\n`);
 
     res.json({
