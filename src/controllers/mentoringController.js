@@ -143,8 +143,12 @@ exports.bookSlot = async (req, res) => {
 
     const student = await prisma.user.findUnique({ where: { id: studentId } });
 
-    // Notify mentor about new booking request
-    await sendBookingRequestEmail(student, slot.mentor, slot);
+    // Notify mentor about new booking request (fire-and-forget — SMTP can be slow)
+    setImmediate(() => {
+      sendBookingRequestEmail(student, slot.mentor, slot).catch((err) =>
+        console.error('sendBookingRequestEmail failed:', err?.message || err)
+      );
+    });
 
     // Create notifications
     await Promise.all([
@@ -216,8 +220,12 @@ exports.confirmBooking = async (req, res) => {
       },
     });
 
-    // Send confirmation emails to both student and mentor
-    await sendMentoringConfirmationEmail(booking.student, booking.slot.mentor, booking.slot, meetLink);
+    // Send confirmation emails to both student and mentor (fire-and-forget)
+    setImmediate(() => {
+      sendMentoringConfirmationEmail(booking.student, booking.slot.mentor, booking.slot, meetLink).catch((err) =>
+        console.error('sendMentoringConfirmationEmail failed:', err?.message || err)
+      );
+    });
 
     // Notify both student and mentor
     await Promise.all([
@@ -286,9 +294,13 @@ exports.cancelBooking = async (req, res) => {
       }),
     ]);
 
-    // Send cancellation email to the other party
+    // Send cancellation email to the other party (fire-and-forget)
     if (cancelledBy === 'admin') {
-      await sendBookingCancelledEmail(booking.student, booking.slot.mentor, booking.slot, reason);
+      setImmediate(() => {
+        sendBookingCancelledEmail(booking.student, booking.slot.mentor, booking.slot, reason).catch((err) =>
+          console.error('sendBookingCancelledEmail failed:', err?.message || err)
+        );
+      });
       await prisma.notification.create({
         data: {
           userId: booking.student.id,

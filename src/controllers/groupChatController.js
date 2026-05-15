@@ -183,24 +183,40 @@ exports.getMyGroups = async (req, res) => {
       },
     });
 
-    const groups = await Promise.all(
-      memberships.map(async (m) => {
-        const lastMsg = await prisma.groupMessage.findFirst({
-          where: { groupId: m.groupId },
-          orderBy: { createdAt: 'desc' },
-          include: { sender: { select: { id: true, fullName: true } } },
-        });
-        const unreadCount = await prisma.groupMessage.count({
-          where: { groupId: m.groupId, senderId: { not: userId }, isRead: false },
-        });
-        return {
-          ...m.group,
-          lastMessage: lastMsg ? `${lastMsg.sender.fullName}: ${lastMsg.message}` : null,
-          lastMessageAt: lastMsg?.createdAt || m.group.createdAt,
-          unreadCount,
-        };
-      })
-    );
+    const groupIds = memberships.map((m) => m.groupId);
+
+    // Batch fetch the most recent message per group + unread counts in 2 queries
+    // (replaces 2 * memberships.length queries — was N+1)
+    const [lastMessages, unreadCounts] = await Promise.all([
+      groupIds.length
+        ? prisma.groupMessage.findMany({
+            where: { groupId: { in: groupIds } },
+            orderBy: [{ groupId: 'asc' }, { createdAt: 'desc' }],
+            distinct: ['groupId'],
+            include: { sender: { select: { id: true, fullName: true } } },
+          })
+        : [],
+      groupIds.length
+        ? prisma.groupMessage.groupBy({
+            by: ['groupId'],
+            where: { groupId: { in: groupIds }, senderId: { not: userId }, isRead: false },
+            _count: { _all: true },
+          })
+        : [],
+    ]);
+
+    const lastByGroup = new Map(lastMessages.map((msg) => [msg.groupId, msg]));
+    const unreadByGroup = new Map(unreadCounts.map((row) => [row.groupId, row._count._all]));
+
+    const groups = memberships.map((m) => {
+      const lastMsg = lastByGroup.get(m.groupId);
+      return {
+        ...m.group,
+        lastMessage: lastMsg ? `${lastMsg.sender.fullName}: ${lastMsg.message}` : null,
+        lastMessageAt: lastMsg?.createdAt || m.group.createdAt,
+        unreadCount: unreadByGroup.get(m.groupId) || 0,
+      };
+    });
 
     res.json(groups);
   } catch (error) {

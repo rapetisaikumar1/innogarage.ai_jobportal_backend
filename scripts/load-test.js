@@ -66,17 +66,25 @@ const summarize = (records) => {
     return acc;
   }, {});
 
+  let min = Infinity;
+  let max = -Infinity;
+  let sum = 0;
+  for (const value of durations) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+    sum += value;
+  }
   return {
     count: records.length,
     errors,
     errorRate: records.length ? (errors / records.length) * 100 : 0,
-    min: Math.min(...durations),
-    avg: durations.reduce((sum, value) => sum + value, 0) / Math.max(1, durations.length),
+    min: durations.length ? min : 0,
+    avg: durations.length ? sum / durations.length : 0,
     p50: percentile(durations, 50),
     p90: percentile(durations, 90),
     p95: percentile(durations, 95),
     p99: percentile(durations, 99),
-    max: Math.max(...durations),
+    max: durations.length ? max : 0,
     statusCounts,
   };
 };

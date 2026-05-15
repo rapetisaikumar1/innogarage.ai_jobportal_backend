@@ -169,6 +169,8 @@ model MentorBooking {
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
+  @@index([studentId, createdAt])
+  @@index([status])
   @@map("mentor_bookings")
 }
 
@@ -230,6 +232,8 @@ model GroupMessage {
 
   createdAt DateTime  @default(now())
 
+  @@index([groupId, createdAt])
+  @@index([groupId, senderId, isRead])
   @@map("group_messages")
 }
 
@@ -330,6 +334,8 @@ model ShoutPost {
   createdAt DateTime       @default(now())
   updatedAt DateTime       @updatedAt
 
+  @@index([createdAt])
+  @@index([userId, createdAt])
   @@map("shout_posts")
 }
 
@@ -347,6 +353,7 @@ model ShoutComment {
 
   createdAt DateTime      @default(now())
 
+  @@index([postId, createdAt])
   @@map("shout_comments")
 }
 
@@ -380,6 +387,9 @@ model SupportQuery {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([assignedToId, status])
   @@map("support_queries")
 }
 

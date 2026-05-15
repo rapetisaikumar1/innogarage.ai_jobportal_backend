@@ -1,6 +1,7 @@
 const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { invalidateCachedUser } = require('../middleware/auth');
 const {
   AVAILABLE_TECHNOLOGY_CATEGORIES,
   normalizeTechnologyName,
@@ -214,6 +215,7 @@ exports.toggleAdminStatus = async (req, res) => {
       select: { id: true, fullName: true, isActive: true },
     });
 
+    invalidateCachedUser(id);
     clearAdminListCache();
 
     res.json(updated);
@@ -272,6 +274,7 @@ exports.updateAdmin = async (req, res) => {
       },
     });
 
+    invalidateCachedUser(id);
     clearAdminListCache();
 
     res.json(updated);
@@ -481,6 +484,7 @@ exports.deleteStudent = async (req, res) => {
     }
 
     await prisma.user.delete({ where: { id } });
+    invalidateCachedUser(id);
     clearStudentListCache();
     res.json({ message: 'Student deleted' });
   } catch (error) {
@@ -578,6 +582,7 @@ exports.toggleStudentStatus = async (req, res) => {
       select: { id: true, fullName: true, status: true },
     });
 
+    invalidateCachedUser(id);
     clearStudentListCache();
 
     res.json(updated);
@@ -947,6 +952,10 @@ exports.deleteAvailableTechnology = async (req, res) => {
 // Get platform analytics
 exports.getAnalytics = async (req, res) => {
   try {
+    if (analyticsCache.payload && Date.now() < analyticsCache.expiresAt) {
+      return res.json(analyticsCache.payload);
+    }
+
     const [
       totalStudents,
       totalAdmins,
@@ -1020,6 +1029,7 @@ exports.getAnalytics = async (req, res) => {
       technologyBreakdown,
     };
 
+    analyticsCache = { payload, expiresAt: Date.now() + 30 * 1000 };
     res.json(payload);
   } catch (error) {
     res.status(500).json({ message: 'Failed to fetch analytics', error: error.message });
