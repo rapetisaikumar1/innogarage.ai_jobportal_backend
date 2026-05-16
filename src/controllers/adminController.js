@@ -152,7 +152,7 @@ exports.createAdmin = async (req, res) => {
 
     res.status(201).json(admin);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to create admin', error: error.message });
+    res.status(500).json({ message: 'Failed to create mentor', error: error.message });
   }
 };
 
@@ -195,7 +195,7 @@ exports.getAdmins = async (req, res) => {
 
     res.json(admins);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch admins', error: error.message });
+    res.status(500).json({ message: 'Failed to fetch mentors', error: error.message });
   }
 };
 
@@ -206,7 +206,7 @@ exports.toggleAdminStatus = async (req, res) => {
     const admin = await prisma.user.findUnique({ where: { id } });
 
     if (!admin || admin.role !== 'ADMIN') {
-      return res.status(404).json({ message: 'Admin not found' });
+      return res.status(404).json({ message: 'Mentor not found' });
     }
 
     const updated = await prisma.user.update({
@@ -220,7 +220,7 @@ exports.toggleAdminStatus = async (req, res) => {
 
     res.json(updated);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to toggle admin status', error: error.message });
+    res.status(500).json({ message: 'Failed to toggle mentor status', error: error.message });
   }
 };
 
@@ -232,7 +232,7 @@ exports.updateAdmin = async (req, res) => {
 
     const admin = await prisma.user.findUnique({ where: { id } });
     if (!admin || admin.role !== 'ADMIN') {
-      return res.status(404).json({ message: 'Admin not found' });
+      return res.status(404).json({ message: 'Mentor not found' });
     }
 
     if (!fullName || !email) {
@@ -279,7 +279,7 @@ exports.updateAdmin = async (req, res) => {
 
     res.json(updated);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to update admin', error: error.message });
+    res.status(500).json({ message: 'Failed to update mentor', error: error.message });
   }
 };
 
@@ -703,7 +703,7 @@ exports.assignMentor = async (req, res) => {
 
     const mentor = await prisma.user.findUnique({ where: { id: mentorId } });
     if (!mentor || mentor.role !== 'ADMIN') {
-      return res.status(404).json({ message: 'Admin not found' });
+      return res.status(404).json({ message: 'Mentor not found' });
     }
 
     // For now, each student can only have one assigned admin.
