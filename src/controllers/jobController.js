@@ -263,6 +263,244 @@ const LOCATION_COUNTRY_CODES = {
   india: 'in',
 };
 
+const PREFERRED_JOB_PORTAL_PRIORITY = new Map([
+  ['linkedin', 140],
+  ['indeed', 138],
+  ['ziprecruiter', 136],
+  ['glassdoor', 134],
+  ['monster', 132],
+  ['careerbuilder', 130],
+]);
+
+const PREFERRED_JOB_PORTAL_LABELS = {
+  linkedin: 'LinkedIn',
+  indeed: 'Indeed',
+  ziprecruiter: 'ZipRecruiter',
+  glassdoor: 'Glassdoor',
+  monster: 'Monster',
+  careerbuilder: 'CareerBuilder',
+};
+
+const PREFERRED_JOB_PORTAL_HOSTS = [
+  ['linkedin.com', 'linkedin'],
+  ['indeed.com', 'indeed'],
+  ['ziprecruiter.com', 'ziprecruiter'],
+  ['glassdoor.com', 'glassdoor'],
+  ['monster.com', 'monster'],
+  ['careerbuilder.com', 'careerbuilder'],
+];
+
+const LOW_QUALITY_JOB_PUBLISHERS = new Set([
+  'learn4good',
+  'jooble',
+  'talentcom',
+  'bebee',
+  'ladders',
+  'adzuna',
+  'jobsora',
+  'jobrapido',
+  'jobilize',
+  'tartaai',
+  'joblift',
+  'grabjobs',
+  'postjobfree',
+]);
+
+const LOW_QUALITY_JOB_HOST_PATTERNS = [
+  'learn4good.com',
+  'jooble.org',
+  'talent.com',
+  'bebee.com',
+  'theladders.com',
+  'adzuna.com',
+  'jobsora.com',
+  'jobrapido.com',
+  'jobilize.com',
+  'tarta.ai',
+  'joblift.com',
+  'grabjobs.co',
+  'postjobfree.com',
+];
+
+const COMPANY_CAREER_HOST_PATTERNS = [
+  'greenhouse.io',
+  'lever.co',
+  'ashbyhq.com',
+  'myworkdayjobs.com',
+  'workdayjobs.com',
+  'myworkdaysite.com',
+  'icims.com',
+  'smartrecruiters.com',
+  'jobvite.com',
+  'oraclecloud.com',
+  'successfactors.com',
+  'dayforcehcm.com',
+  'bamboohr.com',
+  'paylocity.com',
+  'applytojob.com',
+  'taleo.net',
+  'ultipro.com',
+  'recruitee.com',
+  'avature.net',
+];
+
+const normalizePublisherKey = (value) => compact(value)
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '');
+
+const normalizeHostname = (value) => {
+  const normalizedValue = compact(value);
+  if (!normalizedValue) return '';
+
+  try {
+    return new URL(normalizedValue).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+};
+
+const getComparableHostKey = (hostname) => {
+  const normalizedHost = compact(hostname).toLowerCase().replace(/^www\./, '');
+  if (!normalizedHost) return '';
+
+  const parts = normalizedHost.split('.').filter(Boolean);
+  if (parts.length <= 2) return normalizedHost;
+
+  const hasCountryTld = parts[parts.length - 1].length === 2
+    && ['co', 'com', 'org', 'net', 'gov', 'edu', 'ac'].includes(parts[parts.length - 2]);
+
+  return parts.slice(hasCountryTld ? -3 : -2).join('.');
+};
+
+const getComparableUrlHost = (value) => getComparableHostKey(normalizeHostname(value));
+
+const matchesHostPatterns = (hostname, patterns) => {
+  if (!hostname) return false;
+  return patterns.some((pattern) => hostname === pattern || hostname.endsWith(`.${pattern}`));
+};
+
+const matchesEmployerWebsite = (applyLink, employerWebsite) => {
+  const applyHost = getComparableUrlHost(applyLink);
+  const employerHost = getComparableUrlHost(employerWebsite);
+  return Boolean(applyHost && employerHost && applyHost === employerHost);
+};
+
+const resolvePreferredPortalKey = (publisherKey, hostname) => {
+  if (PREFERRED_JOB_PORTAL_PRIORITY.has(publisherKey)) return publisherKey;
+
+  const matchedPortal = PREFERRED_JOB_PORTAL_HOSTS.find(([pattern]) => (
+    hostname === pattern || hostname.endsWith(`.${pattern}`)
+  ));
+
+  return matchedPortal?.[1] || '';
+};
+
+const normalizeBoolean = (value) => {
+  if (value === true || value === false) return value;
+  const normalized = compact(value).toLowerCase();
+  if (!normalized) return false;
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
+};
+
+const collectApplyOptions = (job) => {
+  const options = [];
+  const pushOption = ({ publisher, applyLink, isDirect, sourceType }) => {
+    const normalizedApplyLink = compact(applyLink);
+    if (!normalizedApplyLink) return;
+    if (normalizedApplyLink.includes('google.com/search')) return;
+
+    options.push({
+      publisher: compact(publisher),
+      applyLink: normalizedApplyLink,
+      isDirect: normalizeBoolean(isDirect),
+      sourceType,
+    });
+  };
+
+  const selectedApplyOption = normalizeObject(job.selected_apply_option || job.selectedApplyOption);
+  if (Object.keys(selectedApplyOption).length > 0) {
+    pushOption({
+      publisher: selectedApplyOption.publisher,
+      applyLink: selectedApplyOption.apply_link || selectedApplyOption.applyLink,
+      isDirect: selectedApplyOption.is_direct ?? selectedApplyOption.isDirect,
+      sourceType: selectedApplyOption.source_type || selectedApplyOption.sourceType || 'selected',
+    });
+  }
+
+  pushOption({
+    publisher: job.job_publisher || job.publisher,
+    applyLink: job.job_apply_link || job.applyLink,
+    isDirect: job.job_apply_is_direct || job.isDirect,
+    sourceType: 'primary',
+  });
+
+  const applyOptions = Array.isArray(job.apply_options)
+    ? job.apply_options
+    : Array.isArray(job.applyOptions)
+      ? job.applyOptions
+      : [];
+
+  applyOptions.forEach((option) => {
+    pushOption({
+      publisher: option.publisher,
+      applyLink: option.apply_link || option.applyLink,
+      isDirect: option.is_direct ?? option.isDirect,
+      sourceType: 'alternate',
+    });
+  });
+
+  const seenLinks = new Set();
+  return options.filter((option) => {
+    if (seenLinks.has(option.applyLink)) return false;
+    seenLinks.add(option.applyLink);
+    return true;
+  });
+};
+
+const scoreApplyOption = (job, option) => {
+  const publisherKey = normalizePublisherKey(option.publisher);
+  const hostname = normalizeHostname(option.applyLink);
+  const employerWebsite = job.employer_website || job.employerWebsite || '';
+  const preferredPortalKey = resolvePreferredPortalKey(publisherKey, hostname);
+  const isPreferredPortal = Boolean(preferredPortalKey);
+  const isLowQualityPublisher = LOW_QUALITY_JOB_PUBLISHERS.has(publisherKey);
+  const isLowQualityHost = matchesHostPatterns(hostname, LOW_QUALITY_JOB_HOST_PATTERNS);
+  const isCompanyCareerHost = matchesHostPatterns(hostname, COMPANY_CAREER_HOST_PATTERNS)
+    || matchesEmployerWebsite(option.applyLink, employerWebsite);
+
+  let score = 0;
+  let sourceType = 'other';
+  let publisherLabel = option.publisher;
+
+  if (isPreferredPortal) {
+    score = PREFERRED_JOB_PORTAL_PRIORITY.get(preferredPortalKey);
+    sourceType = 'portal';
+    publisherLabel = publisherLabel || PREFERRED_JOB_PORTAL_LABELS[preferredPortalKey] || '';
+  } else if (isCompanyCareerHost) {
+    score = 128 + (option.isDirect ? 4 : 0);
+    sourceType = 'company';
+    publisherLabel = publisherLabel || 'Company career page';
+  } else if (isLowQualityPublisher || isLowQualityHost) {
+    score = -50;
+  }
+
+  return {
+    ...option,
+    publisher: compact(publisherLabel) || (sourceType === 'company' ? 'Company career page' : ''),
+    hostname,
+    score,
+    sourceType,
+  };
+};
+
+const resolvePreferredApplySource = (job) => {
+  const scoredOptions = collectApplyOptions(job)
+    .map((option) => scoreApplyOption(job, option))
+    .sort((left, right) => right.score - left.score || Number(right.isDirect) - Number(left.isDirect));
+
+  return scoredOptions.find((option) => option.score > 0) || null;
+};
+
 const escapeRegExp = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const hasLocationPhrase = (text, phrase) => {
@@ -379,6 +617,7 @@ const rankJobs = (rawJobs, profile) => {
 
   const scoredJobs = rawJobs
     .map((job) => {
+      const preferredApplySource = resolvePreferredApplySource(job);
       const title = compact(job.job_title).toLowerCase();
       const searchText = compact([
         job.job_title,
@@ -396,6 +635,9 @@ const rankJobs = (rawJobs, profile) => {
       const skillTokenMatches = skillTokens.filter((token) => searchTokens.has(token)).length;
       const locationMatches = locationTerms.filter((term) => searchText.includes(term)).length;
       const experienceMatches = experienceTerms.filter((term) => searchTokens.has(term)).length;
+      const sourceBoost = preferredApplySource
+        ? Math.max(2, Math.round(preferredApplySource.score / 35))
+        : -12;
       const relevanceScore = (exactRoleMatch ? 8 : 0)
         + (titleAnchorMatches * 4)
         + (textAnchorMatches * 2)
@@ -403,11 +645,13 @@ const rankJobs = (rawJobs, profile) => {
         + (skillPhraseMatches * 3)
         + skillTokenMatches
         + (locationMatches ? 2 : 0)
-        + (experienceMatches ? 1 : 0);
+        + (experienceMatches ? 1 : 0)
+        + sourceBoost;
 
       return {
         job,
         relevanceScore,
+        hasPreferredSource: Boolean(preferredApplySource),
         isRelevant: Boolean(
           exactRoleMatch
           || titleAnchorMatches > 0
@@ -419,7 +663,7 @@ const rankJobs = (rawJobs, profile) => {
     });
 
   const relevantJobs = scoredJobs
-    .filter((item) => item.isRelevant)
+    .filter((item) => item.isRelevant && item.hasPreferredSource)
     .sort((left, right) => right.relevanceScore - left.relevanceScore);
 
   if (relevantJobs.length > 0) {
@@ -427,13 +671,30 @@ const rankJobs = (rawJobs, profile) => {
   }
 
   return scoredJobs
-    .filter((item) => item.relevanceScore >= 3)
+    .filter((item) => item.hasPreferredSource && item.relevanceScore >= 3)
     .sort((left, right) => right.relevanceScore - left.relevanceScore)
     .map((item) => item.job);
 };
 
 const normalizeJob = (job) => {
-  const applyLink = job.job_apply_link || job.job_google_link || '';
+  const preferredApplySource = resolvePreferredApplySource(job);
+  const applyLink = preferredApplySource?.applyLink || '';
+  const publisher = preferredApplySource?.publisher || '';
+  const sourceType = preferredApplySource?.sourceType || '';
+  const rawPayload = {
+    ...job,
+    job_apply_link: applyLink || job.job_apply_link || '',
+    job_publisher: publisher || job.job_publisher || '',
+    job_apply_is_direct: preferredApplySource ? preferredApplySource.isDirect : normalizeBoolean(job.job_apply_is_direct),
+    selected_apply_option: preferredApplySource ? {
+      publisher,
+      apply_link: applyLink,
+      is_direct: preferredApplySource.isDirect,
+      source_type: sourceType,
+      hostname: preferredApplySource.hostname,
+    } : null,
+  };
+
   return {
     id: job.job_id || applyLink || `${job.employer_name || 'company'}-${job.job_title || 'job'}`,
     externalId: job.job_id || null,
@@ -444,8 +705,9 @@ const normalizeJob = (job) => {
     location: normalizeLocation(job),
     jobDescription: job.job_description || '',
     employmentType: job.job_employment_type || '',
-    publisher: job.job_publisher || '',
-    rawPayload: job,
+    publisher,
+    sourceType,
+    rawPayload,
   };
 };
 
@@ -498,6 +760,16 @@ const serializeListing = (listing) => {
   const savedAt = listing.lastSeenAt?.toISOString() || listing.updatedAt?.toISOString() || listing.createdAt?.toISOString() || null;
   const listingMeta = getListingMeta(listing.rawPayload);
   const viewedAt = compact(listingMeta.viewedAt) || null;
+  const rawPayload = normalizeObject(listing.rawPayload);
+  const preferredApplySource = resolvePreferredApplySource({
+    ...rawPayload,
+    applyLink: listing.applyLink,
+    job_apply_link: rawPayload.job_apply_link || listing.applyLink,
+    publisher: rawPayload.publisher || rawPayload.job_publisher,
+  });
+  const applyLink = preferredApplySource?.applyLink || '';
+  const publisher = preferredApplySource?.publisher || '';
+  const sourceType = preferredApplySource?.sourceType || '';
 
   return {
     id: listing.sourceJobId || listing.id,
@@ -506,18 +778,21 @@ const serializeListing = (listing) => {
     company: listing.company,
     location: listing.location || '',
     datePosted,
-    applyLink: listing.applyLink,
+    applyLink,
     isViewed: Boolean(viewedAt),
     viewedAt,
     isApplied: Boolean(listing.isApplied),
     appliedAt: listing.appliedAt?.toISOString() || null,
     savedAt,
     source: listing.source,
+    publisher,
+    sourceType,
     job_id: listing.sourceJobId || listing.id,
     job_title: listing.title,
     employer_name: listing.company,
     job_location: listing.location || '',
-    job_apply_link: listing.applyLink,
+    job_apply_link: applyLink,
+    job_publisher: publisher,
     job_posted_at: datePosted,
     saved_at: savedAt,
   };
@@ -622,7 +897,7 @@ const getPersistedJobListings = async (userId, { limit } = {}) => {
     ...(take ? { take } : {}),
   });
 
-  return listings.map(serializeListing);
+  return dedupeJobs(listings.map(serializeListing).filter((listing) => listing.applyLink));
 };
 
 const stringifyStructuredValue = (value) => {
