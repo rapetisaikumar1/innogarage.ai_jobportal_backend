@@ -169,6 +169,19 @@ const createSearchError = (message, statusCode = 502) => {
   return error;
 };
 
+const buildLocatedQuery = (parts, location) => {
+  const baseQuery = parts
+    .map(compact)
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const normalizedLocation = compact(location);
+
+  if (!normalizedLocation) return baseQuery;
+  return baseQuery ? `${baseQuery} in ${normalizedLocation}` : normalizedLocation;
+};
+
 const getRapidApiError = (error) => {
   const status = error.response?.status;
   const data = error.response?.data;
@@ -221,11 +234,7 @@ const buildQuery = (profile) => {
   const location = compact(profile.location);
   const skills = toArray(profile.keySkills).slice(0, 5).join(' ');
 
-  return [role, experience, skills, location]
-    .filter(Boolean)
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return buildLocatedQuery([role, experience, skills], location);
 };
 
 const buildSearchQueries = (profile) => {
@@ -236,10 +245,9 @@ const buildSearchQueries = (profile) => {
   const skillSnippet = skills.slice(0, 2).join(' ');
 
   return [...new Set([
-    [baseRole, location].filter(Boolean).join(' '),
-    [baseRole, skillSnippet, location].filter(Boolean).join(' '),
-    [baseRole, skillSnippet].filter(Boolean).join(' '),
-    baseRole,
+    buildLocatedQuery([baseRole, skillSnippet], location),
+    buildLocatedQuery([baseRole], location),
+    buildLocatedQuery([skillSnippet], location),
   ].map(compact).filter(Boolean))];
 };
 
@@ -247,6 +255,48 @@ const LOCATION_ALIASES = {
   usa: ['usa', 'us', 'united states', 'united states of america', 'america'],
   canada: ['canada'],
   india: ['india'],
+};
+
+const LOCATION_COUNTRY_CODES = {
+  usa: 'us',
+  canada: 'ca',
+  india: 'in',
+};
+
+const escapeRegExp = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const hasLocationPhrase = (text, phrase) => {
+  const normalizedText = compact(text).toLowerCase();
+  const normalizedPhrase = compact(phrase).toLowerCase();
+  if (!normalizedText || !normalizedPhrase) return false;
+
+  const pattern = normalizedPhrase
+    .split(/\s+/)
+    .map(escapeRegExp)
+    .join('\\s+');
+
+  return new RegExp(`(^|[^a-z0-9])${pattern}([^a-z0-9]|$)`, 'i').test(normalizedText);
+};
+
+const resolveLocationKey = (value) => {
+  const normalized = compact(value).toLowerCase();
+  if (!normalized) return '';
+
+  for (const [key, aliases] of Object.entries(LOCATION_ALIASES)) {
+    if (normalized === key) return key;
+    if (aliases.some((alias) => normalized === alias || hasLocationPhrase(normalized, alias))) {
+      return key;
+    }
+  }
+
+  return '';
+};
+
+const getRapidApiLocationParams = (location) => {
+  const locationKey = resolveLocationKey(location);
+  const countryCode = LOCATION_COUNTRY_CODES[locationKey];
+
+  return countryCode ? { country: countryCode } : {};
 };
 
 const normalizePostedDate = (job) => {
@@ -1653,11 +1703,12 @@ const filterJobsBySearchDays = (jobs, searchDays) => {
   });
 };
 
-const fetchRapidApiJobs = async ({ query, page, postedFilter }) => {
+const fetchRapidApiJobs = async ({ query, page, postedFilter, location }) => {
   const params = {
     query,
     page: String(page || 1),
     num_pages: '1',
+    ...getRapidApiLocationParams(location),
   };
 
   if (postedFilter) params.date_posted = postedFilter;
@@ -1761,7 +1812,12 @@ const lookupRapidApiJobDescription = async (listing) => {
     let jobs = [];
 
     try {
-      jobs = await fetchRapidApiJobs({ query, page: 1, postedFilter: null });
+      jobs = await fetchRapidApiJobs({
+        query,
+        page: 1,
+        postedFilter: null,
+        location: listing.location,
+      });
     } catch (error) {
       const providerError = getRapidApiError(error);
       console.error('RapidAPI JD lookup failed', {
@@ -1808,7 +1864,11 @@ const lookupRapidApiJobDescription = async (listing) => {
 
 const finalizeJobs = (rawJobs, profile, searchDays) => sortJobsByDate(
   filterJobsBySearchDays(
-    dedupeJobs(rankJobs(rawJobs, profile).map(normalizeJob).filter((job) => job.applyLink)),
+    dedupeJobs(
+      rankJobs(rawJobs, profile)
+        .map(normalizeJob)
+        .filter((job) => job.applyLink)
+    ),
     searchDays
   )
 );
@@ -1840,6 +1900,7 @@ const collectSearchJobs = async ({
           query,
           page,
           postedFilter,
+          location: profile.location,
         });
       } catch (error) {
         const providerError = getRapidApiError(error);
@@ -1932,9 +1993,13 @@ const resolveSearchContext = async (req) => {
     throw createSearchError('Profile not found', 404);
   }
 
+  if (!compact(profile.location)) {
+    throw createSearchError('Please add your preferred location to your profile before searching jobs.', 400);
+  }
+
   const query = buildQuery(profile);
   if (!query) {
-    throw createSearchError('Please add job role, experience, skills, or location to your profile first.', 400);
+    throw createSearchError('Please add job role, experience, or skills to your profile before searching jobs.', 400);
   }
 
   if (!getRapidApiKey()) {
