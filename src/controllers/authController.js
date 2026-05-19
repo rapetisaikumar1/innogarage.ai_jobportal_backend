@@ -600,7 +600,7 @@ exports.completeProfile = async (req, res) => {
     if (resumeUrl) updateData.resumeUrl = resumeUrl;
     if (parsedResumeText) updateData.parsedResumeText = parsedResumeText;
 
-    let user = await prisma.user.update({
+    const user = await prisma.user.update({
       where: { id: userId },
       data: updateData,
       select: {
@@ -625,68 +625,7 @@ exports.completeProfile = async (req, res) => {
       },
     });
 
-    // Auto-assign mentor to student after profile completion
-    if (user.role === 'STUDENT' && !user.assignedMentorId) {
-      // Fetch all active mentors with their assigned student count
-      const mentors = await prisma.user.findMany({
-        where: {
-          role: 'ADMIN',
-          isActive: true,
-        },
-        select: {
-          id: true,
-          createdAt: true,
-          _count: {
-            select: { assignedStudents: true },
-          },
-        },
-      });
-
-      if (mentors.length > 0) {
-        // Sort by student count (ascending), then by createdAt (ascending)
-        mentors.sort((a, b) => {
-          const countDiff = a._count.assignedStudents - b._count.assignedStudents;
-          if (countDiff !== 0) return countDiff;
-          return new Date(a.createdAt) - new Date(b.createdAt);
-        });
-
-        // Select the mentor with the least load
-        const selectedMentor = mentors[0];
-
-        // Assign the mentor to the student
-        user = await prisma.user.update({
-          where: { id: userId },
-          data: { assignedMentorId: selectedMentor.id },
-          select: {
-            id: true,
-            registrationNumber: true,
-            fullName: true,
-            email: true,
-            phone: true,
-            role: true,
-            isActive: true,
-            isEmailVerified: true,
-            education: true,
-            experience: true,
-            keySkills: true,
-            resumeUrl: true,
-            avatarUrl: true,
-            assignedMentorId: true,
-            profileCompleted: true,
-          },
-        });
-
-        await prisma.studentAdminAssignment.upsert({
-          where: { studentId_adminId: { studentId: userId, adminId: selectedMentor.id } },
-          update: {},
-          create: { studentId: userId, adminId: selectedMentor.id },
-        });
-
-        console.log(`Auto-assigned mentor ${selectedMentor.id} to student ${userId} (mentor load: ${selectedMentor._count.assignedStudents} students)`);
-      }
-    }
-
-    // Auto-create group chat for the student with all admins & super admins
+    // Auto-create group chat for the student with assigned admins and all super admins
     if (user.role === 'STUDENT') {
       const existingGroup = await prisma.chatGroup.findUnique({ where: { studentId: userId } });
       if (!existingGroup) {
